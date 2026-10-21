@@ -124,8 +124,9 @@ class SQLiteToolAuditSink(ToolAuditSink):
                     record.tool_call_id, record.actor, record.principal, record.tool,
                     record.capability, record.required_scope, int(record.side_effect),
                     int(record.external), record.action_hash, record.status, record.timestamp,
-                    record.policy, record.reason, record.latency_ms, record.result_summary,
-                    record.error, json.dumps(payload, ensure_ascii=False, default=str),
+                    record.policy, payload.get("reason"), record.latency_ms,
+                    payload.get("result_summary"), payload.get("error"),
+                    json.dumps(payload, ensure_ascii=False, default=str),
                 ),
             )
 

@@ -1,0 +1,227 @@
+"""WORKER reads for Gmail, calendar, and public pages.
+
+An application tool harness, when one is bound or passed in, is the only
+call. ``BoundaryHarness`` covers the same boundary when the process has no
+application yet: the provider or file read runs inside ``execute``.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Callable
+from contextvars import ContextVar, Token
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from pu.core.interfaces.tools import ToolContext, ToolResult
+from pu.identity.principal import Principal, PrincipalKind
+from pu.identity.seam import InternalPrincipalSeam, attached_principal
+
+_BOUND: ContextVar[Any] = ContextVar("pu_bound_read_harness", default=None)
+
+READ_SCOPES = {
+    "read_web_page": "web:read",
+    "search_web": "web:read",
+    "list_events": "calendar:read",
+    "read_week_availability": "calendar:read",
+    "read_gmail_today": "email:read",
+    "read_email_inbox": "email:read",
+    "search_gmail": "email:read",
+    "read_gmail_thread": "email:read",
+}
+
+
+def bind_harness(harness: Any) -> Token:
+    return _BOUND.set(harness)
+
+
+def reset_bound_harness(token: Token) -> None:
+    _BOUND.reset(token)
+
+
+def clear_bound_harness() -> None:
+    _BOUND.set(None)
+
+
+def bound_harness() -> Any:
+    return _BOUND.get()
+
+
+def external_harness(app: Any = None) -> Any:
+    bound = _BOUND.get()
+    if bound is not None:
+        return bound
+    if app is None:
+        return None
+    return getattr(app, "tool_harness", None)
+
+
+def job_owner(home: Path | None) -> tuple[str, str]:
+    attached = attached_principal()
+    if attached is not None:
+        return attached.user_id, attached.workspace_id
+    if home is None:
+        return "", ""
+    database = Path(home) / "state.db"
+    if not database.is_file():
+        return "", ""
+    conn = sqlite3.connect(database)
+    try:
+        row = conn.execute(
+            "SELECT user_id, workspace_id FROM identity_local WHERE singleton = 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return "", ""
+    finally:
+        conn.close()
+    if not row:
+        return "", ""
+    return str(row[0]), str(row[1])
+
+
+def worker_context(
+    *,
+    owner_user_id: str,
+    workspace_id: str = "",
+    job_id: str = "",
+    scopes: tuple[str, ...] = (),
+    observer=None,
+    extra_metadata: dict | None = None,
+    tool_name: str = "",
+) -> ToolContext:
+    scope_set = set(scopes)
+    if tool_name in READ_SCOPES:
+        scope_set.add(READ_SCOPES[tool_name])
+    metadata = {
+        "principal_kind": PrincipalKind.WORKER.value,
+        "owner_user_id": owner_user_id,
+        "job_id": job_id,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return ToolContext(
+        observer=observer,
+        actor="worker",
+        principal=owner_user_id or "worker",
+        agent_id="worker",
+        scopes=frozenset(scope_set),
+        capabilities=frozenset(scope_set),
+        metadata=metadata,
+    )
+
+
+class BoundaryHarness:
+    """One read inside ``execute`` when the process has no application harness."""
+
+    def __init__(self, producer: Callable[[], Any]):
+        self._producer = producer
+
+    def execute(self, name: str, arguments: dict, context: ToolContext) -> ToolResult:
+        del name, arguments
+        if context.metadata.get("principal_kind") != PrincipalKind.WORKER.value:
+            return ToolResult(output="", ok=False, error="worker_principal_required")
+        output = self._producer()
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False, default=str)
+        return ToolResult(ok=True, output=output)
+
+
+def _attach_worker(owner_user_id: str, workspace_id: str):
+    if not owner_user_id or not workspace_id:
+        return None
+    try:
+        principal = Principal(PrincipalKind.WORKER, owner_user_id, workspace_id)
+    except (TypeError, ValueError):
+        return None
+    return InternalPrincipalSeam().attach(principal)
+
+
+def execute_worker_read(
+    harness,
+    name: str,
+    arguments: dict | None,
+    *,
+    owner_user_id: str,
+    workspace_id: str = "",
+    job_id: str = "",
+    scopes: tuple[str, ...] = (),
+    observer=None,
+    extra_metadata: dict | None = None,
+    home: Path | None = None,
+) -> ToolResult:
+    payload = dict(arguments or {})
+    connection_id = str(payload.get("connection_id") or "")
+    if connection_id:
+        from pu.identity.session import refuse_foreign_connection
+
+        refusal = refuse_foreign_connection(home, connection_id, owner_user_id)
+        if refusal is not None:
+            return ToolResult(output="", ok=False, error=refusal)
+    context = worker_context(
+        owner_user_id=owner_user_id,
+        workspace_id=workspace_id,
+        job_id=job_id,
+        scopes=scopes,
+        observer=observer,
+        extra_metadata=extra_metadata,
+        tool_name=name,
+    )
+    token = _attach_worker(owner_user_id, workspace_id)
+    try:
+        return harness.execute(name, payload, context)
+    finally:
+        if token is not None:
+            InternalPrincipalSeam().detach(token)
+
+
+def parse_json_output(result: ToolResult) -> Any:
+    if not result.ok:
+        raise ValueError(result.error or "tool harness rejected the read")
+    try:
+        return json.loads(result.output)
+    except (TypeError, ValueError):
+        return result.output
+
+
+def coerce_availability(result: ToolResult) -> dict:
+    unknown = {
+        "status": "unknown",
+        "slots": [],
+        "events": [],
+        "checked_sources": [],
+        "warnings": [],
+        "timezone": "Asia/Ho_Chi_Minh",
+    }
+    if not result.ok:
+        unknown["warnings"] = [result.error or "calendar read blocked"]
+        return unknown
+    try:
+        parsed = json.loads(result.output)
+    except (TypeError, ValueError):
+        unknown["warnings"] = ["calendar read returned no structured intervals"]
+        return unknown
+    if not isinstance(parsed, dict) or "status" not in parsed:
+        return unknown
+    parsed.setdefault("slots", [])
+    parsed.setdefault("events", [])
+    parsed.setdefault("warnings", [])
+    parsed.setdefault("checked_sources", [])
+    return parsed
+
+
+def read_calendar_ics(home: Path) -> str:
+    """Today's titles from calendar.ics. Called only from a harness ``execute``."""
+    ics = Path(home) / "calendar.ics"
+    if not ics.is_file():
+        return "(no calendar)"
+    today = datetime.now().strftime("%Y%m%d")
+    lines: list[str] = []
+    title = ""
+    for line in ics.read_text(encoding="utf-8").splitlines():
+        if line.startswith("SUMMARY:"):
+            title = line[len("SUMMARY:") :]
+        elif line.startswith("DTSTART") and today in line and title:
+            lines.append(title)
+    return "; ".join(lines) or "(nothing today)"

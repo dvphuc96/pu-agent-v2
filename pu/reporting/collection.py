@@ -147,6 +147,48 @@ def _published_at(item: dict) -> str | None:
     return value
 
 
+def _availability_through_harness(harness, repo, workspace, workspace_id, app):
+    """Read availability through the tool harness, then keep the meeting window."""
+    from pu.harness.gateway import coerce_availability, execute_worker_read, job_owner
+    from pu.reporting.availability import filter_partner_events
+    from pu.reporting.scheduling import meeting_window, window_snapshot
+
+    sources = repo.sources(workspace_id)
+    emails = [
+        {"body_text": source.get("content", ""), "internal_date": source.get("published_at")}
+        for source in sources
+        if source.get("source_type") == "email" and source.get("enabled", True)
+    ]
+    window = meeting_window(emails)
+    arguments = {
+        key: value
+        for key, value in (window.get("arguments") or {}).items()
+        if key in {"start_date", "days", "duration", "allowed_dates"}
+    }
+    if "days" not in arguments:
+        arguments["days"] = 2
+    owner, workspace_owner = job_owner(getattr(repo, "home", None))
+    observer = None
+    if app is not None and getattr(app, "event_publisher", None) is not None:
+        observer = app.event_publisher.publish
+    result = execute_worker_read(
+        harness,
+        "read_week_availability",
+        arguments,
+        owner_user_id=owner,
+        workspace_id=workspace_owner,
+        job_id=str(workspace_id),
+        scopes=("calendar:read",),
+        observer=observer,
+        extra_metadata={"workspace_id": workspace_id},
+        home=getattr(repo, "home", None),
+    )
+    parsed = coerce_availability(result)
+    if parsed.get("events") is not None:
+        parsed = filter_partner_events(parsed, workspace)
+    return window_snapshot(parsed, window)
+
+
 def collect_partner_sources(
     repo,
     workspace_id,
@@ -188,28 +230,39 @@ def collect_partner_sources(
         timed_out = True
         return True
 
-    def execute(tool, arguments):
-        from pu.core.interfaces.tools import ToolContext
+    def execute_on(harness, tool, arguments):
+        from pu.harness.gateway import execute_worker_read, job_owner
 
-        result = app.tool_harness.execute(
+        owner, workspace_owner = job_owner(getattr(repo, "home", None))
+        observer = None
+        if app is not None and getattr(app, "event_publisher", None) is not None:
+            observer = app.event_publisher.publish
+        result = execute_worker_read(
+            harness,
             tool,
             arguments,
-            ToolContext(
-                principal="local-user",
-                actor="automatic-briefing",
-                agent_id="web-research-agent",
-                scopes=frozenset({"web:read"}),
-                capabilities=frozenset({"web:read"}),
-                observer=app.event_publisher.publish,
-                metadata={"workspace_id": workspace_id, "untrusted_input": True},
-            ),
+            owner_user_id=owner,
+            workspace_id=workspace_owner,
+            job_id=str(workspace_id),
+            scopes=("web:read", "calendar:read"),
+            observer=observer,
+            extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
+            home=getattr(repo, "home", None),
         )
         if not result.ok:
             raise ValueError("Nguồn web không khả dụng qua tool harness.")
         return json.loads(result.output)
 
+    def execute(tool, arguments):
+        return execute_on(app.tool_harness, tool, arguments)
+
     def read_page(url):
-        return execute("read_web_page", {"url": url}) if app else fetch_source(url)
+        from pu.harness.gateway import external_harness
+
+        harness = external_harness(app)
+        if harness is None:
+            return fetch_source(url)
+        return execute_on(harness, "read_web_page", {"url": url})
 
     def search_pages(query):
         if not app:
@@ -589,7 +642,17 @@ def collect_partner_sources(
         from pu.reporting.availability import filter_partner_events
         availability = filter_partner_events(calendar_snapshot, workspace)
     else:
-        availability = requested_partner_availability(repo.home, workspace, repo.sources(workspace_id))
+        from pu.harness.gateway import external_harness
+
+        harness = external_harness(app)
+        if harness is not None:
+            availability = _availability_through_harness(
+                harness, repo, workspace, workspace_id, app
+            )
+        else:
+            availability = requested_partner_availability(
+                repo.home, workspace, repo.sources(workspace_id)
+            )
     repo.add_source(
         workspace_id,
         title="Lịch họp liên quan và giờ trống đã kiểm tra",

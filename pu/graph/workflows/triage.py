@@ -72,19 +72,44 @@ def classify_message(provider: LLMProvider, small_model: str, message: str) -> t
 
 
 def todays_events(home: Path) -> str:
-    """Today's events straight from calendar.ics — a local file read, which is
-    exactly why it can run in parallel with the classifier's network call."""
-    ics = home / "calendar.ics"
-    if not ics.exists():
-        return "(no calendar)"
-    today = datetime.now().strftime("%Y%m%d")
-    lines, title = [], ""
-    for line in ics.read_text(encoding="utf-8").splitlines():
-        if line.startswith("SUMMARY:"):
-            title = line[len("SUMMARY:"):]
-        elif line.startswith("DTSTART") and today in line and title:
-            lines.append(title)
-    return "; ".join(lines) or "(nothing today)"
+    """Today's events via the tool harness.
+
+    A bound harness (tests, or a worker that already has one) is the only
+    reader. Otherwise the ICS parse runs inside ``BoundaryHarness.execute``.
+    """
+    from pu.harness.gateway import (
+        BoundaryHarness,
+        bound_harness,
+        execute_worker_read,
+        job_owner,
+        read_calendar_ics,
+        worker_context,
+    )
+
+    owner, workspace_id = job_owner(home)
+    harness = bound_harness()
+    if harness is not None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        execute_worker_read(
+            harness,
+            "list_events",
+            {"start": today, "end": today},
+            owner_user_id=owner,
+            workspace_id=workspace_id,
+            job_id="triage",
+            scopes=("calendar:read",),
+            home=home,
+        )
+        return "(nothing today)"
+    context = worker_context(
+        owner_user_id=owner,
+        workspace_id=workspace_id,
+        job_id="triage",
+        scopes=("calendar:read",),
+        tool_name="list_events",
+    )
+    result = BoundaryHarness(lambda: read_calendar_ics(home)).execute("list_events", {}, context)
+    return result.output
 
 
 def build_triage_graph(*, classify_fn: Callable[[str], tuple[str, str]],

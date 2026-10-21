@@ -216,9 +216,62 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
             metadata={"untrusted_input": True},
         )
     elif op == "fetch_source":
-        from pu.tools.web_source import fetch_source
+        from pu.harness.gateway import (
+            BoundaryHarness,
+            execute_worker_read,
+            external_harness,
+            job_owner,
+            parse_json_output,
+            worker_context,
+        )
 
-        repo.add_source(workspace_id, **fetch_source(payload.get("url", "")))
+        app = app_factory() if app_factory else None
+        harness = external_harness(app)
+        url = payload.get("url", "") or ""
+        owner, workspace_owner = job_owner(home)
+        observer = None
+        if app is not None and getattr(app, "event_publisher", None) is not None:
+            observer = app.event_publisher.publish
+        if harness is None:
+            from pu.tools.web_source import fetch_source
+
+            context = worker_context(
+                owner_user_id=owner,
+                workspace_id=workspace_owner,
+                job_id=str(workspace_id),
+                scopes=("web:read",),
+                tool_name="read_web_page",
+                extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
+            )
+            result = BoundaryHarness(lambda: fetch_source(url)).execute(
+                "read_web_page", {"url": url}, context
+            )
+        else:
+            result = execute_worker_read(
+                harness,
+                "read_web_page",
+                {"url": url},
+                owner_user_id=owner,
+                workspace_id=workspace_owner,
+                job_id=str(workspace_id),
+                scopes=("web:read",),
+                observer=observer,
+                extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
+                home=home,
+            )
+        page = parse_json_output(result)
+        if not isinstance(page, dict):
+            raise ValueError("Nguồn web không khả dụng qua tool harness.")
+        repo.add_source(
+            workspace_id,
+            title=page.get("title") or url,
+            content=page.get("content") or "",
+            source_type=page.get("source_type") or "web",
+            url=page.get("url") or url,
+            metadata=page.get("metadata")
+            if isinstance(page.get("metadata"), dict)
+            else {"untrusted_input": True},
+        )
     elif op == "upload_source":
         from pu.reporting.attachments import extract_attachment
 

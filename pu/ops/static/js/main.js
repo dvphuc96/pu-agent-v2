@@ -142,6 +142,9 @@ function wireChrome(){
   setNav(localStorage.getItem("navHidden") === "1" || (!localStorage.getItem("navHidden") && window.innerWidth < 900));
 }
 
+fetch("/api/auth/csrf").then(r => r.ok ? r.json() : null).then(body => {
+  if (body && body.csrf_token) puCsrf = body.csrf_token;
+}).catch(() => {});
 window.addEventListener("hashchange", render);
 window.__hold = (v)=>{ animating = v; };   // test hook: freeze the diagram
 wireDock(); wireChrome();

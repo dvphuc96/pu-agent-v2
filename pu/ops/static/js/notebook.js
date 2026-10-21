@@ -26,7 +26,7 @@ function nbDate(value){
 }
 async function nbAPI(payload){
   if(NB.detail&&payload.workspace_id===NB.detail.workspace.id&&NB.detail.report&&payload.report_id===undefined){payload={report_id:NB.detail.report.payload.report_id,...payload};}
-  const response=await fetch("/api/workspace",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+  const response=await fetch("/api/workspace",{method:"POST",headers:puMutateHeaders(),body:JSON.stringify(payload)});
   const result=await response.json();
   if(result.error) throw new Error(result.error);
   return result;

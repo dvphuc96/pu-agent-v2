@@ -232,7 +232,7 @@ async function runGraph(workflow){
   render();
   try {
     const res = await fetch("/api/graph/stream", {
-      method: "POST", headers: {"Content-Type": "application/json"},
+      method: "POST", headers: puMutateHeaders(),
       body: JSON.stringify({workflow}),
     });
     const reader = res.body.getReader();

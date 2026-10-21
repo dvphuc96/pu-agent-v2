@@ -258,9 +258,36 @@ class BriefingService:
         day = current.date().isoformat()
         if current.hour < 7 or self.state("meeting_scan_day") == day:
             return
+        from pu.harness.gateway import (
+            coerce_availability,
+            execute_worker_read,
+            external_harness,
+            job_owner,
+        )
         from pu.reporting.availability import filter_partner_events, read_availability
 
-        availability = read_availability(self.home, days=2)
+        app = self.app_factory() if self.app_factory else None
+        harness = external_harness(app)
+        if harness is not None:
+            owner, workspace_owner = job_owner(self.home)
+            observer = None
+            if app is not None and getattr(app, "event_publisher", None) is not None:
+                observer = app.event_publisher.publish
+            availability = coerce_availability(
+                execute_worker_read(
+                    harness,
+                    "read_week_availability",
+                    {"days": 2},
+                    owner_user_id=owner,
+                    workspace_id=workspace_owner,
+                    job_id="meeting-scan",
+                    scopes=("calendar:read",),
+                    observer=observer,
+                    home=self.home,
+                )
+            )
+        else:
+            availability = read_availability(self.home, days=2)
         count = 0
         for workspace in self.repo.list():
             if not filter_partner_events(availability, workspace)["events"]:
@@ -666,10 +693,34 @@ class BriefingService:
             self.set_state("scan_requested", "0")
             message = "Đã đọc email local. Kết nối Gmail một lần để tự đồng bộ inbox."
             if (self.home / "gmail-token.json").is_file():
-                from pu.tools.gmail import sync
+                from pu.harness.gateway import execute_worker_read, external_harness, job_owner
 
-                with self.repo.database.connection() as conn:
-                    message = sync(conn, self.home, max_messages=500, recent_days=7, only_new=True)
+                app = self.app_factory() if self.app_factory else None
+                harness = external_harness(app)
+                if harness is not None:
+                    owner, workspace_owner = job_owner(self.home)
+                    observer = None
+                    if app is not None and getattr(app, "event_publisher", None) is not None:
+                        observer = app.event_publisher.publish
+                    result = execute_worker_read(
+                        harness,
+                        "read_gmail_today",
+                        {"days": 7, "max_results": 20},
+                        owner_user_id=owner,
+                        workspace_id=workspace_owner,
+                        job_id="inbox-scan",
+                        scopes=("email:read",),
+                        observer=observer,
+                        home=self.home,
+                    )
+                    message = result.output if result.ok else (result.error or result.output)
+                else:
+                    from pu.tools.gmail import sync
+
+                    with self.repo.database.connection() as conn:
+                        message = sync(
+                            conn, self.home, max_messages=500, recent_days=7, only_new=True
+                        )
             self.discover()
             self.schedule_meeting_briefs()
             self.set_state("scan_message", redact(message))
@@ -738,9 +789,10 @@ class BriefingService:
                 self.wake.wait(15)
                 self.wake.clear()
 
-        threading.Thread(target=heartbeat, daemon=True, name="brief-heartbeat").start()
-        self.thread = threading.Thread(target=loop, daemon=True, name="partner-briefing")
-        self.thread.start()
+        from pu.identity.threads import spawn_inheriting
+
+        spawn_inheriting(heartbeat, name="brief-heartbeat")
+        self.thread = spawn_inheriting(loop, name="partner-briefing")
 
     def close(self):
         self.stop_event.set()

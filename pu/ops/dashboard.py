@@ -812,7 +812,16 @@ def gmail_sync_action(payload: dict) -> dict:
 
     Sync is always on demand (a click here or a tool call), so this endpoint
     IS the dashboard's trigger. The button must never 500 the page: sync()
-    already reports every failure as a sentence."""
+    already reports every failure as a sentence. The pull goes through the
+    tool harness with a WORKER principal for the job owner.
+    """
+    from pu.harness.gateway import (
+        BoundaryHarness,
+        execute_worker_read,
+        external_harness,
+        job_owner,
+        worker_context,
+    )
     from pu.tools import gmail
 
     settings = load_settings()
@@ -822,9 +831,34 @@ def gmail_sync_action(payload: dict) -> dict:
         max_messages = int(payload.get("max_messages") or settings.gmail_max_messages)
     except (TypeError, ValueError):
         max_messages = settings.gmail_max_messages
+    harness = external_harness(None)
+    owner, workspace_id = job_owner(home)
+    if harness is not None:
+        result = execute_worker_read(
+            harness,
+            "read_gmail_today",
+            {"days": 7, "max_results": 20},
+            owner_user_id=owner,
+            workspace_id=workspace_id,
+            job_id="gmail-sync",
+            scopes=("email:read",),
+            home=home,
+        )
+        text = result.output if result.ok else (result.error or result.output)
+        return {"message": text}
     conn = connect(home)
     try:
-        return {"message": gmail.sync(conn, home, label=label, max_messages=max_messages)}
+        context = worker_context(
+            owner_user_id=owner,
+            workspace_id=workspace_id,
+            job_id="gmail-sync",
+            scopes=("email:read",),
+            tool_name="read_gmail_today",
+        )
+        result = BoundaryHarness(
+            lambda: gmail.sync(conn, home, label=label, max_messages=max_messages)
+        ).execute("read_gmail_today", {}, context)
+        return {"message": result.output}
     finally:
         conn.close()
 
@@ -910,9 +944,14 @@ def drive_action(payload: dict) -> dict:
 
 
 def run_query(payload: dict) -> dict:
-    """A tiny read-only SQL console.
-    Opens state.db in read-only mode so a write can't slip through, and only
-    accepts a single SELECT/WITH statement. Caps at 200 rows."""
+    """A tiny read-only SQL console scoped to the current owner.
+
+    Owned tables are copied into a private connection with only this owner's
+    rows. The shared database file is detached before the query runs.
+    """
+    import re
+    import sqlite3
+
     sql = (payload.get("sql") or "").strip().rstrip(";").strip()
     if not sql:
         return {"error": "Type a SELECT query."}
@@ -921,22 +960,70 @@ def run_query(payload: dict) -> dict:
         return {"error": "Only SELECT (or WITH … SELECT) queries are allowed."}
     if ";" in sql:
         return {"error": "One statement at a time (no semicolons)."}
-    import sqlite3
-
+    if re.search(r"\b(raw|sqlite_master|pragma)\b", low):
+        return {"error": "That schema is not available in the SQL console."}
     settings = load_settings()
     settings.ensure_home()
-    db = (settings.home / "state.db").resolve()
+    from pu.db import connect
+    from pu.identity.scope import current_owner_user_id
+
+    opener = connect(settings.home)
     try:
-        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        c.row_factory = sqlite3.Row
-        cur = c.execute(sql)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        data = [[str(r[i]) if r[i] is not None else "" for i in range(len(cols))]
-                for r in cur.fetchmany(200)]
-        c.close()
+        owner = current_owner_user_id(opener)
+    finally:
+        opener.close()
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", owner or ""):
+        return {"error": "No owner is available for this query."}
+    db = (settings.home / "state.db").resolve()
+    memory = sqlite3.connect(":memory:")
+    try:
+        memory.execute("ATTACH DATABASE ? AS raw", (f"file:{db}?mode=ro",))
+        hidden = {
+            "auth_sessions",
+            "oauth_connections",
+            "oidc_transactions",
+            "oidc_subjects",
+            "users",
+            "identity_local",
+            "schema_migrations",
+        }
+        tables = memory.execute(
+            "SELECT name FROM raw.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for (name,) in tables:
+            if name in hidden or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                continue
+            try:
+                columns = [
+                    row[1] for row in memory.execute(f"PRAGMA raw.table_info({name})").fetchall()
+                ]
+                # A view in this connection cannot point at the attached file.
+                # Copy the visible rows, then detach so the shared file is gone.
+                if "owner_user_id" in columns:
+                    memory.execute(
+                        f'CREATE TABLE "{name}" AS SELECT * FROM raw."{name}" '
+                        "WHERE owner_user_id = ?",
+                        (owner,),
+                    )
+                else:
+                    memory.execute(
+                        f'CREATE TABLE "{name}" AS SELECT * FROM raw."{name}"'
+                    )
+            except sqlite3.Error:
+                continue
+        memory.execute("DETACH DATABASE raw")
+        memory.row_factory = sqlite3.Row
+        cursor = memory.execute(sql)
+        cols = [item[0] for item in cursor.description] if cursor.description else []
+        data = [
+            [str(row[index]) if row[index] is not None else "" for index in range(len(cols))]
+            for row in cursor.fetchmany(200)
+        ]
         return {"columns": cols, "rows": data}
     except sqlite3.Error as exc:
         return {"error": str(exc)}
+    finally:
+        memory.close()
 
 
 _whisper = None
@@ -1042,18 +1129,29 @@ def _editor_cmd() -> list[str] | None:
 
 
 def reveal_path(rel: str) -> dict:
-    """Open a file/folder under PU_HOME — in the user's code editor if one
-    is on PATH (cursor/code/$PU_EDITOR), otherwise reveal in Finder.
-    Restricted to paths inside PU_HOME."""
+    """Open a file under the current owner's root.
+
+    The shared home, ``state.db``, and another user's ``owners/<id>`` tree
+    are not reachable from this endpoint.
+    """
     import subprocess
     import sys
 
     settings = load_settings()
     settings.ensure_home()
     home = settings.home.resolve()
-    target = (home / (rel or ".")).resolve()
-    if target != home and home not in target.parents:
-        return {"error": "path is outside the .pu home"}
+    from pu.identity.files import owner_for_home
+
+    owner = owner_for_home(home)
+    if not owner:
+        return {"error": "no principal"}
+    raw = (rel or ".").replace("\\", "/").lstrip("/")
+    if raw == ".." or raw.startswith("../") or "/../" in f"/{raw}/":
+        return {"error": "path is outside the owner home"}
+    root = (home / "owners" / owner).resolve()
+    target = (root / raw).resolve()
+    if target != root and root not in target.parents:
+        return {"error": "path is outside the owner home"}
     if not target.exists():
         return {"error": f"not found: {target}"}
 
@@ -1151,6 +1249,45 @@ def events_since(cursor):
     return {"events": out, "cursor": len(lines)}
 
 
+def _oidc_provider_from_env():
+    """OIDC client from the environment. Login stays off until every endpoint is set."""
+    import urllib.parse
+    import urllib.request
+
+    from pu.identity.oidc import OidcProvider
+
+    authorization = os.environ.get("PU_OIDC_AUTHORIZATION_ENDPOINT", "").strip()
+    token_endpoint = os.environ.get("PU_OIDC_TOKEN_ENDPOINT", "").strip()
+    client_id = os.environ.get("PU_OIDC_CLIENT_ID", "").strip()
+    redirect_uri = os.environ.get("PU_OIDC_REDIRECT_URI", "").strip()
+    if not (authorization and token_endpoint and client_id and redirect_uri):
+        return None
+    secret = os.environ.get("PU_OIDC_CLIENT_SECRET", "")
+
+    def http_post(url: str, form: dict) -> dict:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("oidc token response")
+        return payload
+
+    return OidcProvider(
+        authorization_endpoint=authorization,
+        token_endpoint=token_endpoint,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        client_secret=secret,
+        http_post=http_post,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, body: bytes, ctype: str, *, no_cache: bool = False) -> None:
         self.send_response(200)
@@ -1164,6 +1301,86 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        from pu.identity.session import attached_decision, evaluate_on_home
+
+        decision = evaluate_on_home(self.headers, mutate=False)
+        if decision.rejected:
+            self._reject(401 if decision.reason == "session_revoked" else 403, decision.reason)
+            return
+        with attached_decision(decision):
+            if self.path.startswith("/api/auth/"):
+                self._auth_get()
+                return
+            self._get_routes()
+
+    def _reject(self, status: int, reason: str) -> None:
+        body = json.dumps({"error": reason}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth_get(self) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        from pu.config import load_settings
+        from pu.identity.session import SESSION_COOKIE, AuthStore, cookie_value
+
+        settings = load_settings()
+        home = settings.ensure_home()
+        store = AuthStore(home)
+        path = self.path.split("?", 1)[0]
+        if path == "/api/auth/csrf":
+            token = store.csrf_token(cookie_value(self.headers, SESSION_COOKIE))
+            if not token:
+                self._reject(401, "session_revoked")
+                return
+            self._send(json.dumps({"csrf_token": token}).encode(), "application/json", no_cache=True)
+            return
+        if path == "/api/auth/login":
+            provider = _oidc_provider_from_env()
+            if provider is None:
+                self._reject(400, "oidc_not_configured")
+                return
+            started = store.begin_oidc(provider)
+            body = json.dumps({"authorization_url": started.authorization_url}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", started.set_cookie)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/api/auth/callback":
+            provider = _oidc_provider_from_env()
+            params = parse_qs(urlparse(self.path).query)
+            if provider is None:
+                self._reject(400, "oidc_not_configured")
+                return
+            try:
+                issued = store.complete_oidc(
+                    provider,
+                    code=params.get("code", [""])[0],
+                    state=params.get("state", [""])[0],
+                    transaction_cookie=cookie_value(self.headers, "pu_oidc"),
+                )
+            except Exception as exc:
+                code = getattr(exc, "code", "oidc")
+                self._reject(400, str(code))
+                return
+            body = json.dumps({"csrf_token": issued.csrf_token, "ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", issued.set_cookie)
+            self.send_header("Set-Cookie", issued.clear_oidc_cookie)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._reject(404, "not_found")
+
+    def _get_routes(self):
         if self.path == "/api/briefing":
             from pu.ops.briefing import briefing_service
             settings = load_settings()
@@ -1238,6 +1455,33 @@ class Handler(BaseHTTPRequestHandler):
         self._send(target.read_bytes(), ctype, no_cache=True)
 
     def do_POST(self):
+        from pu.identity.session import attached_decision, evaluate_on_home
+
+        decision = evaluate_on_home(self.headers, mutate=True)
+        if decision.rejected:
+            self._reject(403, decision.reason)
+            return
+        with attached_decision(decision):
+            if self.path.split("?", 1)[0] == "/api/auth/logout":
+                self._auth_logout()
+                return
+            self._post_routes()
+
+    def _auth_logout(self) -> None:
+        from pu.config import load_settings
+        from pu.identity.session import SESSION_COOKIE, AuthStore, cookie_value, format_set_cookie
+
+        home = load_settings().ensure_home()
+        AuthStore(home).revoke_session(cookie_value(self.headers, SESSION_COOKIE))
+        body = json.dumps({"ok": True}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", format_set_cookie(SESSION_COOKIE, "", max_age=0))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _post_routes(self):
         from urllib.parse import urlparse
         origin = self.headers.get("Origin")
         if (origin and (urlparse(origin).netloc != self.headers.get("Host") or urlparse(origin).scheme != "http")) or self.headers.get("Sec-Fetch-Site") == "cross-site":
