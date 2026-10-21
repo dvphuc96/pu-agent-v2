@@ -202,6 +202,9 @@ def verify_id_token(
         audience_ok = False
     if not audience_ok:
         raise AuthError("aud")
+    # Multiple audiences must name this client as the authorized party.
+    if isinstance(audience, list) and len(audience) > 1 and claims.get("azp") != provider.client_id:
+        raise AuthError("azp")
     current = time.time() if now is None else now
     try:
         expires = int(claims["exp"])

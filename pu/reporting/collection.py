@@ -252,9 +252,6 @@ def collect_partner_sources(
             raise ValueError("Nguồn web không khả dụng qua tool harness.")
         return json.loads(result.output)
 
-    def execute(tool, arguments):
-        return execute_on(app.tool_harness, tool, arguments)
-
     def read_page(url):
         from pu.harness.gateway import read_harness
 
@@ -262,8 +259,15 @@ def collect_partner_sources(
         return execute_on(harness, "read_web_page", {"url": url})
 
     def search_pages(query):
-        if not app:
-            return search_results(query, config.max_results_per_query)
+        from pu.harness.gateway import read_harness
+
+        arguments = {"query": query, "max_results": config.max_results_per_query}
+
+        def _search(_arguments):
+            return {"results": search_results(query, config.max_results_per_query)}
+
+        payload = execute_on(read_harness(app, _search), "search_web", arguments)
+        results = payload.get("results", []) if isinstance(payload, dict) else []
         return [
             {
                 "title": item.get("title", "Kết quả tìm kiếm"),
@@ -277,9 +281,8 @@ def collect_partner_sources(
                     "untrusted_input": True,
                 },
             }
-            for item in execute(
-                "search_web", {"query": query, "max_results": config.max_results_per_query}
-            )["results"]
+            for item in results
+            if isinstance(item, dict)
         ]
 
     def add_candidate(item, topics, *, snippet_only=False, relation=None):

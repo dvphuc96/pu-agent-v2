@@ -183,12 +183,35 @@ def test_id_token_checks_iss_aud_exp_nonce_and_rs256():
     )
     assert good["sub"] == "subject-a"
     listed = verify_id_token(
-        sign_hs256(_claims(aud=["other", CLIENT]), SECRET),
+        sign_hs256(_claims(aud=["other", CLIENT], azp=CLIENT), SECRET),
         provider,
         nonce="nonce-a",
         now=now,
     )
     assert listed["aud"] == ["other", CLIENT]
+    single = verify_id_token(
+        sign_hs256(_claims(aud=[CLIENT]), SECRET),
+        provider,
+        nonce="nonce-a",
+        now=now,
+    )
+    assert single["aud"] == [CLIENT]
+    with pytest.raises(AuthError) as missing_azp:
+        verify_id_token(
+            sign_hs256(_claims(aud=["other", CLIENT]), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert missing_azp.value.code == "azp"
+    with pytest.raises(AuthError) as wrong_azp:
+        verify_id_token(
+            sign_hs256(_claims(aud=["other", CLIENT], azp="other"), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert wrong_azp.value.code == "azp"
     with pytest.raises(AuthError) as iss:
         verify_id_token(
             sign_hs256(_claims(iss="https://evil.test"), SECRET),
@@ -320,6 +343,135 @@ def test_reveal_not_found_and_sqlite_schema_stay_hidden(tmp_path, monkeypatch):
     assert blocked.get("rows") in (None, [])
     assert "error" in blocked
     assert "sqlite_schema" not in json.dumps(blocked.get("rows"))
+
+
+def test_search_without_an_app_runs_inside_the_harness(tmp_path, monkeypatch):
+    from pu.reporting.collection import CollectionConfig, collect_partner_sources
+    from pu.reporting.workspace import WorkspaceRepository
+
+    seen: list[bool] = []
+
+    def search_results(_query, _max_results):
+        from pu.harness.gateway import harness_execute_active
+
+        seen.append(harness_execute_active())
+        return [
+            {
+                "title": "Acme",
+                "content": "Acme manufactures industrial widgets for business buyers.",
+                "url": "https://acme.example/about",
+                "source_type": "web",
+                "metadata": {},
+            }
+        ]
+
+    monkeypatch.setattr("pu.reporting.collection.search_results", search_results)
+    monkeypatch.setattr(
+        "pu.reporting.collection.fetch_source",
+        lambda url: {
+            "title": "Acme",
+            "url": url,
+            "content": "Acme manufactures industrial widgets for business buyers.",
+            "source_type": "web",
+            "metadata": {"links": []},
+        },
+    )
+    repo = WorkspaceRepository(tmp_path / "home")
+    workspace = repo.create("Acme", "https://acme.example")
+    collect_partner_sources(
+        repo,
+        workspace["id"],
+        config=CollectionConfig(
+            max_search_queries=1,
+            max_detail_pages=0,
+            max_read_attempts=6,
+            max_web_pages=4,
+            max_duration_seconds=5,
+        ),
+    )
+    assert seen
+    assert all(seen)
+
+
+def test_enc1_rows_migrate_on_open_and_a_swap_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    home = tmp_path / "home"
+    home.mkdir()
+    connect(home).close()
+    owner_a, owner_b = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    blob_a = _encrypt_enc1(json.dumps({"access_token": "token-a"}).encode())
+    blob_b = _encrypt_enc1(json.dumps({"access_token": "token-b"}).encode())
+    store = AuthStore(home)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            """INSERT INTO oauth_connections(id, owner_user_id, provider, token_ciphertext)
+               VALUES('conn-a', ?, 'gmail', ?), ('conn-b', ?, 'gmail', ?)""",
+            (owner_a, blob_a, owner_b, blob_b),
+        )
+    AuthStore(home)
+    stored = dict(
+        sqlite3.connect(home / "state.db").execute(
+            "SELECT id, token_ciphertext FROM oauth_connections"
+        )
+    )
+    assert not is_legacy_ciphertext(stored["conn-a"])
+    assert not is_legacy_ciphertext(stored["conn-b"])
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            "UPDATE oauth_connections SET token_ciphertext = ? WHERE id = 'conn-a'",
+            (stored["conn-b"],),
+        )
+    calls: list[str] = []
+    assert (
+        store.use_oauth_connection(
+            "conn-a",
+            owner_user_id=owner_a,
+            provider_call=lambda token: calls.append(token["access_token"]) or token["access_token"],
+        )
+        is None
+    )
+    assert calls == []
+
+
+def test_enc1_without_a_key_is_pinned_and_not_adopted_after_a_swap(tmp_path, monkeypatch):
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    home = tmp_path / "home"
+    home.mkdir()
+    owner = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    blob_a = _encrypt_enc1(json.dumps({"access_token": "token-a"}).encode())
+    blob_b = _encrypt_enc1(json.dumps({"access_token": "token-b"}).encode())
+    monkeypatch.delenv("PU_TOKEN_KEY")
+    connect(home).close()
+    store = AuthStore(home)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            """INSERT INTO oauth_connections(id, owner_user_id, provider, token_ciphertext)
+               VALUES('conn-a', ?, 'gmail', ?), ('conn-b', ?, 'gmail', ?)""",
+            (owner, blob_a, other, blob_b),
+        )
+    AuthStore(home)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            "UPDATE oauth_connections SET token_ciphertext = ? WHERE id = 'conn-a'",
+            (blob_b,),
+        )
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    calls: list[str] = []
+    assert (
+        store.use_oauth_connection(
+            "conn-a",
+            owner_user_id=owner,
+            provider_call=lambda token: calls.append(token["access_token"]) or token["access_token"],
+        )
+        is None
+    )
+    assert calls == []
+    leftover = sqlite3.connect(home / "state.db").execute(
+        "SELECT token_ciphertext, migration_pending FROM oauth_connections WHERE id = 'conn-a'"
+    ).fetchone()
+    assert is_legacy_ciphertext(leftover[0])
+    assert leftover[1] == 1
 
 
 def test_no_cookie_request_rejects_a_rebound_host():

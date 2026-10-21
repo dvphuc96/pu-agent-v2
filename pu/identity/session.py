@@ -8,6 +8,7 @@ Revocation is a row update checked on the next request.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -19,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pu.identity.crypto import decrypt, encrypt, is_legacy_ciphertext
+from pu.identity.crypto import decrypt, encrypt, is_legacy_ciphertext, token_key_material
 from pu.identity.directory import ensure_identity_tables, provision_user
 from pu.identity.oidc import (
     AuthError,
@@ -61,7 +62,9 @@ CREATE TABLE IF NOT EXISTS oauth_connections (
     owner_user_id TEXT NOT NULL,
     provider TEXT NOT NULL,
     token_ciphertext TEXT NOT NULL,
-    revoked_at TEXT
+    revoked_at TEXT,
+    migration_pending INTEGER NOT NULL DEFAULT 0,
+    legacy_digest TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -170,6 +173,7 @@ class AuthStore:
                 conn.execute(
                     "ALTER TABLE oidc_transactions ADD COLUMN nonce TEXT NOT NULL DEFAULT ''"
                 )
+            migrate_legacy_oauth_tokens(conn)
             conn.commit()
 
     def begin_oidc(self, provider: OidcProvider) -> OidcStart:
@@ -342,31 +346,105 @@ class AuthStore:
 
         A foreign or revoked id returns before ``provider_call`` runs.
         """
+        with self._connect() as conn:
+            migrate_legacy_oauth_tokens(conn)
         row = self._connection(connection_id)
         if row is None or row["revoked_at"] or row["owner_user_id"] != owner_user_id:
             return None
-        legacy = is_legacy_ciphertext(row["token_ciphertext"])
-        token = json.loads(
-            decrypt(
-                row["token_ciphertext"],
-                owner_user_id=row["owner_user_id"],
-                connection_id=connection_id,
-            ).decode("utf-8")
-        )
-        if legacy:
-            upgraded = encrypt(
-                json.dumps(token, separators=(",", ":")).encode("utf-8"),
-                owner_user_id=row["owner_user_id"],
-                connection_id=connection_id,
+        if row["migration_pending"] or is_legacy_ciphertext(row["token_ciphertext"]):
+            return None
+        try:
+            token = json.loads(
+                decrypt(
+                    row["token_ciphertext"],
+                    owner_user_id=row["owner_user_id"],
+                    connection_id=connection_id,
+                ).decode("utf-8")
             )
-            with self._connect() as conn:
-                conn.execute(
-                    """UPDATE oauth_connections SET token_ciphertext=?
-                       WHERE id=? AND owner_user_id=?""",
-                    (upgraded, connection_id, row["owner_user_id"]),
-                )
-                conn.commit()
+        except ValueError:
+            return None
         return provider_call(token)
+
+
+def _ciphertext_digest(ciphertext: str) -> str:
+    return hashlib.sha256(ciphertext.encode("ascii")).hexdigest()
+
+
+def _oauth_columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute("PRAGMA table_info(oauth_connections)")}
+
+
+def migrate_legacy_oauth_tokens(conn: sqlite3.Connection) -> None:
+    """Re-encrypt every ``enc1`` token, or pin it so it cannot change owners.
+
+    With ``PU_TOKEN_KEY``, each legacy blob is rewritten as ``enc2`` bound to
+    that row's owner and connection id. Without the key, the row is marked
+    pending and the ciphertext digest is recorded. A later swap of the blob
+    no longer matches the digest, so it is not adopted for the new owner.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_connections'"
+    ).fetchone()
+    if not exists:
+        return
+    columns = _oauth_columns(conn)
+    if "migration_pending" not in columns:
+        conn.execute(
+            "ALTER TABLE oauth_connections ADD COLUMN migration_pending INTEGER NOT NULL DEFAULT 0"
+        )
+    if "legacy_digest" not in columns:
+        conn.execute(
+            "ALTER TABLE oauth_connections ADD COLUMN legacy_digest TEXT NOT NULL DEFAULT ''"
+        )
+    key_ready = len(token_key_material()) >= 16
+    rows = conn.execute(
+        """SELECT id, owner_user_id, token_ciphertext, legacy_digest, migration_pending
+           FROM oauth_connections"""
+    ).fetchall()
+    for row in rows:
+        connection_id = row["id"]
+        owner = row["owner_user_id"]
+        ciphertext = row["token_ciphertext"]
+        digest = row["legacy_digest"] or ""
+        if not is_legacy_ciphertext(ciphertext):
+            if digest or row["migration_pending"]:
+                conn.execute(
+                    """UPDATE oauth_connections
+                       SET migration_pending = 0, legacy_digest = '' WHERE id = ?""",
+                    (connection_id,),
+                )
+            continue
+        current = _ciphertext_digest(ciphertext)
+        if digest and digest != current:
+            conn.execute(
+                "UPDATE oauth_connections SET migration_pending = 1 WHERE id = ?",
+                (connection_id,),
+            )
+            continue
+        if not key_ready:
+            conn.execute(
+                """UPDATE oauth_connections
+                   SET migration_pending = 1, legacy_digest = ? WHERE id = ?""",
+                (current, connection_id),
+            )
+            continue
+        try:
+            plaintext = decrypt(ciphertext, owner_user_id=owner, connection_id=connection_id)
+        except ValueError:
+            conn.execute(
+                """UPDATE oauth_connections
+                   SET migration_pending = 1, legacy_digest = ? WHERE id = ?""",
+                (current, connection_id),
+            )
+            continue
+        upgraded = encrypt(plaintext, owner_user_id=owner, connection_id=connection_id)
+        conn.execute(
+            """UPDATE oauth_connections
+               SET token_ciphertext = ?, migration_pending = 0, legacy_digest = ''
+               WHERE id = ?""",
+            (upgraded, connection_id),
+        )
+    conn.commit()
 
 
 def evaluate_on_home(headers: Any, *, mutate: bool) -> RequestDecision:
