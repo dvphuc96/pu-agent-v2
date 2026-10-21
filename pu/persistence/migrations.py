@@ -200,6 +200,11 @@ ALTER TABLE briefing_jobs ADD COLUMN next_attempt TEXT NOT NULL DEFAULT '';
         "owner_user_id_personal_workspace_and_composite_fks",
         "",
     ),
+    Migration(
+        9006,
+        "idempotent_owner_match_triggers",
+        "",
+    ),
 )
 
 
@@ -224,10 +229,14 @@ class SQLiteMigrationRunner:
                 from pu.persistence.ownership import apply_ownership_migration
 
                 apply_ownership_migration(self.conn)
+            elif migration.version == 9006:
+                from pu.persistence.ownership import install_owner_match_triggers
+
+                install_owner_match_triggers(self.conn)
             elif migration.sql:
                 self.conn.executescript(migration.sql)
             self.conn.execute(
-                "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
                 (
                     migration.version,
                     migration.name,
@@ -235,11 +244,6 @@ class SQLiteMigrationRunner:
                 ),
             )
             newly_applied.append(migration.version)
-        from pu.persistence.ownership import _owner_match_triggers
-
-        # Re-install the workflow foreign-key triggers on databases that already
-        # recorded 9005, so a stricter check reaches existing files.
-        _owner_match_triggers(self.conn)
         self.conn.commit()
         from pu.identity.scope import load_local_owner_cache
 

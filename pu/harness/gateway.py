@@ -20,6 +20,7 @@ from pu.identity.principal import Principal, PrincipalKind
 from pu.identity.seam import InternalPrincipalSeam, attached_principal
 
 _BOUND: ContextVar[Any] = ContextVar("pu_bound_read_harness", default=None)
+_EXECUTING: ContextVar[bool] = ContextVar("pu_harness_execute", default=False)
 
 READ_SCOPES = {
     "read_web_page": "web:read",
@@ -49,6 +50,11 @@ def bound_harness() -> Any:
     return _BOUND.get()
 
 
+def harness_execute_active() -> bool:
+    """True while a worker read is inside ``Harness.execute``."""
+    return _EXECUTING.get()
+
+
 def external_harness(app: Any = None) -> Any:
     bound = _BOUND.get()
     if bound is not None:
@@ -56,6 +62,18 @@ def external_harness(app: Any = None) -> Any:
     if app is None:
         return None
     return getattr(app, "tool_harness", None)
+
+
+def read_harness(app: Any, producer: Callable[..., Any]) -> Any:
+    """Return a harness. There is no direct-call fallback.
+
+    A bound harness or the application's tool harness wins. Otherwise the
+    provider read runs inside ``BoundaryHarness.execute``.
+    """
+    found = external_harness(app)
+    if found is not None:
+        return found
+    return BoundaryHarness(producer)
 
 
 def job_owner(home: Path | None) -> tuple[str, str]:
@@ -119,10 +137,14 @@ class BoundaryHarness:
         self._producer = producer
 
     def execute(self, name: str, arguments: dict, context: ToolContext) -> ToolResult:
-        del name, arguments
+        del name
         if context.metadata.get("principal_kind") != PrincipalKind.WORKER.value:
             return ToolResult(output="", ok=False, error="worker_principal_required")
-        output = self._producer()
+        token = _EXECUTING.set(True)
+        try:
+            output = _invoke_producer(self._producer, arguments or {})
+        finally:
+            _EXECUTING.reset(token)
         if not isinstance(output, str):
             output = json.dumps(output, ensure_ascii=False, default=str)
         return ToolResult(ok=True, output=output)
@@ -169,11 +191,25 @@ def execute_worker_read(
         tool_name=name,
     )
     token = _attach_worker(owner_user_id, workspace_id)
+    executing = _EXECUTING.set(True)
     try:
         return harness.execute(name, payload, context)
     finally:
+        _EXECUTING.reset(executing)
         if token is not None:
             InternalPrincipalSeam().detach(token)
+
+
+def _invoke_producer(producer: Callable[..., Any], arguments: dict) -> Any:
+    import inspect
+
+    try:
+        parameters = inspect.signature(producer).parameters
+    except (TypeError, ValueError):
+        return producer()
+    if not parameters:
+        return producer()
+    return producer(arguments)
 
 
 def parse_json_output(result: ToolResult) -> Any:

@@ -84,6 +84,7 @@ def _provider(http_post):
         client_id="pu-test",
         redirect_uri="https://app.test/api/auth/callback",
         client_secret=CLIENT_SECRET,
+        issuer="https://idp.test",
         http_post=http_post,
     )
 
@@ -91,7 +92,14 @@ def _provider(http_post):
 def _http_post_for(subject: str, seen: dict):
     def http_post(_url, form):
         seen["form"] = dict(form)
-        return {"id_token": sign_hs256({"sub": subject}, CLIENT_SECRET)}
+        claims = {
+            "sub": subject,
+            "iss": "https://idp.test",
+            "aud": "pu-test",
+            "exp": int(time.time()) + 600,
+            "nonce": seen["nonce"],
+        }
+        return {"id_token": sign_hs256(claims, CLIENT_SECRET)}
 
     return http_post
 
@@ -152,7 +160,7 @@ class _Handler:
         self.sent: list[tuple[str, str]] = []
         handler = object.__new__(Handler)
         handler.path = path
-        handler.headers = headers
+        handler.headers = {"Host": "127.0.0.1:8765", **headers}
         handler.rfile = io.BytesIO(body)
         handler.wfile = io.BytesIO()
         handler.send_response = self.statuses.append
@@ -187,6 +195,8 @@ def test_mu11_oidc_pkce_sets_lax_cookie_and_checks_state(tmp_path, monkeypatch):
     payload = json.loads(login.body)
     query = urllib.parse.parse_qs(urllib.parse.urlparse(payload["authorization_url"]).query)
     assert query["code_challenge_method"] == ["S256"]
+    assert query["nonce"][0]
+    seen["nonce"] = query["nonce"][0]
     assert "code_verifier" not in query
     verifier_later = seen.get("form")
     assert verifier_later is None
@@ -242,7 +252,11 @@ def test_mu11_csrf_rejects_state_change_and_legacy_loopback_still_runs(tmp_path,
     legacy = _Handler("POST", "/api/chat/stop", {"Content-Length": "2"}, b"{}")
     assert legacy.statuses == [200]
     assert "accepted" in json.loads(legacy.body)
-    assert evaluate_on_home({}, mutate=True).rejected is False
+    assert evaluate_on_home({"Host": "127.0.0.1:8765"}, mutate=True).rejected is False
+    assert evaluate_on_home({"Host": "localhost"}, mutate=True).rejected is False
+    rebound = evaluate_on_home({"Host": "rebind.example"}, mutate=True)
+    assert rebound.rejected is True and rebound.reason == "loopback_host"
+    assert evaluate_on_home({}, mutate=True).rejected is True
     AuthStore(home).revoke_session(issued.session_id)
     revoked = _Handler("GET", "/api/briefing", {"Cookie": f"{SESSION_COOKIE}={issued.session_id}"})
     assert revoked.statuses == [401]
@@ -303,7 +317,12 @@ def test_mu03_foreign_connection_does_not_call_provider(tmp_path, monkeypatch):
     row = sqlite3.connect(home / "state.db").execute(
         "SELECT token_ciphertext FROM oauth_connections WHERE id=?", (own,)
     ).fetchone()
-    assert decrypt(row[0]).decode().find(ACCESS_TOKEN) >= 0
+    assert (
+        decrypt(row[0], owner_user_id=user_a.user_id, connection_id=own)
+        .decode()
+        .find(ACCESS_TOKEN)
+        >= 0
+    )
 
 
 def test_mu04_other_owner_approval_is_not_found(tmp_path):

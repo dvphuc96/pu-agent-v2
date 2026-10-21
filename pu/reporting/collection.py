@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
-from pu.reporting.availability import requested_partner_availability
 from pu.reporting.identity import source_relation
 from pu.reporting.research_plan import (
     DEFAULT_TOPICS,
@@ -257,11 +256,9 @@ def collect_partner_sources(
         return execute_on(app.tool_harness, tool, arguments)
 
     def read_page(url):
-        from pu.harness.gateway import external_harness
+        from pu.harness.gateway import read_harness
 
-        harness = external_harness(app)
-        if harness is None:
-            return fetch_source(url)
+        harness = read_harness(app, lambda _arguments: fetch_source(url))
         return execute_on(harness, "read_web_page", {"url": url})
 
     def search_pages(query):
@@ -642,17 +639,22 @@ def collect_partner_sources(
         from pu.reporting.availability import filter_partner_events
         availability = filter_partner_events(calendar_snapshot, workspace)
     else:
-        from pu.harness.gateway import external_harness
+        from pu.harness.gateway import read_harness
 
-        harness = external_harness(app)
-        if harness is not None:
-            availability = _availability_through_harness(
-                harness, repo, workspace, workspace_id, app
-            )
-        else:
-            availability = requested_partner_availability(
-                repo.home, workspace, repo.sources(workspace_id)
-            )
+        def _read_week(arguments):
+            from pu.reporting.availability import read_availability
+
+            options = {
+                key: arguments[key]
+                for key in ("start_date", "days", "duration", "allowed_dates")
+                if isinstance(arguments, dict) and arguments.get(key) not in (None, "")
+            }
+            return read_availability(repo.home, **options)
+
+        harness = read_harness(app, _read_week)
+        availability = _availability_through_harness(
+            harness, repo, workspace, workspace_id, app
+        )
     repo.add_source(
         workspace_id,
         title="Lịch họp liên quan và giờ trống đã kiểm tra",

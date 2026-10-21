@@ -1,9 +1,9 @@
 """Phase 0 reproductions for static-analysis findings.
 
-These tests encode the multi-user safety properties the current single-user
-build does not provide. Each confirmed defect is marked xfail so the suite
-stays green without changing product behavior. A strict xfail becomes an
-error when the underlying defect is fixed and the marker should be removed.
+These tests encode the multi-user safety properties. A defect that has been
+fixed runs as a normal test. The remaining xfail markers belong to later
+phases (OTel redaction, tracer init, and Google Calendar errors) and stay
+until those phases land.
 """
 
 from __future__ import annotations
@@ -290,7 +290,11 @@ def test_collector_page_read_without_app_goes_through_tool_harness(tmp_path, mon
     monkeypatch.setattr("pu.reporting.collection.fetch_source", _mark_bypass(state, "page"))
     monkeypatch.setattr("pu.reporting.collection.search_results", lambda *_a, **_k: [])
     monkeypatch.setattr(
-        "pu.reporting.collection.requested_partner_availability",
+        "pu.reporting.availability.read_availability",
+        _mark_bypass(state, "calendar"),
+    )
+    monkeypatch.setattr(
+        "pu.reporting.availability.requested_partner_availability",
         _mark_bypass(state, "calendar"),
     )
     repo = WorkspaceRepository(home)
@@ -312,7 +316,11 @@ def test_collector_calendar_read_goes_through_tool_harness(tmp_path, monkeypatch
     home = tmp_path / "home"
     state = _fresh_state()
     monkeypatch.setattr(
-        "pu.reporting.collection.requested_partner_availability",
+        "pu.reporting.availability.read_availability",
+        _mark_bypass(state, "calendar"),
+    )
+    monkeypatch.setattr(
+        "pu.reporting.availability.requested_partner_availability",
         _mark_bypass(state, "calendar"),
     )
     repo = WorkspaceRepository(home)

@@ -16,7 +16,7 @@ def post(path, payload):
     handler = object.__new__(dashboard.Handler)
     body = json.dumps(payload).encode()
     handler.path = path
-    handler.headers = {'Content-Length': str(len(body))}
+    handler.headers = {"Host": "127.0.0.1:8765", "Content-Length": str(len(body))}
     handler.rfile, handler.wfile = io.BytesIO(body), io.BytesIO()
     handler.send_response = lambda status: None
     handler.send_header = lambda *args: None

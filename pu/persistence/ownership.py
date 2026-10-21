@@ -64,6 +64,12 @@ CREATE TRIGGER episodes_ad AFTER DELETE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, summary, owner_user_id)
     VALUES ('delete', old.id, old.summary, old.owner_user_id);
 END;
+CREATE TRIGGER episodes_au AFTER UPDATE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, summary, owner_user_id)
+    VALUES ('delete', old.id, old.summary, old.owner_user_id);
+    INSERT INTO episodes_fts(rowid, summary, owner_user_id)
+    VALUES (new.id, new.summary, new.owner_user_id);
+END;
 """
 
 _KNOWLEDGE_FTS_TRIGGERS = """
@@ -681,7 +687,11 @@ def _drop_triggers(conn: sqlite3.Connection, table: str) -> None:
 def _trigger_names(trigger_sql: str) -> set[str]:
     return {
         match.group(1)
-        for match in re.finditer(r"CREATE\s+TRIGGER\s+(\w+)", trigger_sql, re.IGNORECASE)
+        for match in re.finditer(
+            r"CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+            trigger_sql,
+            re.IGNORECASE,
+        )
     }
 
 
@@ -737,6 +747,36 @@ def _upgrade_fts(
     conn.execute(f"INSERT INTO {fts_name}({fts_name}) VALUES('rebuild')")
 
 
+# Bump the suffix when the trigger body changes. CREATE IF NOT EXISTS will
+# not replace an existing body, so a new name is the install.
+_OWNER_MATCH_VERSION = "v1"
+
+
+def install_owner_match_triggers(conn: sqlite3.Connection) -> None:
+    """Install workflow owner-match triggers once.
+
+    ``CREATE TRIGGER IF NOT EXISTS`` is safe when several connections migrate
+    or open the database together. Dropping and recreating the same name on
+    every ``connect()`` races: DDL commits implicitly, and the second CREATE
+    then fails with ``trigger already exists``.
+    """
+    _owner_match_triggers(conn)
+    _install_episodes_update_trigger(conn)
+
+
+def _install_episodes_update_trigger(conn: sqlite3.Connection) -> None:
+    if not _exists(conn, "episodes") or not _exists(conn, "episodes_fts"):
+        return
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
+               INSERT INTO episodes_fts(episodes_fts, rowid, summary, owner_user_id)
+               VALUES ('delete', old.id, old.summary, old.owner_user_id);
+               INSERT INTO episodes_fts(rowid, summary, owner_user_id)
+               VALUES (new.id, new.summary, new.owner_user_id);
+           END"""
+    )
+
+
 def _owner_match_triggers(conn: sqlite3.Connection) -> None:
     statements = (
         (
@@ -759,10 +799,10 @@ def _owner_match_triggers(conn: sqlite3.Connection) -> None:
         if not _exists(conn, table):
             continue
         for timing in ("INSERT", "UPDATE"):
-            name = f"{table}_owner_match_{timing.lower()}"
-            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            legacy = f"{table}_owner_match_{timing.lower()}"
+            name = f"{legacy}_{_OWNER_MATCH_VERSION}"
             conn.execute(
-                f"""CREATE TRIGGER {name}
+                f"""CREATE TRIGGER IF NOT EXISTS {name}
                     BEFORE {timing} ON {table}
                     FOR EACH ROW
                     WHEN NEW.{column} IS NOT NULL AND NOT EXISTS (
@@ -773,3 +813,5 @@ def _owner_match_triggers(conn: sqlite3.Connection) -> None:
                         SELECT RAISE(ABORT, '{message}');
                     END"""
             )
+            if legacy != name:
+                conn.execute(f"DROP TRIGGER IF EXISTS {legacy}")

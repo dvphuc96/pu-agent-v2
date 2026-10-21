@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pu.identity.crypto import decrypt, encrypt
+from pu.identity.crypto import decrypt, encrypt, is_legacy_ciphertext
 from pu.identity.directory import ensure_identity_tables, provision_user
 from pu.identity.oidc import (
     AuthError,
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS oidc_transactions (
     id TEXT PRIMARY KEY,
     state TEXT NOT NULL,
     code_verifier TEXT NOT NULL,
+    nonce TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS oidc_subjects (
@@ -107,6 +108,23 @@ def _equal(left: str, right: str) -> bool:
     return secrets.compare_digest(left_b, right_b)
 
 
+def host_is_loopback(headers: Any) -> bool:
+    """True when Host is 127.0.0.1, localhost, or ::1, optional port included."""
+    host = header_value(headers, "Host").strip().lower()
+    if not host:
+        return False
+    if host.startswith("["):
+        end = host.find("]")
+        if end < 0:
+            return False
+        name = host[1:end]
+    elif host.count(":") == 1:
+        name = host.rsplit(":", 1)[0]
+    else:
+        name = host
+    return name in {"127.0.0.1", "localhost", "::1"}
+
+
 @dataclass(frozen=True)
 class OidcStart:
     authorization_url: str
@@ -147,20 +165,30 @@ class AuthStore:
         with self._connect() as conn:
             ensure_identity_tables(conn)
             conn.executescript(_DDL)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(oidc_transactions)")}
+            if "nonce" not in columns:
+                conn.execute(
+                    "ALTER TABLE oidc_transactions ADD COLUMN nonce TEXT NOT NULL DEFAULT ''"
+                )
             conn.commit()
 
     def begin_oidc(self, provider: OidcProvider) -> OidcStart:
         verifier, challenge = pkce_pair()
         state = secrets.token_urlsafe(24)
+        nonce = secrets.token_urlsafe(24)
         transaction_id = secrets.token_urlsafe(24)
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO oidc_transactions(id, state, code_verifier, created_at) VALUES(?,?,?,?)",
-                (transaction_id, state, verifier, _now()),
+                """INSERT INTO oidc_transactions(
+                       id, state, code_verifier, nonce, created_at
+                   ) VALUES(?,?,?,?,?)""",
+                (transaction_id, state, verifier, nonce, _now()),
             )
             conn.commit()
         return OidcStart(
-            authorization_url=authorization_url(provider, state=state, challenge=challenge),
+            authorization_url=authorization_url(
+                provider, state=state, challenge=challenge, nonce=nonce
+            ),
             set_cookie=format_set_cookie(OIDC_COOKIE, transaction_id, max_age=600),
             transaction_id=transaction_id,
         )
@@ -177,14 +205,16 @@ class AuthStore:
             raise AuthError("oidc_cookie")
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT state, code_verifier FROM oidc_transactions WHERE id=?",
+                "SELECT state, code_verifier, nonce FROM oidc_transactions WHERE id=?",
                 (transaction_cookie,),
             ).fetchone()
             conn.execute("DELETE FROM oidc_transactions WHERE id=?", (transaction_cookie,))
             conn.commit()
         if row is None or not _equal(row["state"], state):
             raise AuthError("state")
-        subject = exchange_code(provider, code=code, verifier=row["code_verifier"])
+        subject = exchange_code(
+            provider, code=code, verifier=row["code_verifier"], nonce=row["nonce"] or ""
+        )
         principal = self._principal_for_subject(subject)
         return self.issue_session(principal)
 
@@ -250,6 +280,8 @@ class AuthStore:
     def evaluate(self, headers: Any, *, mutate: bool) -> RequestDecision:
         session_id = cookie_value(headers, SESSION_COOKIE)
         if not session_id:
+            if not host_is_loopback(headers):
+                return RequestDecision(rejected=True, reason="loopback_host")
             return RequestDecision(rejected=False)
         session = self._live_session(session_id)
         if session is None:
@@ -267,7 +299,11 @@ class AuthStore:
 
     def save_oauth_token(self, *, owner_user_id: str, provider: str, token: dict) -> str:
         connection_id = str(uuid.uuid4())
-        ciphertext = encrypt(json.dumps(token, separators=(",", ":")).encode("utf-8"))
+        ciphertext = encrypt(
+            json.dumps(token, separators=(",", ":")).encode("utf-8"),
+            owner_user_id=owner_user_id,
+            connection_id=connection_id,
+        )
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO oauth_connections(
@@ -309,13 +345,40 @@ class AuthStore:
         row = self._connection(connection_id)
         if row is None or row["revoked_at"] or row["owner_user_id"] != owner_user_id:
             return None
-        token = json.loads(decrypt(row["token_ciphertext"]).decode("utf-8"))
+        legacy = is_legacy_ciphertext(row["token_ciphertext"])
+        token = json.loads(
+            decrypt(
+                row["token_ciphertext"],
+                owner_user_id=row["owner_user_id"],
+                connection_id=connection_id,
+            ).decode("utf-8")
+        )
+        if legacy:
+            upgraded = encrypt(
+                json.dumps(token, separators=(",", ":")).encode("utf-8"),
+                owner_user_id=row["owner_user_id"],
+                connection_id=connection_id,
+            )
+            with self._connect() as conn:
+                conn.execute(
+                    """UPDATE oauth_connections SET token_ciphertext=?
+                       WHERE id=? AND owner_user_id=?""",
+                    (upgraded, connection_id, row["owner_user_id"]),
+                )
+                conn.commit()
         return provider_call(token)
 
 
 def evaluate_on_home(headers: Any, *, mutate: bool) -> RequestDecision:
-    """Check the session cookie when one is present. No cookie stays legacy."""
+    """Check the session cookie when one is present.
+
+    No cookie is the legacy loopback dashboard. That mode only accepts a Host
+    of 127.0.0.1, localhost, or ::1, so a DNS-rebinding name cannot ride the
+    unauthenticated path.
+    """
     if not cookie_value(headers, SESSION_COOKIE):
+        if not host_is_loopback(headers):
+            return RequestDecision(rejected=True, reason="loopback_host")
         return RequestDecision(rejected=False)
     from pu.config import load_settings
 

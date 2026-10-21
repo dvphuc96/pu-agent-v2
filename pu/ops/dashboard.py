@@ -1001,7 +1001,7 @@ def run_query(payload: dict) -> dict:
         return {"error": "Only SELECT (or WITH … SELECT) queries are allowed."}
     if ";" in sql:
         return {"error": "One statement at a time (no semicolons)."}
-    if re.search(r"\b(raw|sqlite_master|pragma)\b", low):
+    if re.search(r"\b(raw|sqlite_master|sqlite_schema|pragma)\b", low):
         return {"error": "That schema is not available in the SQL console."}
     settings = load_settings()
     settings.ensure_home()
@@ -1214,14 +1214,14 @@ def reveal_path(rel: str) -> dict:
     if target != root and root not in target.parents:
         return {"error": "path is outside the owner home"}
     if not target.exists():
-        return {"error": f"not found: {target}"}
+        return {"error": "not found"}
 
     editor = _editor_cmd()
     if editor and target.is_file() and target.suffix != ".db":  # editors choke on sqlite
         subprocess.run([*editor, str(target)], check=False)
         return {"ok": True, "opened_in": editor[0], "path": str(target)}
     if sys.platform != "darwin":
-        return {"error": f"no editor found and reveal is macOS-only — the path is {target}"}
+        return {"error": "no editor found and reveal is macOS-only"}
     subprocess.run(
         ["open", "-R", str(target)] if target.is_file() else ["open", str(target)],
         check=False,
@@ -1321,7 +1321,9 @@ def _oidc_provider_from_env():
     token_endpoint = os.environ.get("PU_OIDC_TOKEN_ENDPOINT", "").strip()
     client_id = os.environ.get("PU_OIDC_CLIENT_ID", "").strip()
     redirect_uri = os.environ.get("PU_OIDC_REDIRECT_URI", "").strip()
-    if not (authorization and token_endpoint and client_id and redirect_uri):
+    issuer = os.environ.get("PU_OIDC_ISSUER", "").strip()
+    jwks_uri = os.environ.get("PU_OIDC_JWKS_URI", "").strip()
+    if not (authorization and token_endpoint and client_id and redirect_uri and issuer):
         return None
     secret = os.environ.get("PU_OIDC_CLIENT_SECRET", "")
 
@@ -1339,13 +1341,24 @@ def _oidc_provider_from_env():
             raise TypeError("oidc token response")
         return payload
 
+    def http_get(url: str) -> dict:
+        request = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("oidc jwks response")
+        return payload
+
     return OidcProvider(
         authorization_endpoint=authorization,
         token_endpoint=token_endpoint,
         client_id=client_id,
         redirect_uri=redirect_uri,
         client_secret=secret,
+        issuer=issuer,
+        jwks_uri=jwks_uri,
         http_post=http_post,
+        http_get=http_get,
     )
 
 
@@ -1544,7 +1557,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _post_routes(self):
         from urllib.parse import urlparse
+
+        from pu.identity.session import SESSION_COOKIE, cookie_value, host_is_loopback
+
         origin = self.headers.get("Origin")
+        if not cookie_value(self.headers, SESSION_COOKIE) and not host_is_loopback(self.headers):
+            self.send_response(403)
+            self.end_headers()
+            return
         if (origin and (urlparse(origin).netloc != self.headers.get("Host") or urlparse(origin).scheme != "http")) or self.headers.get("Sec-Fetch-Site") == "cross-site":
             self.send_response(403)
             self.end_headers()

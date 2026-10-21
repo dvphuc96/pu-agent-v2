@@ -451,6 +451,27 @@ def test_install_requires_a_password_and_refuses_to_drop_existing_rows():
     assert not any("DROP SCHEMA" in statement for statement in conn.statements)
 
 
+# The briefing worker must see every due owner, then attach that owner per job.
+# Mentioning the column is not a filter; these two statements are the allowlist.
+CROSS_OWNER_ALLOWLIST = (
+    ("pu/ops/briefing.py", "SELECT DISTINCT owner_user_id FROM briefing_jobs"),
+    ("pu/ops/briefing.py", "SELECT owner_user_id FROM briefing_state"),
+)
+
+
+def _has_owner_filter(statement: str) -> bool:
+    if "pu_current_owner" in statement:
+        return True
+    return re.search(r"(?i)\bowner_user_id\s*=\s*\?", statement) is not None
+
+
+def _cross_owner_allowed(path: Path, statement: str) -> str:
+    for allowed_path, snippet in CROSS_OWNER_ALLOWLIST:
+        if path.as_posix() == allowed_path and snippet in statement:
+            return snippet
+    return ""
+
+
 def test_private_table_statements_carry_an_owner_filter():
     skip = {
         Path("pu/persistence/ownership.py"),
@@ -464,6 +485,7 @@ def test_private_table_statements_carry_an_owner_filter():
     update_set = re.compile(r"(?is)\bUPDATE\s+([A-Za-z_][A-Za-z0-9_]*)\s+SET\b")
     delete_from = re.compile(r"(?is)\bDELETE\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)")
     hits: list[str] = []
+    used_allowlist: set[tuple[str, str]] = set()
     for path in Path("pu").rglob("*.py"):
         if path in skip:
             continue
@@ -488,10 +510,15 @@ def test_private_table_statements_carry_an_owner_filter():
             }
             if not tables & set(OWNED_TABLES):
                 continue
-            if "owner_user_id" in statement or "pu_current_owner" in statement:
+            if _has_owner_filter(statement):
+                continue
+            allowed = _cross_owner_allowed(path, statement)
+            if allowed:
+                used_allowlist.add((path.as_posix(), allowed))
                 continue
             hits.append(f"{path}:{getattr(node, 'lineno', 0)}: {' '.join(statement.split())[:160]}")
     assert hits == []
+    assert used_allowlist == set(CROSS_OWNER_ALLOWLIST)
 
 
 def _statement_text(node: ast.AST) -> str:

@@ -90,7 +90,7 @@ def todays_events(home: Path) -> str:
     harness = bound_harness()
     if harness is not None:
         today = datetime.now().strftime("%Y-%m-%d")
-        execute_worker_read(
+        result = execute_worker_read(
             harness,
             "list_events",
             {"start": today, "end": today},
@@ -100,7 +100,7 @@ def todays_events(home: Path) -> str:
             scopes=("calendar:read",),
             home=home,
         )
-        return "(nothing today)"
+        return result.output if result.ok else (result.error or result.output)
     context = worker_context(
         owner_user_id=owner,
         workspace_id=workspace_id,

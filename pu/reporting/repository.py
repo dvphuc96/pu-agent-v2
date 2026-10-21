@@ -104,11 +104,3 @@ class FileReportRepository:
 
     def _copy_owned(self, name: str, data: bytes) -> None:
         self._put(name, data)
-
-    def _write_sidecar(self, report_id: str) -> None:
-        from pu.identity.files import owner_for_home
-
-        owner = owner_for_home(self.home)
-        if not owner:
-            return
-        (self.root / f"{report_id}.json.owner").write_text(owner, encoding="utf-8")

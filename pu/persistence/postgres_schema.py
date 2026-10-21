@@ -1,9 +1,11 @@
 """PostgreSQL production schema for private data.
 
-SQLite remains the dev/test adapter. Production enables row level security,
-forces it for the table owner, and expects the application role ``pu_app``
-to be created without BYPASSRLS. The session variable ``pu.owner_user_id``
-is the only owner the policies accept.
+SQLite remains the dev/test adapter. Production enables row level security
+and forces it for the table owner. Production connections must log in as
+``pu_app`` (NOSUPERUSER, NOBYPASSRLS). A superuser connection bypasses row
+level security even when FORCE is set, so a production DSN must not use a
+superuser or any role with BYPASSRLS. The session variable
+``pu.owner_user_id`` is the only owner the policies accept.
 """
 
 from __future__ import annotations
@@ -284,9 +286,10 @@ def install(
 ) -> None:
     """Create the phase-1 schema and make ``role`` subject to forced RLS.
 
-    There is no default password. ``DROP SCHEMA`` runs only for an empty
-    schema, or when ``replace_existing`` is set for a fixture. A schema that
-    already holds rows is left in place.
+    Production must connect as this role (``pu_app`` by default). There is no
+    default password. ``DROP SCHEMA`` runs only for an empty schema, or when
+    ``replace_existing`` is set for a fixture. A schema that already holds
+    rows is left in place.
 
     ``CREATE ROLE`` cannot run inside a transaction block, so this switches the
     connection to autocommit for the duration of the install and restores the

@@ -267,33 +267,39 @@ class BriefingService:
         from pu.harness.gateway import (
             coerce_availability,
             execute_worker_read,
-            external_harness,
             job_owner,
+            read_harness,
         )
-        from pu.reporting.availability import filter_partner_events, read_availability
+        from pu.reporting.availability import filter_partner_events
 
         app = self.app_factory() if self.app_factory else None
-        harness = external_harness(app)
-        if harness is not None:
-            owner, workspace_owner = job_owner(self.home)
-            observer = None
-            if app is not None and getattr(app, "event_publisher", None) is not None:
-                observer = app.event_publisher.publish
-            availability = coerce_availability(
-                execute_worker_read(
-                    harness,
-                    "read_week_availability",
-                    {"days": 2},
-                    owner_user_id=owner,
-                    workspace_id=workspace_owner,
-                    job_id="meeting-scan",
-                    scopes=("calendar:read",),
-                    observer=observer,
-                    home=self.home,
-                )
+
+        def _read_week(arguments):
+            from pu.reporting.availability import read_availability
+
+            days = 2
+            if isinstance(arguments, dict) and arguments.get("days") not in (None, ""):
+                days = arguments["days"]
+            return read_availability(self.home, days=days)
+
+        harness = read_harness(app, _read_week)
+        owner, workspace_owner = job_owner(self.home)
+        observer = None
+        if app is not None and getattr(app, "event_publisher", None) is not None:
+            observer = app.event_publisher.publish
+        availability = coerce_availability(
+            execute_worker_read(
+                harness,
+                "read_week_availability",
+                {"days": 2},
+                owner_user_id=owner,
+                workspace_id=workspace_owner,
+                job_id="meeting-scan",
+                scopes=("calendar:read",),
+                observer=observer,
+                home=self.home,
             )
-        else:
-            availability = read_availability(self.home, days=2)
+        )
         count = 0
         for workspace in self.repo.list():
             if not filter_partner_events(availability, workspace)["events"]:
@@ -712,34 +718,35 @@ class BriefingService:
             self.set_state("scan_requested", "0")
             message = "Đã đọc email local. Kết nối Gmail một lần để tự đồng bộ inbox."
             if (self.home / "gmail-token.json").is_file():
-                from pu.harness.gateway import execute_worker_read, external_harness, job_owner
+                from pu.harness.gateway import execute_worker_read, job_owner, read_harness
 
                 app = self.app_factory() if self.app_factory else None
-                harness = external_harness(app)
-                if harness is not None:
-                    owner, workspace_owner = job_owner(self.home)
-                    observer = None
-                    if app is not None and getattr(app, "event_publisher", None) is not None:
-                        observer = app.event_publisher.publish
-                    result = execute_worker_read(
-                        harness,
-                        "read_gmail_today",
-                        {"days": 7, "max_results": 20},
-                        owner_user_id=owner,
-                        workspace_id=workspace_owner,
-                        job_id="inbox-scan",
-                        scopes=("email:read",),
-                        observer=observer,
-                        home=self.home,
-                    )
-                    message = result.output if result.ok else (result.error or result.output)
-                else:
+
+                def _sync(_arguments=None):
                     from pu.tools.gmail import sync
 
                     with self.repo.database.connection() as conn:
-                        message = sync(
+                        return sync(
                             conn, self.home, max_messages=500, recent_days=7, only_new=True
                         )
+
+                harness = read_harness(app, _sync)
+                owner, workspace_owner = job_owner(self.home)
+                observer = None
+                if app is not None and getattr(app, "event_publisher", None) is not None:
+                    observer = app.event_publisher.publish
+                result = execute_worker_read(
+                    harness,
+                    "read_gmail_today",
+                    {"days": 7, "max_results": 20},
+                    owner_user_id=owner,
+                    workspace_id=workspace_owner,
+                    job_id="inbox-scan",
+                    scopes=("email:read",),
+                    observer=observer,
+                    home=self.home,
+                )
+                message = result.output if result.ok else (result.error or result.output)
             self.discover()
             self.schedule_meeting_briefs()
             self.set_state("scan_message", redact(message))
