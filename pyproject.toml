@@ -67,6 +67,10 @@ drive = [
 pdf = [
     "xhtml2pdf>=0.2.11",
 ]
+# Production operational store. Dev and test stay on SQLite.
+postgres = [
+    "psycopg[binary]>=3.1",
+]
 dev = [
     "pytest>=8.0",
     "ruff==0.16.0",
