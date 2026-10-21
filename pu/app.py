@@ -48,6 +48,8 @@ class PU(BaseAgent):
         self.report_builder = dependencies.report_builder
         self.evaluation_harness = dependencies.evaluation_harness
         self.report_repository = dependencies.report_repository
+        self.dependencies = dependencies
+        self.principal_seam = dependencies.principal_seam
         # Chat-triggered research: the registry is built before the
         # orchestrator exists (the orchestrator consumes tool subsets), so
         # the research tool is attached here with a lazy closure over it.
