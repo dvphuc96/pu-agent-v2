@@ -43,6 +43,9 @@ def load_soul(settings: Settings) -> str:
     soul_path = settings.home / "SOUL.md"
     if not soul_path.exists():
         soul_path.write_text(DEFAULT_SOUL, encoding="utf-8")
+        from pu.identity.files import note_written
+
+        note_written(settings.home, soul_path)
     return soul_path.read_text(encoding="utf-8")
 
 

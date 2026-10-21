@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from pu.identity.scope import OwnershipConnection, load_local_owner_cache, register_owner_function
+
 
 class SQLiteDatabase:
     def __init__(self, path: Path):
@@ -23,8 +25,14 @@ class SQLiteDatabase:
         return cls(Path(home) / "state.db")
 
     def connect(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, check_same_thread=check_same_thread)
+        conn = sqlite3.connect(
+            self.path,
+            check_same_thread=check_same_thread,
+            factory=OwnershipConnection,
+        )
         conn.row_factory = sqlite3.Row
+        register_owner_function(conn)
+        load_local_owner_cache(conn)
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
         # WAL lets dashboard/AgentOps readers coexist with checkpoint/audit writes.

@@ -87,13 +87,17 @@ class BriefingService:
 
     def state(self, key, default=""):
         with self.repo.database.connection() as conn:
-            row = conn.execute("SELECT value FROM briefing_state WHERE key=?", (key,)).fetchone()
+            row = conn.execute(
+                "SELECT value FROM briefing_state WHERE key=? AND owner_user_id = pu_current_owner()",
+                (key,),
+            ).fetchone()
         return row[0] if row else default
 
     def set_state(self, key, value):
         with self.repo.database.connection() as conn:
             conn.execute(
-                "INSERT INTO briefing_state VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                """INSERT INTO briefing_state(key, value) VALUES(?,?)
+                   ON CONFLICT(key, owner_user_id) DO UPDATE SET value=excluded.value""",
                 (key, str(value)),
             )
 
@@ -106,7 +110,7 @@ class BriefingService:
                 )
             ]
             skipped = conn.execute(
-                "SELECT COUNT(*) FROM briefing_seen WHERE reason!=''"
+                "SELECT COUNT(*) FROM briefing_seen WHERE reason!='' AND owner_user_id = pu_current_owner()"
             ).fetchone()[0]
         return {
             "enabled": self.state("enabled", "1") == "1",
@@ -147,7 +151,12 @@ class BriefingService:
             rows = [
                 dict(row)
                 for row in conn.execute(
-                    "SELECT e.* FROM crm_emails e LEFT JOIN briefing_seen s ON s.gmail_id=e.gmail_id WHERE s.gmail_id IS NULL AND e.internal_date>=? ORDER BY e.internal_date LIMIT 100",
+                    """SELECT e.* FROM crm_emails e
+                       LEFT JOIN briefing_seen s
+                         ON s.gmail_id=e.gmail_id AND s.owner_user_id=e.owner_user_id
+                       WHERE s.gmail_id IS NULL AND e.internal_date>=?
+                         AND e.owner_user_id = pu_current_owner()
+                       ORDER BY e.internal_date LIMIT 100""",
                     (cutoff,),
                 )
             ]
@@ -170,7 +179,11 @@ class BriefingService:
         # SQLite serializes discoveries across API calls and processes.
         with self.repo.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.executemany("INSERT OR IGNORE INTO briefing_seen VALUES(?,?,?,?)", skipped)
+            conn.executemany(
+                """INSERT OR IGNORE INTO briefing_seen(gmail_id, domain, reason, seen_at)
+                   VALUES(?,?,?,?)""",
+                skipped,
+            )
             for domain, emails in groups.items():
                 ids = [e["gmail_id"] for e in emails]
                 # Another discover may have committed after our initial read.
@@ -178,13 +191,17 @@ class BriefingService:
                     i
                     for i in ids
                     if not conn.execute(
-                        "SELECT 1 FROM briefing_seen WHERE gmail_id=?", (i,)
+                        """SELECT 1 FROM briefing_seen
+                           WHERE gmail_id=? AND owner_user_id = pu_current_owner()""",
+                        (i,),
                     ).fetchone()
                 ]
                 if not unseen:
                     continue
                 workspace = conn.execute(
-                    "SELECT id FROM research_workspaces WHERE lower(website) IN (?,?) LIMIT 1",
+                    """SELECT id FROM research_workspaces
+                       WHERE lower(website) IN (?,?) AND owner_user_id = pu_current_owner()
+                       LIMIT 1""",
                     (f"https://{domain}", f"https://{domain}/"),
                 ).fetchone()
                 wid = workspace[0] if workspace else "ws-" + uuid.uuid4().hex
@@ -213,7 +230,8 @@ class BriefingService:
                     ),
                 )
                 conn.executemany(
-                    "INSERT OR IGNORE INTO briefing_seen VALUES(?,?,?,?)",
+                    """INSERT OR IGNORE INTO briefing_seen(gmail_id, domain, reason, seen_at)
+                       VALUES(?,?,?,?)""",
                     [(i, domain, "", now()) for i in unseen],
                 )
 
@@ -292,10 +310,12 @@ class BriefingService:
         with self.repo.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             owner = conn.execute(
-                "SELECT value FROM briefing_state WHERE key='lease_owner'"
+                """SELECT value FROM briefing_state
+                   WHERE key='lease_owner' AND owner_user_id = pu_current_owner()"""
             ).fetchone()
             expires = conn.execute(
-                "SELECT value FROM briefing_state WHERE key='lease_until'"
+                """SELECT value FROM briefing_state
+                   WHERE key='lease_until' AND owner_user_id = pu_current_owner()"""
             ).fetchone()
             if owner and owner[0] != self.owner and expires and float(expires[0]) > time.time():
                 return False
@@ -304,7 +324,8 @@ class BriefingService:
                 ("lease_until", str(int(time.time() + 120))),
             ):
                 conn.execute(
-                    "INSERT INTO briefing_state VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    """INSERT INTO briefing_state(key, value) VALUES(?,?)
+                   ON CONFLICT(key, owner_user_id) DO UPDATE SET value=excluded.value""",
                     (key, value),
                 )
             return True
@@ -327,7 +348,9 @@ class BriefingService:
                 emails = [
                     dict(r)
                     for r in conn.execute(
-                        "SELECT * FROM crm_emails WHERE gmail_id IN (SELECT value FROM json_each(?))",
+                        """SELECT * FROM crm_emails
+                           WHERE owner_user_id = pu_current_owner()
+                             AND gmail_id IN (SELECT value FROM json_each(?))""",
                         (job["email_ids_json"],),
                     )
                 ]
@@ -349,7 +372,10 @@ class BriefingService:
                 if not selected:
                     with self.repo.database.connection() as conn:
                         conn.execute(
-                            "UPDATE briefing_seen SET reason='Không có nhu cầu hợp tác/chuẩn bị cuộc gặp' WHERE gmail_id IN (SELECT value FROM json_each(?))",
+                            """UPDATE briefing_seen
+                               SET reason='Không có nhu cầu hợp tác/chuẩn bị cuộc gặp'
+                               WHERE owner_user_id = pu_current_owner()
+                                 AND gmail_id IN (SELECT value FROM json_each(?))""",
                             (job["email_ids_json"],),
                         )
                     self.update(jid, status="skipped", stage="skipped")
@@ -361,7 +387,9 @@ class BriefingService:
                     # Rediscover by each explicit company website before research.
                     with self.repo.database.connection() as conn:
                         conn.execute(
-                            "DELETE FROM briefing_seen WHERE gmail_id IN (SELECT value FROM json_each(?))",
+                            """DELETE FROM briefing_seen
+                               WHERE owner_user_id = pu_current_owner()
+                                 AND gmail_id IN (SELECT value FROM json_each(?))""",
                             (json.dumps([e["gmail_id"] for e in emails]),),
                         )
                     self.update(
@@ -689,7 +717,13 @@ class BriefingService:
             while not self.stop_event.wait(30):
                 with self.repo.database.connection() as conn:
                     conn.execute(
-                        "UPDATE briefing_state SET value=? WHERE key='lease_until' AND EXISTS(SELECT 1 FROM briefing_state WHERE key='lease_owner' AND value=?)",
+                        """UPDATE briefing_state SET value=?
+                           WHERE key='lease_until' AND owner_user_id = pu_current_owner()
+                             AND EXISTS(
+                                 SELECT 1 FROM briefing_state
+                                 WHERE key='lease_owner' AND value=?
+                                   AND owner_user_id = pu_current_owner()
+                             )""",
                         (str(int(time.time() + 120)), self.owner),
                     )
 

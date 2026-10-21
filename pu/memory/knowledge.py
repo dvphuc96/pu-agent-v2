@@ -93,8 +93,14 @@ def set_group(conn: sqlite3.Connection, source_id: int, group: str) -> None:
 
 def delete_source(conn: sqlite3.Connection, source_id: int) -> None:
     # Chunks first — the FTS 'delete' trigger needs the rows still present.
-    conn.execute("DELETE FROM knowledge_chunks WHERE source_id=?", (source_id,))
-    conn.execute("DELETE FROM knowledge_sources WHERE id=?", (source_id,))
+    conn.execute(
+        "DELETE FROM knowledge_chunks WHERE source_id=? AND owner_user_id = pu_current_owner()",
+        (source_id,),
+    )
+    conn.execute(
+        "DELETE FROM knowledge_sources WHERE id=? AND owner_user_id = pu_current_owner()",
+        (source_id,),
+    )
     conn.commit()
 
 
@@ -111,6 +117,8 @@ def search(conn: sqlite3.Connection, query: str, top_k: int = 5) -> list[dict]:
            JOIN knowledge_chunks kc ON kc.id = kf.rowid
            JOIN knowledge_sources ks ON ks.id = kc.source_id
            WHERE knowledge_fts MATCH ? AND ks.enabled = 1
+             AND ks.owner_user_id = pu_current_owner()
+             AND kc.owner_user_id = pu_current_owner()
            ORDER BY rank LIMIT ?""",
         (safe, top_k),
     ).fetchall()
@@ -120,20 +128,27 @@ def search(conn: sqlite3.Connection, query: str, top_k: int = 5) -> list[dict]:
 def list_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """SELECT id, title, "group", origin, path, enabled, chars, added_at
-           FROM knowledge_sources ORDER BY "group", title"""
+           FROM knowledge_sources
+           WHERE owner_user_id = pu_current_owner()
+           ORDER BY "group", title"""
     ).fetchall()
 
 
 def get_source(conn: sqlite3.Connection, source_id: int) -> dict | None:
     row = conn.execute(
         """SELECT id, title, "group", origin, path, enabled, chars, added_at
-           FROM knowledge_sources WHERE id=?""", (source_id,)).fetchone()
+           FROM knowledge_sources WHERE id=? AND owner_user_id = pu_current_owner()""",
+        (source_id,),
+    ).fetchone()
     return dict(row) if row else None
 
 
 def chunks_for(conn: sqlite3.Connection, source_id: int) -> list[str]:
     return [r[0] for r in conn.execute(
-        "SELECT content FROM knowledge_chunks WHERE source_id=? ORDER BY id", (source_id,))]
+        """SELECT content FROM knowledge_chunks
+           WHERE source_id=? AND owner_user_id = pu_current_owner() ORDER BY id""",
+        (source_id,),
+    )]
 
 
 # ---- folder re-index ---------------------------------------------------------
@@ -146,7 +161,7 @@ def reindex_folder(conn: sqlite3.Connection, folder: Path) -> str:
              if p.is_file() and p.suffix.lower() in (".md", ".txt")}
     existing = {r["path"]: r for r in conn.execute(
         """SELECT id, path, fingerprint FROM knowledge_sources
-           WHERE origin='folder'""").fetchall()}
+           WHERE origin='folder' AND owner_user_id = pu_current_owner()""").fetchall()}
 
     added = updated = 0
     for name, path in files.items():

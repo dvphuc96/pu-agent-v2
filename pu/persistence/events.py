@@ -33,10 +33,10 @@ class SQLiteAgentEventRepository:
             )
 
     def list(self, *, limit: int = 200, workflow_id: str | None = None) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM agent_events"
+        sql = "SELECT * FROM agent_events WHERE owner_user_id = pu_current_owner()"
         params: tuple[Any, ...] = ()
         if workflow_id:
-            sql += " WHERE workflow_id=?"
+            sql += " AND workflow_id=?"
             params = (workflow_id,)
         sql += " ORDER BY occurred_at DESC LIMIT ?"
         params += (limit,)
@@ -52,7 +52,9 @@ class SQLiteAgentEventRepository:
     def aggregate(self, *, limit: int = 5000) -> dict[str, Any]:
         with self.database.connection() as conn:
             rows = conn.execute(
-                "SELECT kind, status, duration_ms, payload_json FROM agent_events ORDER BY occurred_at DESC LIMIT ?",
+                """SELECT kind, status, duration_ms, payload_json FROM agent_events
+                   WHERE owner_user_id = pu_current_owner()
+                   ORDER BY occurred_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         by_kind: dict[str, int] = {}
@@ -130,6 +132,9 @@ class SQLiteToolAuditSink(ToolAuditSink):
     def list(self, limit: int = 250) -> list[dict[str, Any]]:
         with self.database.connection() as conn:
             rows = conn.execute(
-                "SELECT record_json FROM tool_audit_events ORDER BY id DESC LIMIT ?", (limit,)
+                """SELECT record_json FROM tool_audit_events
+                   WHERE owner_user_id = pu_current_owner()
+                   ORDER BY id DESC LIMIT ?""",
+                (limit,),
             ).fetchall()
         return [json.loads(row[0]) for row in rows]

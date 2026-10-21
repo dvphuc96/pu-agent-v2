@@ -82,6 +82,9 @@ def _load_credentials(home: Path):
         try:
             creds.refresh(Request())
             path.write_text(creds.to_json(), encoding="utf-8")
+            from pu.identity.files import note_written
+
+            note_written(home, path)
         except Exception:
             return None
     return creds if (creds and creds.valid) else None
@@ -117,6 +120,9 @@ def connect(home: Path) -> str:
     path = _token_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(creds.to_json(), encoding="utf-8")
+    from pu.identity.files import note_written
+
+    note_written(home, path)
     return f"Gmail connected (read-only via {client_source}). Token cached at {path}."
 
 
@@ -207,7 +213,8 @@ def upsert_messages(conn: sqlite3.Connection, rows: list[dict]) -> int:
                    sender_email=excluded.sender_email, subject=excluded.subject,
                    snippet=excluded.snippet, body_text=excluded.body_text,
                    internal_date=excluded.internal_date, unread=excluded.unread,
-                   synced_at=datetime('now')""",
+                   synced_at=datetime('now')
+               WHERE crm_emails.owner_user_id = excluded.owner_user_id""",
             row,
         )
     conn.commit()

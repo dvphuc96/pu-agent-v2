@@ -60,6 +60,9 @@ def _load_credentials(home: Path):
         try:
             creds.refresh(Request())
             path.write_text(creds.to_json(), encoding="utf-8")
+            from pu.identity.files import note_written
+
+            note_written(home, path)
         except Exception:
             return None
     return creds if (creds and creds.valid) else None
@@ -95,6 +98,9 @@ def connect(home: Path) -> str:
     path = _token_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(creds.to_json(), encoding="utf-8")
+    from pu.identity.files import note_written
+
+    note_written(home, path)
     return f"Google Drive connected (read-only via {client_source}). Token cached at {path}."
 
 

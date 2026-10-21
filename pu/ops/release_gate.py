@@ -55,8 +55,12 @@ def report(deterministic: str, judge: str, suites: dict | None = None) -> None:
         "ran_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     (settings.home / "eval_report.json").write_text(json.dumps(record), encoding="utf-8")
-    with (settings.home / "eval_runs.jsonl").open("a", encoding="utf-8") as f:
+    runs_path = settings.home / "eval_runs.jsonl"
+    with runs_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
+    from pu.identity.files import note_written
+
+    note_written(settings.home, runs_path)
 
 
 def main() -> None:

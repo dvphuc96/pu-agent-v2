@@ -710,6 +710,10 @@ def approvals_info(home: Path) -> dict:
 
 def research_action(payload: dict) -> dict:
     """Run the deterministic read-only multi-agent research workflow."""
+    from pu.identity.requests import discard_client_owner
+
+    payload = discard_client_owner(payload)
+    payload.pop("workspace_id", None)
     prompt = (payload.get("prompt") or "").strip() or None
     try:
         days = max(1, min(int(payload.get("email_days") or 7), 30))
@@ -1080,7 +1084,11 @@ def memory_action(payload: dict) -> dict:
         text = (payload.get("content") or "").strip()
         if not text:
             return {"error": "SOUL cannot be empty"}
-        (settings.home / "SOUL.md").write_text(text + "\n")
+        soul_path = settings.home / "SOUL.md"
+        soul_path.write_text(text + "\n")
+        from pu.identity.files import note_written
+
+        note_written(settings.home, soul_path)
         return {"ok": True}
     if action == "save_skill":
         # Edit any loaded SKILL.md by hand (same file the agent's create_skill
@@ -1170,27 +1178,15 @@ class Handler(BaseHTTPRequestHandler):
             settings.ensure_home()
             try:
                 if self.path.startswith("/api/workspace/export"):
-                    from pu.reporting.workspace import WorkspaceRepository
-                    repo = WorkspaceRepository(settings.home)
-                    stored = repo.require_report(params.get("id", [""])[0], params.get("report", [""])[0])
+                    from pu.ops.workspace_api import export_workspace_artifact
+
                     kind = params.get("format", ["md"])[0]
-                    report_id = stored["payload"]["report_id"]
-                    if kind == "md":
-                        data, content_type = stored["payload"]["markdown"].encode(), "text/markdown; charset=utf-8"
-                    elif kind == "json":
-                        data, content_type = json.dumps(stored["payload"], ensure_ascii=False, indent=2).encode(), "application/json"
-                    elif kind == "docx":
-                        from pu.reporting.docx import render_docx
-                        data, content_type = render_docx(stored["payload"]), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    elif kind in {"html", "pdf"}:
-                        artifact = settings.home / "reports" / f"{report_id}.{kind}"
-                        original = settings.home / "reports" / f"{report_id}.json"
-                        from pu.reporting.workspace import content_hash
-                        if not artifact.is_file() or not original.is_file() or content_hash(json.loads(original.read_text(encoding="utf-8"))) != stored["content_hash"]:
-                            raise ValueError("Artifact chưa có hoặc không khớp phiên bản. Có thể xuất Markdown/JSON.")
-                        data, content_type = artifact.read_bytes(), "application/pdf" if kind == "pdf" else "text/html; charset=utf-8"
-                    else:
-                        raise ValueError("Định dạng không hỗ trợ.")
+                    data, content_type, report_id = export_workspace_artifact(
+                        settings.home,
+                        params.get("id", [""])[0],
+                        params.get("report", [""])[0],
+                        kind,
+                    )
                     self.send_response(200)
                     self.send_header("Content-Type", content_type)
                     self.send_header("Content-Disposition", f'attachment; filename="{report_id}.{kind}"')

@@ -1,0 +1,614 @@
+"""Add ``owner_user_id`` and composite foreign keys to private SQLite tables.
+
+Fresh databases and databases created before Phase 1 both go through this
+migration. SQLite has no row level security; the columns, composite foreign
+keys, and the connection stamp are the ownership boundary for dev and test.
+PostgreSQL enforces the same columns with RLS.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+OWNED_TABLES = frozenset(
+    {
+        "calendar_events",
+        "facts",
+        "episodes",
+        "chat_log",
+        "crm_emails",
+        "knowledge_sources",
+        "knowledge_chunks",
+        "proposed_actions",
+        "workflow_runs",
+        "workflow_stage_checkpoints",
+        "agent_events",
+        "tool_audit_events",
+        "research_workspaces",
+        "workspace_sources",
+        "workspace_reports",
+        "workspace_messages",
+        "workspace_deliveries",
+        "briefing_state",
+        "briefing_seen",
+        "briefing_jobs",
+    }
+)
+
+_FACTS_FTS_TRIGGERS = """
+CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN
+    INSERT INTO facts_fts(rowid, subject, content, owner_user_id)
+    VALUES (new.id, new.subject, new.content, new.owner_user_id);
+END;
+CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, subject, content, owner_user_id)
+    VALUES ('delete', old.id, old.subject, old.content, old.owner_user_id);
+END;
+CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, subject, content, owner_user_id)
+    VALUES ('delete', old.id, old.subject, old.content, old.owner_user_id);
+    INSERT INTO facts_fts(rowid, subject, content, owner_user_id)
+    VALUES (new.id, new.subject, new.content, new.owner_user_id);
+END;
+"""
+
+_EPISODES_FTS_TRIGGERS = """
+CREATE TRIGGER episodes_ai AFTER INSERT ON episodes BEGIN
+    INSERT INTO episodes_fts(rowid, summary, owner_user_id)
+    VALUES (new.id, new.summary, new.owner_user_id);
+END;
+CREATE TRIGGER episodes_ad AFTER DELETE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, summary, owner_user_id)
+    VALUES ('delete', old.id, old.summary, old.owner_user_id);
+END;
+"""
+
+_KNOWLEDGE_FTS_TRIGGERS = """
+CREATE TRIGGER knowledge_ai AFTER INSERT ON knowledge_chunks BEGIN
+    INSERT INTO knowledge_fts(rowid, content, owner_user_id)
+    VALUES (new.id, new.content, new.owner_user_id);
+END;
+CREATE TRIGGER knowledge_ad AFTER DELETE ON knowledge_chunks BEGIN
+    INSERT INTO knowledge_fts(knowledge_fts, rowid, content, owner_user_id)
+    VALUES ('delete', old.id, old.content, old.owner_user_id);
+END;
+CREATE TRIGGER knowledge_au AFTER UPDATE ON knowledge_chunks BEGIN
+    INSERT INTO knowledge_fts(knowledge_fts, rowid, content, owner_user_id)
+    VALUES ('delete', old.id, old.content, old.owner_user_id);
+    INSERT INTO knowledge_fts(rowid, content, owner_user_id)
+    VALUES (new.id, new.content, new.owner_user_id);
+END;
+"""
+
+
+def apply_ownership_migration(conn: sqlite3.Connection) -> None:
+    from pu.identity.directory import ensure_local_principal
+
+    conn.commit()
+    principal = ensure_local_principal(conn)
+    owner = principal.user_id
+    for table in sorted(OWNED_TABLES):
+        _add_owner_column(conn, table)
+    for table in sorted(OWNED_TABLES):
+        _backfill_owner(conn, table, owner)
+    _unique_owner_key(conn, "workflow_runs", "id")
+    _unique_owner_key(conn, "research_workspaces", "id")
+    _unique_owner_key(conn, "knowledge_sources", "id")
+    _unique_owner_key(conn, "workspace_reports", "report_id")
+    _rebuild_checkpoints(conn)
+    _rebuild_workspace_children(conn)
+    _rebuild_briefing_identity(conn)
+    _rebuild_knowledge_chunks(conn)
+    _upgrade_fts(
+        conn,
+        "facts_fts",
+        "facts",
+        ("subject", "content", "owner_user_id"),
+        _FACTS_FTS_TRIGGERS,
+    )
+    _upgrade_fts(
+        conn,
+        "episodes_fts",
+        "episodes",
+        ("summary", "owner_user_id"),
+        _EPISODES_FTS_TRIGGERS,
+    )
+    _upgrade_fts(
+        conn,
+        "knowledge_fts",
+        "knowledge_chunks",
+        ("content", "owner_user_id"),
+        _KNOWLEDGE_FTS_TRIGGERS,
+    )
+    _owner_match_triggers(conn)
+    conn._pu_local_owner = owner  # type: ignore[attr-defined]
+    conn._pu_local_workspace = principal.workspace_id  # type: ignore[attr-defined]
+
+
+def _exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def _add_owner_column(conn: sqlite3.Connection, table: str) -> None:
+    if not _exists(conn, table) or _is_virtual(conn, table):
+        return
+    if "owner_user_id" in _columns(conn, table):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT ''")
+
+
+def _backfill_owner(conn: sqlite3.Connection, table: str, owner: str) -> None:
+    if not _exists(conn, table) or _is_virtual(conn, table):
+        return
+    if "owner_user_id" not in _columns(conn, table):
+        return
+    conn.execute(
+        f"UPDATE {table} SET owner_user_id = ? WHERE owner_user_id = ''",
+        (owner,),
+    )
+
+
+def _is_virtual(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,)).fetchone()
+    return bool(row and row[0] and "VIRTUAL" in row[0].upper())
+
+
+def _unique_owner_key(conn: sqlite3.Connection, table: str, key: str) -> None:
+    if not _exists(conn, table) or "owner_user_id" not in _columns(conn, table):
+        return
+    conn.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{table}_{key}_owner ON {table}({key}, owner_user_id)"
+    )
+
+
+def _pk(conn: sqlite3.Connection, table: str) -> list[str]:
+    ranked = sorted(
+        (row[5], row[1]) for row in conn.execute(f"PRAGMA table_info({table})") if row[5]
+    )
+    return [name for _, name in ranked]
+
+
+def _has_fk(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: tuple[str, ...],
+    ref_table: str,
+    ref_columns: tuple[str, ...],
+) -> bool:
+    if not _exists(conn, table):
+        return False
+    groups: dict[int, list[tuple[int, str, str, str]]] = {}
+    for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
+        groups.setdefault(row[0], []).append((row[1], row[3], row[2], row[4]))
+    expected = list(zip(columns, [ref_table] * len(columns), ref_columns))
+    for pairs in groups.values():
+        ordered = [(src, parent, dst) for _, src, parent, dst in sorted(pairs)]
+        if ordered == expected:
+            return True
+    return False
+
+
+def _fk_off(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+
+
+def _fk_on(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _rebuild(conn: sqlite3.Connection, table: str, create_sql: str, columns: list[str]) -> None:
+    if not _exists(conn, table):
+        conn.execute(create_sql)
+        return
+    present = _columns(conn, table)
+    copied = [column for column in columns if column in present]
+    _fk_off(conn)
+    conn.execute(f"ALTER TABLE {table} RENAME TO {table}__pre_owner")
+    conn.execute(create_sql)
+    if copied:
+        quoted = ", ".join(copied)
+        conn.execute(
+            f"INSERT INTO {table}({quoted}) SELECT {quoted} FROM {table}__pre_owner"
+        )
+    conn.execute(f"DROP TABLE {table}__pre_owner")
+    _fk_on(conn)
+
+
+def _rebuild_checkpoints(conn: sqlite3.Connection) -> None:
+    if _has_fk(
+        conn,
+        "workflow_stage_checkpoints",
+        ("workflow_id", "owner_user_id"),
+        "workflow_runs",
+        ("id", "owner_user_id"),
+    ):
+        return
+    _drop_triggers(conn, "workflow_stage_checkpoints")
+    _rebuild(
+        conn,
+        "workflow_stage_checkpoints",
+        """CREATE TABLE workflow_stage_checkpoints (
+            workflow_id TEXT NOT NULL,
+            owner_user_id TEXT NOT NULL DEFAULT '',
+            stage_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT,
+            error TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(workflow_id, stage_name),
+            FOREIGN KEY(workflow_id, owner_user_id)
+                REFERENCES workflow_runs(id, owner_user_id) ON DELETE CASCADE
+        )""",
+        [
+            "workflow_id",
+            "owner_user_id",
+            "stage_name",
+            "status",
+            "result_json",
+            "error",
+            "updated_at",
+        ],
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_status
+           ON workflow_stage_checkpoints(status, updated_at DESC)"""
+    )
+
+
+def _rebuild_workspace_children(conn: sqlite3.Connection) -> None:
+    if not _has_fk(
+        conn,
+        "workspace_sources",
+        ("workspace_id", "owner_user_id"),
+        "research_workspaces",
+        ("id", "owner_user_id"),
+    ):
+        _drop_triggers(conn, "workspace_sources")
+        _rebuild(
+            conn,
+            "workspace_sources",
+            """CREATE TABLE workspace_sources (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                url TEXT NOT NULL DEFAULT '',
+                published_at TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                fingerprint TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(workspace_id, fingerprint),
+                FOREIGN KEY(workspace_id, owner_user_id)
+                    REFERENCES research_workspaces(id, owner_user_id) ON DELETE CASCADE
+            )""",
+            [
+                "id",
+                "workspace_id",
+                "owner_user_id",
+                "title",
+                "source_type",
+                "content",
+                "url",
+                "published_at",
+                "enabled",
+                "fingerprint",
+                "metadata_json",
+                "created_at",
+            ],
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_workspace_sources
+               ON workspace_sources(workspace_id, created_at)"""
+        )
+    if not _has_fk(
+        conn,
+        "workspace_reports",
+        ("workspace_id", "owner_user_id"),
+        "research_workspaces",
+        ("id", "owner_user_id"),
+    ):
+        _drop_triggers(conn, "workspace_reports")
+        _rebuild(
+            conn,
+            "workspace_reports",
+            """CREATE TABLE workspace_reports (
+                report_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                source_map_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(report_id, owner_user_id),
+                FOREIGN KEY(workspace_id, owner_user_id)
+                    REFERENCES research_workspaces(id, owner_user_id) ON DELETE CASCADE
+            )""",
+            [
+                "report_id",
+                "workspace_id",
+                "owner_user_id",
+                "content_hash",
+                "payload_json",
+                "source_map_json",
+                "created_at",
+            ],
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_workspace_reports
+               ON workspace_reports(workspace_id, created_at DESC)"""
+        )
+    if not _has_fk(
+        conn,
+        "workspace_messages",
+        ("workspace_id", "owner_user_id"),
+        "research_workspaces",
+        ("id", "owner_user_id"),
+    ):
+        _drop_triggers(conn, "workspace_messages")
+        _rebuild(
+            conn,
+            "workspace_messages",
+            """CREATE TABLE workspace_messages (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                source_ids_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(workspace_id, owner_user_id)
+                    REFERENCES research_workspaces(id, owner_user_id) ON DELETE CASCADE
+            )""",
+            [
+                "id",
+                "workspace_id",
+                "owner_user_id",
+                "question",
+                "answer",
+                "source_ids_json",
+                "created_at",
+            ],
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_workspace_messages
+               ON workspace_messages(workspace_id, created_at)"""
+        )
+    if not _has_fk(
+        conn,
+        "workspace_deliveries",
+        ("report_id", "owner_user_id"),
+        "workspace_reports",
+        ("report_id", "owner_user_id"),
+    ):
+        _drop_triggers(conn, "workspace_deliveries")
+        _rebuild(
+            conn,
+            "workspace_deliveries",
+            """CREATE TABLE workspace_deliveries (
+                action_hash TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                report_id TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(workspace_id, owner_user_id)
+                    REFERENCES research_workspaces(id, owner_user_id) ON DELETE CASCADE,
+                FOREIGN KEY(report_id, owner_user_id)
+                    REFERENCES workspace_reports(report_id, owner_user_id)
+            )""",
+            [
+                "action_hash",
+                "workspace_id",
+                "owner_user_id",
+                "report_id",
+                "destination",
+                "result_json",
+                "created_at",
+            ],
+        )
+    if not _has_fk(
+        conn,
+        "briefing_jobs",
+        ("workspace_id", "owner_user_id"),
+        "research_workspaces",
+        ("id", "owner_user_id"),
+    ):
+        _drop_triggers(conn, "briefing_jobs")
+        _rebuild(
+            conn,
+            "briefing_jobs",
+            """CREATE TABLE briefing_jobs (
+                id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL UNIQUE,
+                workspace_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'queued',
+                stage TEXT NOT NULL DEFAULT 'queued',
+                workflow_id TEXT,
+                report_id TEXT,
+                email_ids_json TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(workspace_id, owner_user_id)
+                    REFERENCES research_workspaces(id, owner_user_id)
+            )""",
+            [
+                "id",
+                "fingerprint",
+                "workspace_id",
+                "owner_user_id",
+                "status",
+                "stage",
+                "workflow_id",
+                "report_id",
+                "email_ids_json",
+                "error",
+                "created_at",
+                "updated_at",
+                "attempts",
+                "next_attempt",
+            ],
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_briefing_jobs_status
+               ON briefing_jobs(status, created_at)"""
+        )
+
+
+def _rebuild_briefing_identity(conn: sqlite3.Connection) -> None:
+    if _exists(conn, "briefing_state") and _pk(conn, "briefing_state") != [
+        "key",
+        "owner_user_id",
+    ]:
+        _drop_triggers(conn, "briefing_state")
+        _rebuild(
+            conn,
+            "briefing_state",
+            """CREATE TABLE briefing_state (
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(key, owner_user_id)
+            )""",
+            ["key", "value", "owner_user_id"],
+        )
+    if _exists(conn, "briefing_seen") and _pk(conn, "briefing_seen") != [
+        "gmail_id",
+        "owner_user_id",
+    ]:
+        _drop_triggers(conn, "briefing_seen")
+        _rebuild(
+            conn,
+            "briefing_seen",
+            """CREATE TABLE briefing_seen (
+                gmail_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                domain TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY(gmail_id, owner_user_id)
+            )""",
+            ["gmail_id", "owner_user_id", "domain", "reason", "seen_at"],
+        )
+
+
+def _rebuild_knowledge_chunks(conn: sqlite3.Connection) -> None:
+    if not _exists(conn, "knowledge_chunks"):
+        return
+    if _has_fk(
+        conn,
+        "knowledge_chunks",
+        ("source_id", "owner_user_id"),
+        "knowledge_sources",
+        ("id", "owner_user_id"),
+    ):
+        return
+    _drop_triggers(conn, "knowledge_chunks")
+    if _exists(conn, "knowledge_fts"):
+        conn.execute("DROP TABLE IF EXISTS knowledge_fts")
+    _rebuild(
+        conn,
+        "knowledge_chunks",
+        """CREATE TABLE knowledge_chunks (
+            id INTEGER PRIMARY KEY,
+            source_id INTEGER NOT NULL,
+            owner_user_id TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL,
+            FOREIGN KEY(source_id, owner_user_id)
+                REFERENCES knowledge_sources(id, owner_user_id) ON DELETE CASCADE
+        )""",
+        ["id", "source_id", "owner_user_id", "content"],
+    )
+
+
+def _drop_triggers(conn: sqlite3.Connection, table: str) -> None:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+        (table,),
+    ).fetchall()
+    for (name,) in rows:
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+
+def _upgrade_fts(
+    conn: sqlite3.Connection,
+    fts_name: str,
+    content: str,
+    columns: tuple[str, ...],
+    trigger_sql: str,
+) -> None:
+    if not _exists(conn, content):
+        return
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (fts_name,)).fetchone()
+    if row and row[0] and "owner_user_id" in row[0]:
+        return
+    _drop_triggers(conn, content)
+    conn.execute(f"DROP TABLE IF EXISTS {fts_name}")
+    rendered = []
+    for column in columns:
+        if column == "owner_user_id":
+            rendered.append("owner_user_id UNINDEXED")
+        else:
+            rendered.append(column)
+    conn.execute(
+        f"CREATE VIRTUAL TABLE {fts_name} USING fts5("
+        + ", ".join(rendered)
+        + f", content={content}, content_rowid=id)"
+    )
+    conn.executescript(trigger_sql)
+    conn.execute(f"INSERT INTO {fts_name}({fts_name}) VALUES('rebuild')")
+
+
+def _owner_match_triggers(conn: sqlite3.Connection) -> None:
+    statements = (
+        (
+            "agent_events",
+            "workflow_id",
+            "agent_events owner_user_id does not match workflow_runs",
+        ),
+        (
+            "tool_audit_events",
+            "workflow_id",
+            "tool_audit_events owner_user_id does not match workflow_runs",
+        ),
+        (
+            "proposed_actions",
+            "workflow_id",
+            "proposed_actions owner_user_id does not match workflow_runs",
+        ),
+    )
+    for table, column, message in statements:
+        if not _exists(conn, table):
+            continue
+        for timing in ("INSERT", "UPDATE"):
+            name = f"{table}_owner_match_{timing.lower()}"
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute(
+                f"""CREATE TRIGGER {name}
+                    BEFORE {timing} ON {table}
+                    FOR EACH ROW
+                    WHEN NEW.{column} IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM workflow_runs
+                        WHERE id = NEW.{column} AND owner_user_id <> NEW.owner_user_id
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT, '{message}');
+                    END"""
+            )

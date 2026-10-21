@@ -203,3 +203,6 @@ def save_pinned(specs: list[str]) -> None:
     path = _models_json()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"pinned": specs}, indent=1))
+    from pu.identity.files import note_written
+
+    note_written(path.parent, path)
