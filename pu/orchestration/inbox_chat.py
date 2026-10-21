@@ -389,11 +389,21 @@ class InboxChatBriefing:
         for group in groups.values():
             with self.repo.database.connection() as conn:
                 rows = conn.execute(
-                    "SELECT subject,body_text FROM crm_emails WHERE lower(sender_email) LIKE ? AND julianday(internal_date)<julianday(?) ORDER BY internal_date DESC LIMIT 3",
+                    """SELECT subject,body_text FROM crm_emails
+                       WHERE owner_user_id = pu_current_owner()
+                         AND lower(sender_email) LIKE ?
+                         AND julianday(internal_date)<julianday(?)
+                       ORDER BY internal_date DESC LIMIT 3""",
                     ("%@" + group["domain"], scan["start"]),
                 ).fetchall()
                 knowledge = conn.execute(
-                    "SELECT c.content FROM knowledge_chunks c JOIN knowledge_sources s ON s.id=c.source_id WHERE s.enabled=1 AND c.content LIKE ? LIMIT 2",
+                    """SELECT c.content FROM knowledge_chunks c
+                       JOIN knowledge_sources s
+                         ON s.id=c.source_id AND s.owner_user_id=c.owner_user_id
+                       WHERE s.enabled=1 AND c.content LIKE ?
+                         AND c.owner_user_id = pu_current_owner()
+                         AND s.owner_user_id = pu_current_owner()
+                       LIMIT 2""",
                     ("%" + group["domain"] + "%",),
                 ).fetchall()
             group["history"] = [
@@ -631,7 +641,10 @@ class InboxChatBriefing:
         ).hexdigest()
         with self.repo.database.connection() as conn:
             cached = conn.execute(
-                "SELECT workspace_id,payload_json FROM workspace_reports WHERE json_extract(payload_json,'$.metadata.inbox_fingerprint')=? ORDER BY created_at DESC LIMIT 1",
+                """SELECT workspace_id,payload_json FROM workspace_reports
+                   WHERE owner_user_id = pu_current_owner()
+                     AND json_extract(payload_json,'$.metadata.inbox_fingerprint')=?
+                   ORDER BY created_at DESC LIMIT 1""",
                 (fingerprint,),
             ).fetchone()
         cached_company_sources = []
@@ -683,7 +696,9 @@ class InboxChatBriefing:
         if workspace["company"] != group["company"]:
             with self.repo.database.connection() as conn:
                 conn.execute(
-                    "UPDATE research_workspaces SET company=? WHERE id=?", (group["company"], wid)
+                    """UPDATE research_workspaces SET company=?
+                       WHERE id=? AND owner_user_id = pu_current_owner()""",
+                    (group["company"], wid),
                 )
         current_emails = []
         for email in sorted(group["emails"], key=lambda email: email["internal_date"]):

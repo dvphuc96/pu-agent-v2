@@ -66,9 +66,9 @@ def resume_or_new_session(conn) -> str:
     # 'dashboard-%' filter would orphan those threads on restart. Every dashboard
     # message is tagged source='dashboard' — that's the reliable signal.
     row = conn.execute(
-        "SELECT session_id, MAX(created_at) AS last_at FROM chat_log "
-        "WHERE source='dashboard' GROUP BY session_id "
-        "ORDER BY last_at DESC LIMIT 1"
+        """SELECT session_id, MAX(created_at) AS last_at FROM chat_log
+           WHERE source='dashboard' AND owner_user_id = pu_current_owner()
+           GROUP BY session_id ORDER BY last_at DESC LIMIT 1"""
     ).fetchone()
     if row and row["last_at"]:
         try:
@@ -106,8 +106,11 @@ def maybe_rotate_session(agent) -> None:
     idle_min = int(os.getenv("PU_SESSION_IDLE_MINUTES", "60"))
     if idle_min <= 0:
         return
-    row = agent.conn.execute("SELECT MAX(created_at) FROM chat_log WHERE session_id=?",
-                             (agent.session.session_id,)).fetchone()
+    row = agent.conn.execute(
+        """SELECT MAX(created_at) FROM chat_log
+           WHERE session_id=? AND owner_user_id = pu_current_owner()""",
+        (agent.session.session_id,),
+    ).fetchone()
     if not row or not row[0]:
         return
     try:  # sqlite datetime('now') is UTC "YYYY-MM-DD HH:MM:SS"

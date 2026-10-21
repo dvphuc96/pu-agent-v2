@@ -132,7 +132,9 @@ def make_tools(home) -> list[Tool]:
         with repo.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT result_json FROM workspace_deliveries WHERE action_hash=?", (digest,)
+                """SELECT result_json FROM workspace_deliveries
+                   WHERE action_hash=? AND owner_user_id = pu_current_owner()""",
+                (digest,),
             ).fetchone()
             if row:
                 result = json.loads(row[0])
@@ -233,7 +235,9 @@ def make_tools(home) -> list[Tool]:
         with repo.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             previous = conn.execute(
-                "SELECT result_json FROM workspace_deliveries WHERE action_hash=?", (digest,)
+                """SELECT result_json FROM workspace_deliveries
+                   WHERE action_hash=? AND owner_user_id = pu_current_owner()""",
+                (digest,),
             ).fetchone()
             if previous:
                 result = json.loads(previous[0])
@@ -279,7 +283,8 @@ def make_tools(home) -> list[Tool]:
             }
         with repo.database.connection() as conn:
             conn.execute(
-                "UPDATE workspace_deliveries SET result_json=? WHERE action_hash=?",
+                """UPDATE workspace_deliveries SET result_json=?
+                   WHERE action_hash=? AND owner_user_id = pu_current_owner()""",
                 (json.dumps(receipt), digest),
             )
         return ToolResult(

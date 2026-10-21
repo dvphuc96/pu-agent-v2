@@ -107,7 +107,7 @@ def _action(action_id: str, principal: str, *, pending: bool, secret: str) -> Pr
         principal=principal,
         agent_id="report-agent",
         request_id="req-" + action_id,
-        workflow_id="wf-" + action_id,
+        workflow_id=None,
         tool_call_id="call-" + action_id,
         capability="message:write",
         required_scope="message:write",
@@ -126,7 +126,7 @@ def _audit(mark: str) -> ToolAuditRecord:
     return ToolAuditRecord(
         execution_id="exec-" + mark,
         request_id="req-" + mark,
-        workflow_id="wf-" + mark,
+        workflow_id=None,
         agent_id="worker",
         tool_call_id="call-" + mark,
         actor="worker",
@@ -441,14 +441,14 @@ def test_mu08_encryption_key_stays_out_of_jsonl_and_database(tmp_path, monkeypat
     tracer = Tracer(settings)
     AgentOpsHarness(_repository(home), tracer=tracer).publish(
         "tool_complete",
-        {"output": TOKEN_KEY, "workflow_id": "wf-key"},
+        {"output": TOKEN_KEY},
     )
     assert TOKEN_KEY not in tracer.path.read_text(encoding="utf-8")
     SQLiteToolAuditSink(SQLiteDatabase.from_home(home)).append(
         ToolAuditRecord(
             execution_id="exec-key",
             request_id="req-key",
-            workflow_id="wf-key",
+            workflow_id=None,
             agent_id="worker",
             tool_call_id="call-key",
             actor="worker",

@@ -246,8 +246,47 @@ CREATE TABLE briefing_jobs (
 """
 
 
-def install(conn, *, role: str = "pu_app", password: str = "pu-phase1-fixture") -> None:
-    """Replace the phase-1 schema and make ``role`` subject to forced RLS.
+def _schema_private_rows(conn) -> int | None:
+    """Row count in an existing schema, or None when the schema is absent.
+
+    Table names come from ``information_schema`` and are restricted to simple
+    identifiers before they are interpolated.
+    """
+    import re
+
+    found = conn.execute(
+        "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+        (SCHEMA,),
+    ).fetchone()
+    if not found:
+        return None
+    tables = conn.execute(
+        """SELECT table_name FROM information_schema.tables
+           WHERE table_schema = %s AND table_type = 'BASE TABLE'""",
+        (SCHEMA,),
+    ).fetchall()
+    total = 0
+    for (table,) in tables:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(table)):
+            continue
+        total += int(
+            conn.execute(f'SELECT COUNT(*) FROM "{SCHEMA}"."{table}"').fetchone()[0]
+        )
+    return total
+
+
+def install(
+    conn,
+    *,
+    role: str = "pu_app",
+    password: str | None = None,
+    replace_existing: bool = False,
+) -> None:
+    """Create the phase-1 schema and make ``role`` subject to forced RLS.
+
+    There is no default password. ``DROP SCHEMA`` runs only for an empty
+    schema, or when ``replace_existing`` is set for a fixture. A schema that
+    already holds rows is left in place.
 
     ``CREATE ROLE`` cannot run inside a transaction block, so this switches the
     connection to autocommit for the duration of the install and restores the
@@ -255,13 +294,21 @@ def install(conn, *, role: str = "pu_app", password: str = "pu-phase1-fixture") 
     """
     from psycopg import errors, sql
 
+    if not password:
+        raise ValueError("password is required; there is no default database password")
     if not role.replace("_", "").isalnum():
         raise ValueError("role must be a simple SQL identifier")
     previous_autocommit = getattr(conn, "autocommit", None)
     if previous_autocommit is False:
         conn.autocommit = True
     try:
-        conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+        existing = _schema_private_rows(conn)
+        if existing and not replace_existing:
+            raise RuntimeError(
+                f"refusing to DROP SCHEMA {SCHEMA}: it already contains {existing} rows"
+            )
+        if existing is not None:
+            conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
         conn.execute(f"CREATE SCHEMA {SCHEMA}")
         conn.execute(f"SET search_path TO {SCHEMA}")
         for statement in _DDL.split(";"):
@@ -276,6 +323,15 @@ def install(conn, *, role: str = "pu_app", password: str = "pu-phase1-fixture") 
                     USING (owner_user_id = current_setting('pu.owner_user_id', true))
                     WITH CHECK (owner_user_id = current_setting('pu.owner_user_id', true))"""
             )
+        # ``users`` is keyed by id, not owner_user_id, so it stays out of
+        # PRIVATE_TABLES. A caller may see only their own user row.
+        conn.execute("ALTER TABLE users ENABLE ROW LEVEL SECURITY")
+        conn.execute("ALTER TABLE users FORCE ROW LEVEL SECURITY")
+        conn.execute(
+            """CREATE POLICY pu_user_self ON users
+               USING (id = current_setting('pu.owner_user_id', true))
+               WITH CHECK (id = current_setting('pu.owner_user_id', true))"""
+        )
         try:
             conn.execute(
                 sql.SQL(

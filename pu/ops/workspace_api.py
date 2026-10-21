@@ -69,13 +69,12 @@ def export_workspace_artifact(
             data = FileReportRepository(home).read_bytes(report_id, kind)
         except OwnershipDenied as exc:
             raise KeyError("Artifact không thuộc người dùng hiện tại.") from exc
-        original = home / "reports" / f"{report_id}.json"
-        original_hash = (
-            content_hash(json.loads(original.read_text(encoding="utf-8")))
-            if original.is_file()
-            else ""
-        )
-        if not original.is_file() or original_hash != stored["content_hash"]:
+        try:
+            original_bytes = FileReportRepository(home).read_bytes(report_id, "json")
+        except (KeyError, OwnershipDenied):
+            original_bytes = b""
+        original_hash = content_hash(json.loads(original_bytes)) if original_bytes else ""
+        if not original_bytes or original_hash != stored["content_hash"]:
             raise ValueError("Artifact chưa có hoặc không khớp phiên bản. Có thể xuất Markdown/JSON.")
         content_type = "application/pdf" if kind == "pdf" else "text/html; charset=utf-8"
         return data, content_type, report_id
@@ -388,8 +387,11 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
                 )
                 with repo.database.connection() as conn:
                     pending = conn.execute(
-                        """SELECT id FROM proposed_actions WHERE status IN ('pending','approved')
-                        AND json_extract(arguments_json,'$.workspace_id')=? AND json_extract(arguments_json,'$.report_id')=?""",
+                        """SELECT id FROM proposed_actions
+                           WHERE owner_user_id = pu_current_owner()
+                             AND status IN ('pending','approved')
+                             AND json_extract(arguments_json,'$.workspace_id')=?
+                             AND json_extract(arguments_json,'$.report_id')=?""",
                         (workspace_id, original["payload"]["report_id"]),
                     ).fetchall()
                 for action in pending:

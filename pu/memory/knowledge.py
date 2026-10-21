@@ -70,24 +70,37 @@ def add_source(conn: sqlite3.Connection, title: str, text: str, group: str = "",
 
 
 def _replace_text(conn, source_id: int, text: str) -> None:
-    conn.execute("DELETE FROM knowledge_chunks WHERE source_id=?", (source_id,))
+    conn.execute(
+        """DELETE FROM knowledge_chunks
+           WHERE source_id=? AND owner_user_id = pu_current_owner()""",
+        (source_id,),
+    )
     for chunk in chunk_text(text):
         conn.execute("INSERT INTO knowledge_chunks (source_id, content) VALUES (?, ?)",
                      (source_id, chunk))
-    conn.execute("UPDATE knowledge_sources SET chars=?, fingerprint=? WHERE id=?",
-                 (len(text), _fingerprint(text), source_id))
+    conn.execute(
+        """UPDATE knowledge_sources SET chars=?, fingerprint=?
+           WHERE id=? AND owner_user_id = pu_current_owner()""",
+        (len(text), _fingerprint(text), source_id),
+    )
     conn.commit()
 
 
 def set_enabled(conn: sqlite3.Connection, source_id: int, enabled: bool) -> None:
-    conn.execute("UPDATE knowledge_sources SET enabled=? WHERE id=?",
-                 (1 if enabled else 0, source_id))
+    conn.execute(
+        """UPDATE knowledge_sources SET enabled=?
+           WHERE id=? AND owner_user_id = pu_current_owner()""",
+        (1 if enabled else 0, source_id),
+    )
     conn.commit()
 
 
 def set_group(conn: sqlite3.Connection, source_id: int, group: str) -> None:
-    conn.execute('UPDATE knowledge_sources SET "group"=? WHERE id=?',
-                 (group.strip() or "Ungrouped", source_id))
+    conn.execute(
+        """UPDATE knowledge_sources SET "group"=?
+           WHERE id=? AND owner_user_id = pu_current_owner()""",
+        (group.strip() or "Ungrouped", source_id),
+    )
     conn.commit()
 
 

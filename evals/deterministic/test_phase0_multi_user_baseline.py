@@ -130,7 +130,7 @@ def _action(action_id: str, principal: str) -> ProposedAction:
         principal=principal,
         agent_id="report-agent",
         request_id="req-" + principal,
-        workflow_id="wf-" + principal,
+        workflow_id=None,
         tool_call_id="call-" + principal,
         capability="message:write",
         required_scope="message:write",
@@ -157,7 +157,7 @@ def _publish_canary(tmp_path):
     tracer._otel_tracer = otel
     AgentOpsHarness(repository, tracer=tracer).publish(
         "tool_complete",
-        {"output": CANARY, "api_key": CANARY, "workflow_id": "wf-redact"},
+        {"output": CANARY, "api_key": CANARY},
     )
     return repository, tracer, otel
 
@@ -189,7 +189,7 @@ def test_sqlite_tool_audit_columns_redact_canary(tmp_path):
         ToolAuditRecord(
             execution_id="exec-audit",
             request_id="req-audit",
-            workflow_id="wf-audit",
+            workflow_id=None,
             agent_id="report-agent",
             tool_call_id="call-audit",
             actor="agent",

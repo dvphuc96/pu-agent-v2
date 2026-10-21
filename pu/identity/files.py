@@ -1,9 +1,8 @@
-"""Private files live under an owner root and a legacy path tests already use.
+"""Private files live under an owner root.
 
-New bytes are written under ``owners/<owner_user_id>/``. The historical path
-(``reports/``, ``traces/``, ``calendar.ics``, …) stays so the single-user
-suite can keep reading it. A read through this module refuses another
-owner's file.
+New bytes are written only under ``owners/<owner_user_id>/``. A read may
+still open a legacy path for the database-local user so older single-user
+files keep working. Another owner's file is refused.
 """
 
 from __future__ import annotations
@@ -60,16 +59,13 @@ def owner_root(home: Path, owner_user_id: str) -> Path:
 
 
 def write_owned_bytes(home: Path, relative: str, data: bytes) -> Path:
-    """Write ``relative`` for the current owner and mirror the legacy path."""
+    """Write ``relative`` under the current owner root only."""
     owner = owner_for_home(home)
     if not owner:
         raise OwnershipDenied("no principal is available to own this file")
     path = owner_root(home, owner) / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-    legacy = Path(home) / relative
-    legacy.parent.mkdir(parents=True, exist_ok=True)
-    legacy.write_bytes(data)
     _record(home, relative, owner)
     return path
 

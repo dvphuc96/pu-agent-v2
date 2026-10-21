@@ -235,6 +235,11 @@ class SQLiteMigrationRunner:
                 ),
             )
             newly_applied.append(migration.version)
+        from pu.persistence.ownership import _owner_match_triggers
+
+        # Re-install the workflow foreign-key triggers on databases that already
+        # recorded 9005, so a stricter check reaches existing files.
+        _owner_match_triggers(self.conn)
         self.conn.commit()
         from pu.identity.scope import load_local_owner_cache
 

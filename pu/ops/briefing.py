@@ -106,7 +106,11 @@ class BriefingService:
             jobs = [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT j.*,w.company,w.website FROM briefing_jobs j JOIN research_workspaces w ON w.id=j.workspace_id ORDER BY j.created_at DESC LIMIT 100"
+                    """SELECT j.*,w.company,w.website FROM briefing_jobs j
+                       JOIN research_workspaces w
+                         ON w.id=j.workspace_id AND w.owner_user_id=j.owner_user_id
+                       WHERE j.owner_user_id = pu_current_owner()
+                       ORDER BY j.created_at DESC LIMIT 100"""
                 )
             ]
             skipped = conn.execute(
@@ -239,7 +243,9 @@ class BriefingService:
         self.repo.require(workspace_id)
         with self.repo.database.connection() as conn:
             active = conn.execute(
-                "SELECT id FROM briefing_jobs WHERE workspace_id=? AND status IN ('queued','running','retrying')",
+                """SELECT id FROM briefing_jobs
+                   WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+                     AND status IN ('queued','running','retrying')""",
                 (workspace_id,),
             ).fetchone()
             if active:
@@ -294,7 +300,9 @@ class BriefingService:
                 continue
             with self.repo.database.connection() as conn:
                 if conn.execute(
-                    "SELECT 1 FROM briefing_jobs WHERE workspace_id=? AND status IN ('queued','running','retrying')",
+                    """SELECT 1 FROM briefing_jobs
+                       WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+                         AND status IN ('queued','running','retrying')""",
                     (workspace["id"],),
                 ).fetchone():
                     continue
@@ -325,11 +333,11 @@ class BriefingService:
             "next_attempt",
             "workspace_id",
         }
+        assignment_sql = ",".join(f"{key}=?" for key in values)
         with self.repo.database.connection() as conn:
             conn.execute(
-                "UPDATE briefing_jobs SET "
-                + ",".join(f"{key}=?" for key in values)
-                + ",updated_at=? WHERE id=?",
+                f"UPDATE briefing_jobs SET {assignment_sql},updated_at=? "
+                "WHERE id=? AND owner_user_id = pu_current_owner()",
                 (*values.values(), now(), jid),
             )
 
@@ -366,7 +374,9 @@ class BriefingService:
             with self.repo.database.connection() as conn:
                 saved = (
                     conn.execute(
-                        "SELECT payload_json FROM workspace_reports WHERE workspace_id=? AND json_extract(payload_json,'$.workflow_id')=? LIMIT 1",
+                        """SELECT payload_json FROM workspace_reports
+                           WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+                             AND json_extract(payload_json,'$.workflow_id')=? LIMIT 1""",
                         (wid, job["workflow_id"]),
                     ).fetchone()
                     if job["workflow_id"]
@@ -460,7 +470,8 @@ class BriefingService:
             if identity and identity["name"] != current_workspace["company"]:
                 with self.repo.database.connection() as conn:
                     conn.execute(
-                        "UPDATE research_workspaces SET company=? WHERE id=?",
+                        """UPDATE research_workspaces SET company=?
+                           WHERE id=? AND owner_user_id = pu_current_owner()""",
                         (identity["name"], wid),
                     )
             for email in sorted(emails, key=lambda item: item["internal_date"]):
@@ -530,7 +541,11 @@ class BriefingService:
             if payload.get("evaluation", {}).get("release_allowed"):
                 with self.repo.database.connection() as conn:
                     obsolete = conn.execute(
-                        "SELECT id FROM proposed_actions WHERE status IN ('pending','approved') AND json_extract(arguments_json,'$.workspace_id')=? AND json_extract(arguments_json,'$.report_id')!=?",
+                        """SELECT id FROM proposed_actions
+                           WHERE owner_user_id = pu_current_owner()
+                             AND status IN ('pending','approved')
+                             AND json_extract(arguments_json,'$.workspace_id')=?
+                             AND json_extract(arguments_json,'$.report_id')!=?""",
                         (wid, payload["report_id"]),
                     ).fetchall()
                 for row in obsolete:
@@ -658,7 +673,11 @@ class BriefingService:
         for tool in tools:
             with self.repo.database.connection() as conn:
                 existing = conn.execute(
-                    "SELECT id FROM proposed_actions WHERE tool_name=? AND json_extract(arguments_json,'$.report_id')=? AND (status IN ('executing','executed','failed','rejected') OR (status IN ('pending','approved') AND expires_at>?))",
+                    """SELECT id FROM proposed_actions
+                       WHERE owner_user_id = pu_current_owner()
+                         AND tool_name=? AND json_extract(arguments_json,'$.report_id')=?
+                         AND (status IN ('executing','executed','failed','rejected')
+                              OR (status IN ('pending','approved') AND expires_at>?))""",
                     (tool, payload["report_id"], now()),
                 ).fetchone()
             if not existing:
@@ -729,7 +748,11 @@ class BriefingService:
         with self.repo.database.connection() as conn:
             # Only a lease owner can reclaim an interrupted job; no active owner exists then.
             job = conn.execute(
-                "SELECT * FROM briefing_jobs WHERE status IN ('queued','running') OR (status='retrying' AND next_attempt<=?) ORDER BY created_at LIMIT 1",
+                """SELECT * FROM briefing_jobs
+                   WHERE owner_user_id = pu_current_owner()
+                     AND (status IN ('queued','running')
+                          OR (status='retrying' AND next_attempt<=?))
+                   ORDER BY created_at LIMIT 1""",
                 (now(),),
             ).fetchone()
         if job:
@@ -760,32 +783,87 @@ class BriefingService:
             self.application_signature = signature
         return self.application
 
+    def _due_owner_ids(self) -> list[str]:
+        with self.repo.database.connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT owner_user_id FROM briefing_jobs
+                   WHERE owner_user_id != ''
+                     AND (status IN ('queued','running')
+                          OR (status='retrying' AND next_attempt<=?))""",
+                (now(),),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def _lease_owner_ids(self) -> list[str]:
+        with self.repo.database.connection() as conn:
+            rows = conn.execute(
+                """SELECT owner_user_id FROM briefing_state
+                   WHERE key='lease_owner' AND owner_user_id != ''"""
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def _run_as_owner(self, owner_user_id: str, fn):
+        """Attach a worker principal for this job's owner, then restore the caller."""
+        from pu.identity.principal import Principal, PrincipalKind
+        from pu.identity.seam import InternalPrincipalSeam
+
+        with self.repo.database.connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM personal_workspaces WHERE owner_user_id=?",
+                (owner_user_id,),
+            ).fetchone()
+        if row is None:
+            return fn()
+        token = InternalPrincipalSeam().attach(
+            Principal(PrincipalKind.WORKER, owner_user_id, row[0])
+        )
+        try:
+            return fn()
+        finally:
+            InternalPrincipalSeam().detach(token)
+
+    def _renew_lease(self) -> None:
+        with self.repo.database.connection() as conn:
+            conn.execute(
+                """UPDATE briefing_state SET value=?
+                   WHERE key='lease_until' AND owner_user_id = pu_current_owner()
+                     AND EXISTS(
+                         SELECT 1 FROM briefing_state
+                         WHERE key='lease_owner' AND value=?
+                           AND owner_user_id = pu_current_owner()
+                     )""",
+                (str(int(time.time() + 120)), self.owner),
+            )
+
     def start(self):
         if self.thread and self.thread.is_alive():
             return
 
         def heartbeat():
             while not self.stop_event.wait(30):
-                with self.repo.database.connection() as conn:
-                    conn.execute(
-                        """UPDATE briefing_state SET value=?
-                           WHERE key='lease_until' AND owner_user_id = pu_current_owner()
-                             AND EXISTS(
-                                 SELECT 1 FROM briefing_state
-                                 WHERE key='lease_owner' AND value=?
-                                   AND owner_user_id = pu_current_owner()
-                             )""",
-                        (str(int(time.time() + 120)), self.owner),
-                    )
+                owners = self._lease_owner_ids()
+                if not owners:
+                    self._renew_lease()
+                    continue
+                for owner_user_id in owners:
+                    self._run_as_owner(owner_user_id, self._renew_lease)
+
+        def run_cycle():
+            try:
+                self.cycle()
+            except (Exception, SystemExit) as exc:
+                self.set_state(
+                    "scan_message", "Tác vụ tự động gặp lỗi: " + redact(str(exc))[:400]
+                )
 
         def loop():
             while not self.stop_event.is_set():
-                try:
-                    self.cycle()
-                except (Exception, SystemExit) as exc:
-                    self.set_state(
-                        "scan_message", "Tác vụ tự động gặp lỗi: " + redact(str(exc))[:400]
-                    )
+                owners = self._due_owner_ids()
+                if not owners:
+                    run_cycle()
+                else:
+                    for owner_user_id in owners:
+                        self._run_as_owner(owner_user_id, run_cycle)
                 self.wake.wait(15)
                 self.wake.clear()
 
@@ -816,6 +894,9 @@ def briefing_service(home, *, start=False):
 
 
 def briefing_action(home, payload):
+    from pu.identity.requests import coerce_workspace_id, discard_client_owner
+
+    payload = discard_client_owner(dict(payload or {}))
     service = briefing_service(home, start=True)
     op = payload.get("op")
     if op == "scan":
@@ -838,11 +919,14 @@ def briefing_action(home, payload):
                 raise ValueError("enabled phải là boolean.")
             service.set_state("enabled", "1" if payload["enabled"] else "0")
     elif op == "enqueue":
-        service.enqueue(payload.get("workspace_id", ""))
+        with service.repo.database.connection() as conn:
+            wid = coerce_workspace_id(conn, str(payload.get("workspace_id") or ""))
+        service.enqueue(wid)
     elif op == "prepare_review":
         from pu.ops.browser_agent import agent_lock, get_agent
 
-        wid = payload.get("workspace_id", "")
+        with service.repo.database.connection() as conn:
+            wid = coerce_workspace_id(conn, str(payload.get("workspace_id") or ""))
         report = service.repo.require_report(wid, payload.get("report_id", ""))["payload"]
         if report.get("evaluation", {}).get("release_allowed"):
             if not service.model_configured():
@@ -854,7 +938,9 @@ def briefing_action(home, payload):
     elif op == "retry":
         with service.repo.database.connection() as conn:
             conn.execute(
-                "UPDATE briefing_jobs SET status='queued',stage='queued',error='',attempts=0,updated_at=? WHERE id=? AND status='failed'",
+                """UPDATE briefing_jobs
+                   SET status='queued',stage='queued',error='',attempts=0,updated_at=?
+                   WHERE id=? AND status='failed' AND owner_user_id = pu_current_owner()""",
                 (now(), payload.get("id", "")),
             )
     else:

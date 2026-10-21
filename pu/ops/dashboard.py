@@ -274,7 +274,10 @@ def collect() -> dict:
         return {
             "source": "sqlite",
             "error": "",
-            "items": rows("SELECT id, happened_at, summary FROM episodes ORDER BY happened_at DESC"),
+            "items": rows(
+                """SELECT id, happened_at, summary FROM episodes
+                   WHERE owner_user_id = pu_current_owner() ORDER BY happened_at DESC"""
+            ),
         }
 
     episodes_data = episodes_payload()
@@ -387,14 +390,29 @@ def collect() -> dict:
         info = conn.execute(f"PRAGMA table_info({name})").fetchall()
         cols = [r["name"] for r in info]
         types = {r["name"]: r["type"] for r in info}
-        count = conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+        owned = " WHERE owner_user_id = pu_current_owner()" if "owner_user_id" in cols else ""
+        count = conn.execute(f"SELECT COUNT(*) FROM {name}{owned}").fetchone()[0]
         # up to 200 newest rows so each table has its own scrollable tab
-        sample = [dict(r) for r in conn.execute(f"SELECT * FROM {name} ORDER BY rowid DESC LIMIT 200").fetchall()]
+        sample = [dict(r) for r in conn.execute(
+            f"SELECT * FROM {name}{owned} ORDER BY rowid DESC LIMIT 200"
+        ).fetchall()]
         return {"name": name, "columns": cols, "types": types, "count": count, "sample": sample}
 
     db_path = home / "state.db"
-    all_tables = [r["name"] for r in
-                  conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()]
+    hidden_tables = {
+        "auth_sessions",
+        "oauth_connections",
+        "oidc_transactions",
+        "oidc_subjects",
+        "users",
+        "identity_local",
+        "schema_migrations",
+    }
+    all_tables = [
+        r["name"]
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        if r["name"] not in hidden_tables and not str(r["name"]).endswith("__pre_owner")
+    ]
     db_info = {
         "path": str(db_path.resolve()),
         "size": db_path.stat().st_size if db_path.exists() else 0,
@@ -452,26 +470,43 @@ def collect() -> dict:
                        for e in events[-200:]][::-1],
         "trace_file": (trace_files[-1].name if trace_files else None),
         "trace_errors": trace_errors,
-        "facts": rows("SELECT id, subject, content, source, created_at FROM facts ORDER BY id DESC"),
+        "facts": rows(
+            """SELECT id, subject, content, source, created_at FROM facts
+               WHERE owner_user_id = pu_current_owner() ORDER BY id DESC"""
+        ),
         "episodes": episodes_data["items"],
         "episodes_source": episodes_data["source"],
         "episodes_error": episodes_data["error"],
         "soul": (home / "SOUL.md").read_text(encoding="utf-8") if (home / "SOUL.md").exists() else "",
-        "chat_pending": conn.execute("SELECT COUNT(*) FROM chat_log WHERE consolidated=0").fetchone()[0],
-        "chat_log": rows("SELECT role, content, consolidated, source, session_id, created_at FROM chat_log ORDER BY id DESC LIMIT 80")[::-1],
+        "chat_pending": conn.execute(
+            "SELECT COUNT(*) FROM chat_log WHERE consolidated=0 AND owner_user_id = pu_current_owner()"
+        ).fetchone()[0],
+        "chat_log": rows(
+            """SELECT role, content, consolidated, source, session_id, created_at FROM chat_log
+               WHERE owner_user_id = pu_current_owner() ORDER BY id DESC LIMIT 80"""
+        )[::-1],
         "sessions": session_list(conn),
         "current_session": (live.session.session_id if live is not None else dash_session()),
         "consolidate_every": settings.consolidate_every,
-        "calendar": rows('SELECT title, start, "end", attendees, created_at FROM calendar_events ORDER BY start'),
+        "calendar": rows(
+            """SELECT title, start, "end", attendees, created_at FROM calendar_events
+               WHERE owner_user_id = pu_current_owner() ORDER BY start"""
+        ),
         # CRM inbox: what has been pulled so far (gmail.py syncs on demand, so
         # this is the local store, never a live Gmail call on page load).
-        "crm": rows("SELECT gmail_id, sender_name, sender_email, subject, snippet, "
-                    "internal_date, unread FROM crm_emails ORDER BY internal_date DESC LIMIT 100"),
+        "crm": rows(
+            """SELECT gmail_id, sender_name, sender_email, subject, snippet,
+                      internal_date, unread FROM crm_emails
+               WHERE owner_user_id = pu_current_owner()
+               ORDER BY internal_date DESC LIMIT 100"""
+        ),
         "gmail_enabled": settings.gmail,
         "gmail_connected": (home / "gmail-token.json").exists(),
         "knowledge_sources": [dict(r) for r in conn.execute(
             """SELECT id, title, "group", origin, path, enabled, chars, added_at
-               FROM knowledge_sources ORDER BY "group", title""")],
+               FROM knowledge_sources
+               WHERE owner_user_id = pu_current_owner()
+               ORDER BY "group", title""")],
         "drive_connected": (home / "drive-token.json").exists(),
         "outbox": outbox,
         "skills": skills,
@@ -514,20 +549,26 @@ def session_list(conn) -> list[dict]:
     session_id label on chat_log rows — the same table, no new storage."""
     groups = conn.execute(
         """SELECT session_id, COUNT(*) AS messages, MAX(created_at) AS last_at
-           FROM chat_log GROUP BY session_id ORDER BY last_at DESC"""
+           FROM chat_log WHERE owner_user_id = pu_current_owner()
+           GROUP BY session_id ORDER BY last_at DESC"""
     ).fetchall()
     out = []
     for g in groups:
         sid = g["session_id"]
         first = conn.execute(
-            "SELECT content FROM chat_log WHERE session_id=? AND role='user' ORDER BY id LIMIT 1",
+            """SELECT content FROM chat_log
+               WHERE session_id=? AND role='user' AND owner_user_id = pu_current_owner()
+               ORDER BY id LIMIT 1""",
             (sid,),
         ).fetchone()
         last = conn.execute(
-            "SELECT role, content FROM chat_log WHERE session_id=? ORDER BY id DESC LIMIT 1", (sid,)
+            """SELECT role, content FROM chat_log
+               WHERE session_id=? AND owner_user_id = pu_current_owner()
+               ORDER BY id DESC LIMIT 1""", (sid,)
         ).fetchone()
         sources = [r["source"] for r in conn.execute(
-            "SELECT DISTINCT source FROM chat_log WHERE session_id=?", (sid,)).fetchall()]
+            """SELECT DISTINCT source FROM chat_log
+               WHERE session_id=? AND owner_user_id = pu_current_owner()""", (sid,)).fetchall()]
         preview = ""
         if last:
             preview = ("you: " if last["role"] == "user" else "pu: ") + last["content"][:80]
@@ -974,41 +1015,31 @@ def run_query(payload: dict) -> dict:
         opener.close()
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", owner or ""):
         return {"error": "No owner is available for this query."}
+    from pu.persistence.ownership import OWNED_TABLES
+
     db = (settings.home / "state.db").resolve()
     memory = sqlite3.connect(":memory:")
     try:
         memory.execute("ATTACH DATABASE ? AS raw", (f"file:{db}?mode=ro",))
-        hidden = {
-            "auth_sessions",
-            "oauth_connections",
-            "oidc_transactions",
-            "oidc_subjects",
-            "users",
-            "identity_local",
-            "schema_migrations",
-        }
         tables = memory.execute(
             "SELECT name FROM raw.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
         for (name,) in tables:
-            if name in hidden or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            if name not in OWNED_TABLES or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                 continue
             try:
                 columns = [
                     row[1] for row in memory.execute(f"PRAGMA raw.table_info({name})").fetchall()
                 ]
                 # A view in this connection cannot point at the attached file.
-                # Copy the visible rows, then detach so the shared file is gone.
-                if "owner_user_id" in columns:
-                    memory.execute(
-                        f'CREATE TABLE "{name}" AS SELECT * FROM raw."{name}" '
-                        "WHERE owner_user_id = ?",
-                        (owner,),
-                    )
-                else:
-                    memory.execute(
-                        f'CREATE TABLE "{name}" AS SELECT * FROM raw."{name}"'
-                    )
+                # Copy only this owner's rows, then detach so the shared file is gone.
+                if "owner_user_id" not in columns:
+                    continue
+                memory.execute(
+                    f'CREATE TABLE "{name}" AS SELECT * FROM raw."{name}" '
+                    "WHERE owner_user_id = ?",
+                    (owner,),
+                )
             except sqlite3.Error:
                 continue
         memory.execute("DETACH DATABASE raw")
@@ -1038,11 +1069,13 @@ def _thread_history(conn, sid: str) -> list[dict]:
     drift apart (they used to: 'switch' dropped meta and showed only text)."""
     if sid == "__all__":
         rows = conn.execute(
-            "SELECT role, content, meta FROM chat_log ORDER BY id DESC LIMIT 200"
+            """SELECT role, content, meta FROM chat_log
+               WHERE owner_user_id = pu_current_owner() ORDER BY id DESC LIMIT 200"""
         ).fetchall()[::-1]
     else:
         rows = conn.execute(
-            "SELECT role, content, meta FROM chat_log WHERE session_id=? ORDER BY id",
+            """SELECT role, content, meta FROM chat_log
+               WHERE session_id=? AND owner_user_id = pu_current_owner() ORDER BY id""",
             (sid,),
         ).fetchall()
     # History written before usage metadata existed can still recover its token
@@ -1128,6 +1161,30 @@ def _editor_cmd() -> list[str] | None:
     return None
 
 
+def _names_other_owner(raw: str, owner: str) -> bool:
+    """True when a relative path walks through ``owners/<other-uuid>``."""
+    import re
+
+    parts = [part for part in raw.split("/") if part and part != "."]
+    for index, part in enumerate(parts):
+        if part != "owners" or index + 1 >= len(parts):
+            continue
+        named = parts[index + 1]
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", named) and named != owner:
+            return True
+    return False
+
+
+def _resolved_other_owner(target, home, owner: str) -> bool:
+    owners_root = (home / "owners").resolve()
+    if target != owners_root and owners_root not in target.parents:
+        return False
+    if target == owners_root:
+        return False
+    named = target.relative_to(owners_root).parts[0]
+    return named != owner
+
+
 def reveal_path(rel: str) -> dict:
     """Open a file under the current owner's root.
 
@@ -1146,10 +1203,14 @@ def reveal_path(rel: str) -> dict:
     if not owner:
         return {"error": "no principal"}
     raw = (rel or ".").replace("\\", "/").lstrip("/")
-    if raw == ".." or raw.startswith("../") or "/../" in f"/{raw}/":
-        return {"error": "path is outside the owner home"}
+    if _names_other_owner(raw, owner):
+        return {"error": "path belongs to another owner"}
     root = (home / "owners" / owner).resolve()
     target = (root / raw).resolve()
+    if _resolved_other_owner(target, home, owner):
+        return {"error": "path belongs to another owner"}
+    if raw == ".." or raw.startswith("../") or "/../" in f"/{raw}/":
+        return {"error": "path is outside the owner home"}
     if target != root and root not in target.parents:
         return {"error": "path is outside the owner home"}
     if not target.exists():

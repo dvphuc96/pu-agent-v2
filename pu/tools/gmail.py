@@ -201,14 +201,19 @@ def upsert_messages(conn: sqlite3.Connection, rows: list[dict]) -> int:
     (unread flips off when Gmail says so) and returns how many were NEW."""
     # sqlite3's rowcount counts the UPDATE arm of ON CONFLICT the same as the
     # INSERT arm, so "new" is decided by which ids were absent beforehand.
-    before = {r[0] for r in conn.execute("SELECT gmail_id FROM crm_emails")}
+    before = {
+        r[0]
+        for r in conn.execute(
+            "SELECT gmail_id FROM crm_emails WHERE owner_user_id = pu_current_owner()"
+        )
+    }
     for row in rows:
         conn.execute(
             """INSERT INTO crm_emails (gmail_id, thread_id, sender_name, sender_email,
                                        subject, snippet, body_text, internal_date, unread)
                VALUES (:gmail_id, :thread_id, :sender_name, :sender_email, :subject,
                        :snippet, :body_text, :internal_date, :unread)
-               ON CONFLICT(gmail_id) DO UPDATE SET
+               ON CONFLICT(gmail_id, owner_user_id) DO UPDATE SET
                    thread_id=excluded.thread_id, sender_name=excluded.sender_name,
                    sender_email=excluded.sender_email, subject=excluded.subject,
                    snippet=excluded.snippet, body_text=excluded.body_text,
@@ -263,7 +268,12 @@ def sync(conn: sqlite3.Connection, home: Path, label: str = "INBOX",
         limited = bool(token and len(ids) >= max_messages)
         ids = ids[:max_messages]
         if only_new:
-            known = {row[0] for row in conn.execute("SELECT gmail_id FROM crm_emails")}
+            known = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT gmail_id FROM crm_emails WHERE owner_user_id = pu_current_owner()"
+                )
+            }
             ids = [mid for mid in ids if mid not in known]
         rows = [normalize_message(service.users().messages()
                                   .get(userId="me", id=message_id, format="full").execute())
@@ -297,12 +307,16 @@ def make_recent_scan_tool(conn, home):
         if fresh:
             # Never mix previously synced/archived messages into a fresh INBOX batch.
             rows = conn.execute(
-                "SELECT * FROM crm_emails WHERE gmail_id IN (SELECT value FROM json_each(?)) ORDER BY julianday(internal_date) DESC,gmail_id LIMIT ?",
+                """SELECT * FROM crm_emails
+                   WHERE owner_user_id = pu_current_owner()
+                     AND gmail_id IN (SELECT value FROM json_each(?))
+                   ORDER BY julianday(internal_date) DESC,gmail_id LIMIT ?""",
                 (json.dumps(status["message_ids"]), limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM crm_emails ORDER BY julianday(internal_date) DESC,gmail_id LIMIT ?", (limit,),
+                """SELECT * FROM crm_emails WHERE owner_user_id = pu_current_owner()
+                   ORDER BY julianday(internal_date) DESC,gmail_id LIMIT ?""", (limit,),
             ).fetchall()
         return json.dumps({
             "fresh": fresh, "limited": False, "requested_limit": limit,
@@ -333,7 +347,11 @@ def make_today_tool(conn, home):
         status = {}
         message = sync(conn, home, max_messages=500, start=start, end=end, status=status)
         rows = conn.execute(
-            "SELECT * FROM crm_emails WHERE julianday(internal_date)>=julianday(?) AND julianday(internal_date)<julianday(?) ORDER BY internal_date DESC LIMIT 501",
+            """SELECT * FROM crm_emails
+               WHERE owner_user_id = pu_current_owner()
+                 AND julianday(internal_date)>=julianday(?)
+                 AND julianday(internal_date)<julianday(?)
+               ORDER BY internal_date DESC LIMIT 501""",
             (start.isoformat(), end.isoformat()),
         ).fetchall()
         return json.dumps({"fresh": status.get("ok", False), "limited": status.get("limited", False) or len(rows)>500,
@@ -367,7 +385,8 @@ def read_recent(conn: sqlite3.Connection, days: int = 1, max_results: int = 20) 
     """Emails received within the last `days` days, from the local store."""
     since = (datetime.now(UTC) - timedelta(days=max(0, days))).isoformat()
     rows = conn.execute(
-        """SELECT * FROM crm_emails WHERE internal_date >= ?
+        """SELECT * FROM crm_emails
+           WHERE owner_user_id = pu_current_owner() AND internal_date >= ?
            ORDER BY internal_date DESC LIMIT ?""",
         (since, max_results),
     ).fetchall()
