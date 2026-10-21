@@ -57,7 +57,10 @@ def reset_local_data(home: Path) -> dict:
         removed.append(child.name)
     conn = connect(home)
     # Give the user a clean start before the next normal background sync.
-    conn.execute("INSERT INTO briefing_state VALUES(?,?)", ("last_scan_epoch", str(time.time())))
+    conn.execute(
+        "INSERT INTO briefing_state(key, value) VALUES(?,?)",
+        ("last_scan_epoch", str(time.time())),
+    )
     conn.commit()
     conn.close()
     (home / "reset.marker").write_text(uuid.uuid4().hex, encoding="utf-8")

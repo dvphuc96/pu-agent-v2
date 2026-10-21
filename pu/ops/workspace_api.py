@@ -16,18 +16,70 @@ _model_limit = InMemoryRateLimiter(limit=20)
 
 
 def workspace_list(home: Path, workspace_id: str = "", report_id: str = "") -> dict:
+    from pu.identity.requests import coerce_workspace_id
+
     repo = WorkspaceRepository(home)
     repo.import_existing()
     if workspace_id:
+        with repo.database.connection() as conn:
+            workspace_id = coerce_workspace_id(conn, workspace_id)
         return repo.detail(workspace_id, report_id or None)
     with repo.database.connection() as conn:
         ignored = {
             r[0]
             for r in conn.execute(
-                "SELECT workspace_id FROM briefing_jobs GROUP BY workspace_id HAVING SUM(status!='skipped')=0"
+                """SELECT workspace_id FROM briefing_jobs
+                   WHERE owner_user_id = pu_current_owner()
+                   GROUP BY workspace_id HAVING SUM(status!='skipped')=0"""
             )
         }
     return {"items": [w for w in repo.list() if w["id"] not in ignored or w["report_count"]]}
+
+
+def export_workspace_artifact(
+    home: Path, workspace_id: str, report_id: str, kind: str
+) -> tuple[bytes, str, str]:
+    """Return artifact bytes for a workspace the current principal owns.
+
+    A workspace id or report id that belongs to someone else raises KeyError
+    or PermissionError and does not include that user's bytes.
+    """
+    from pu.identity.files import OwnershipDenied
+    from pu.reporting.repository import FileReportRepository
+    from pu.reporting.workspace import WorkspaceRepository, content_hash
+
+    repo = WorkspaceRepository(home)
+    stored = repo.require_report(workspace_id, report_id)
+    report_id = stored["payload"]["report_id"]
+    if kind == "md":
+        return stored["payload"]["markdown"].encode(), "text/markdown; charset=utf-8", report_id
+    if kind == "json":
+        body = json.dumps(stored["payload"], ensure_ascii=False, indent=2).encode()
+        return body, "application/json", report_id
+    if kind == "docx":
+        from pu.reporting.docx import render_docx
+
+        return (
+            render_docx(stored["payload"]),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            report_id,
+        )
+    if kind in {"html", "pdf"}:
+        try:
+            data = FileReportRepository(home).read_bytes(report_id, kind)
+        except OwnershipDenied as exc:
+            raise KeyError("Artifact không thuộc người dùng hiện tại.") from exc
+        original = home / "reports" / f"{report_id}.json"
+        original_hash = (
+            content_hash(json.loads(original.read_text(encoding="utf-8")))
+            if original.is_file()
+            else ""
+        )
+        if not original.is_file() or original_hash != stored["content_hash"]:
+            raise ValueError("Artifact chưa có hoặc không khớp phiên bản. Có thể xuất Markdown/JSON.")
+        content_type = "application/pdf" if kind == "pdf" else "text/html; charset=utf-8"
+        return data, content_type, report_id
+    raise ValueError("Định dạng không hỗ trợ.")
 
 
 def ask_sources(
@@ -46,7 +98,9 @@ def ask_sources(
     selected_ids = {s["id"] for s in sources}
     with repo.database.connection() as conn:
         previous = conn.execute(
-            "SELECT question,answer,source_ids_json FROM workspace_messages WHERE workspace_id=? ORDER BY created_at DESC LIMIT 5",
+            """SELECT question,answer,source_ids_json FROM workspace_messages
+               WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+               ORDER BY created_at DESC LIMIT 5""",
             (workspace_id,),
         ).fetchall()
     history = [
@@ -125,6 +179,9 @@ def ask_sources(
 
 
 def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
+    from pu.identity.requests import coerce_workspace_id, discard_client_owner
+
+    payload = discard_client_owner(payload)
     repo = WorkspaceRepository(home)
     op = payload.get("op", "")
     if op == "create":
@@ -141,7 +198,8 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
         from pu.tools.google_calendar import connect
 
         return {"message": connect(home)}
-    workspace_id = payload.get("workspace_id", "")
+    with repo.database.connection() as conn:
+        workspace_id = coerce_workspace_id(conn, payload.get("workspace_id", ""))
     workspace = repo.require(workspace_id)
     if op == "detail":
         return repo.detail(workspace_id, payload.get("report_id"))
@@ -174,20 +232,26 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
                     "emails": [
                         dict(r)
                         for r in conn.execute(
-                            "SELECT gmail_id,subject,sender_email,internal_date FROM crm_emails ORDER BY internal_date DESC LIMIT 100"
+                            """SELECT gmail_id,subject,sender_email,internal_date FROM crm_emails
+                               WHERE owner_user_id = pu_current_owner()
+                               ORDER BY internal_date DESC LIMIT 100"""
                         )
                     ],
                     "knowledge": [
                         dict(r)
                         for r in conn.execute(
-                            "SELECT id,title FROM knowledge_sources WHERE enabled=1 ORDER BY id DESC LIMIT 100"
+                            """SELECT id,title FROM knowledge_sources
+                               WHERE enabled=1 AND owner_user_id = pu_current_owner()
+                               ORDER BY id DESC LIMIT 100"""
                         )
                     ],
                 }
             kind = payload.get("kind")
             if kind == "email":
                 row = conn.execute(
-                    "SELECT * FROM crm_emails WHERE gmail_id=?", (payload.get("source_id"),)
+                    """SELECT * FROM crm_emails
+                       WHERE gmail_id=? AND owner_user_id = pu_current_owner()""",
+                    (payload.get("source_id"),),
                 ).fetchone()
                 if row is None:
                     raise KeyError("Email không tồn tại.")
@@ -195,13 +259,15 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
                 data = {"title": row["subject"], "content": content, "source_type": "email"}
             elif kind == "knowledge":
                 row = conn.execute(
-                    "SELECT title FROM knowledge_sources WHERE id=? AND enabled=1",
+                    """SELECT title FROM knowledge_sources
+                       WHERE id=? AND enabled=1 AND owner_user_id = pu_current_owner()""",
                     (payload.get("source_id"),),
                 ).fetchone()
                 if row is None:
                     raise KeyError("Knowledge source không tồn tại hoặc đã tắt.")
                 chunks = conn.execute(
-                    "SELECT content FROM knowledge_chunks WHERE source_id=? ORDER BY id",
+                    """SELECT content FROM knowledge_chunks
+                       WHERE source_id=? AND owner_user_id = pu_current_owner() ORDER BY id""",
                     (payload.get("source_id"),),
                 ).fetchall()
                 data = {

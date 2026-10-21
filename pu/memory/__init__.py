@@ -106,12 +106,20 @@ class Memory:
         """Update only this turn's telemetry, never report content or hashes."""
         import json
 
-        row = self.conn.execute("SELECT meta FROM chat_log WHERE id=? AND role='assistant'", (message_id,)).fetchone()
+        row = self.conn.execute(
+            """SELECT meta FROM chat_log
+               WHERE id=? AND role='assistant' AND owner_user_id = pu_current_owner()""",
+            (message_id,),
+        ).fetchone()
         if row is None:
             return
         meta = json.loads(row[0]) if row[0] else {}
         meta.update(response_timing=timing, latency_ms=int(timing["duration_seconds"] * 1000))
-        self.conn.execute("UPDATE chat_log SET meta=? WHERE id=? AND role='assistant'", (json.dumps(meta), message_id))
+        self.conn.execute(
+            """UPDATE chat_log SET meta=?
+               WHERE id=? AND role='assistant' AND owner_user_id = pu_current_owner()""",
+            (json.dumps(meta), message_id),
+        )
         self.conn.commit()
 
     # ---- sessions (for the dashboard's chat history + "New chat")
@@ -119,7 +127,8 @@ class Memory:
         """The (user, assistant) exchanges of one past session, in order — used
         to reload working memory when the user switches back to a conversation."""
         rows = self.conn.execute(
-            "SELECT role, content FROM chat_log WHERE session_id = ? ORDER BY id",
+            """SELECT role, content FROM chat_log
+               WHERE session_id = ? AND owner_user_id = pu_current_owner() ORDER BY id""",
             (session_id,),
         ).fetchall()
         pairs, pending = [], None
@@ -139,12 +148,16 @@ class Memory:
                       COUNT(*) AS messages,
                       MIN(created_at) AS started_at,
                       MAX(created_at) AS last_at
-               FROM chat_log GROUP BY session_id ORDER BY last_at DESC"""
+               FROM chat_log
+               WHERE owner_user_id = pu_current_owner()
+               GROUP BY session_id ORDER BY last_at DESC"""
         ).fetchall()
         out = []
         for r in rows:
             first = self.conn.execute(
-                "SELECT content FROM chat_log WHERE session_id = ? AND role = 'user' ORDER BY id LIMIT 1",
+                """SELECT content FROM chat_log
+                   WHERE session_id = ? AND role = 'user' AND owner_user_id = pu_current_owner()
+                   ORDER BY id LIMIT 1""",
                 (r["session_id"],),
             ).fetchone()
             out.append({
@@ -162,10 +175,13 @@ class Memory:
         is a file you can open" is true. state.db stays the queryable source of
         truth; this file is a generated view, refreshed after each turn."""
         facts = self.conn.execute(
-            "SELECT subject, content FROM facts ORDER BY subject, id"
+            """SELECT subject, content FROM facts
+               WHERE owner_user_id = pu_current_owner() ORDER BY subject, id"""
         ).fetchall()
         eps = self.conn.execute(
-            "SELECT happened_at, summary FROM episodes ORDER BY happened_at DESC, id DESC"
+            """SELECT happened_at, summary FROM episodes
+               WHERE owner_user_id = pu_current_owner()
+               ORDER BY happened_at DESC, id DESC"""
         ).fetchall()
         lines = [
             "# PU memory",
@@ -180,7 +196,11 @@ class Memory:
         lines += [f"- **{f['subject']}** — {f['content']}" for f in facts] or ["_none yet_"]
         lines += ["", f"## Episodes — episodic memory ({len(eps)})", ""]
         lines += [f"- **{e['happened_at']}** — {e['summary']}" for e in eps] or ["_none yet_"]
-        (self.settings.home / "MEMORY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        memory_path = self.settings.home / "MEMORY.md"
+        memory_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        from pu.identity.files import note_written
+
+        note_written(self.settings.home, memory_path)
 
     def maybe_consolidate(self, notify=None) -> None:
         new_facts = consolidation.consolidate_if_due(

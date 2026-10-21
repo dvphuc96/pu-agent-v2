@@ -82,6 +82,9 @@ def make_update_soul_tool(settings) -> Tool:
             text = text.rstrip() + "\n\n## Learned rules\n"
         text = text.rstrip() + f"\n- {rule}\n"
         path.write_text(text, encoding="utf-8")
+        from pu.identity.files import note_written
+
+        note_written(settings.home, path)
         return f"Noted, I'll remember to: {rule}"
 
     return Tool(
@@ -118,6 +121,9 @@ def make_create_skill_tool(settings, memory) -> Tool:
             return "That didn't validate — description must be present and non-trivial."
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
+        from pu.identity.files import note_written
+
+        note_written(settings.home, dest)
         memory.skills.refresh()  # live this session
         return f"Created skill '{name}'. It will trigger on: {description.strip()}"
 

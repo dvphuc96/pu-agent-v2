@@ -115,6 +115,10 @@ class JsonlToolAuditSink(ToolAuditSink):
         payload = redact(payload)
         with self._lock, self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        if self.path.parent.name == "traces":
+            from pu.identity.files import note_written
+
+            note_written(self.path.parent.parent, self.path)
 
 
 

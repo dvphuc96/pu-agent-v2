@@ -45,6 +45,9 @@ def _write_ics(home: Path, title: str, start: str, end: str, attendees: str) -> 
     else:
         body = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//pu-agent//EN\n"
     ics_path.write_text(body + event + "END:VCALENDAR\n", encoding="utf-8")
+    from pu.identity.files import note_written
+
+    note_written(home, ics_path)
 
 
 def _google_event_body(
@@ -109,6 +112,9 @@ def probe_google_calendar(home: Path, calendar_id: str = "primary") -> None:
         try:
             credentials.refresh(Request())
             token_path.write_text(credentials.to_json(), encoding="utf-8")
+            from pu.identity.files import note_written
+
+            note_written(home, token_path)
         except Exception:
             raise RuntimeError(reauthorize) from None
     if not credentials.valid:
@@ -208,6 +214,9 @@ def sync_to_google_calendar(
                     credentials.refresh(Request())
                     token_path.parent.mkdir(parents=True, exist_ok=True)
                     token_path.write_text(credentials.to_json(), encoding="utf-8")
+                    from pu.identity.files import note_written
+
+                    note_written(home, token_path)
                 except Exception:
                     credentials = None
 
@@ -228,6 +237,9 @@ def sync_to_google_calendar(
                 credentials = flow.run_local_server(port=0)
                 token_path.parent.mkdir(parents=True, exist_ok=True)
                 token_path.write_text(credentials.to_json(), encoding="utf-8")
+                from pu.identity.files import note_written
+
+                note_written(home, token_path)
         else:
             credentials, _ = google.auth.default(scopes=[GOOGLE_CALENDAR_SCOPE])
 
@@ -291,7 +303,9 @@ def make_tool(
         start = start[:16]  # normalize 2026-07-11T17:00:00 → 2026-07-11T17:00
         end = end[:16]
         existing = conn.execute(
-            "SELECT id FROM calendar_events WHERE title = ? AND start = ?", (title, start)
+            """SELECT id FROM calendar_events
+               WHERE title = ? AND start = ? AND owner_user_id = pu_current_owner()""",
+            (title, start),
         ).fetchone()
         if existing:
             return f"Event '{title}' at {start} already exists (not duplicated)."
@@ -371,7 +385,10 @@ def make_list_tool(conn: sqlite3.Connection, home: Path | None = None) -> Tool:
     """
     def local_events(start: str = "", end: str = "", limit: int = 20) -> str:
         query = 'SELECT title, start, "end", attendees FROM calendar_events'
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)")}
         clauses, params = [], []
+        if "owner_user_id" in columns:
+            clauses.append("owner_user_id = pu_current_owner()")
         if start:
             clauses.append("start >= ?")
             params.append(start[:10])                 # inclusive from the start of that day

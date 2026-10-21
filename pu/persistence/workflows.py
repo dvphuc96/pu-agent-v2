@@ -78,7 +78,10 @@ class SQLiteWorkflowRepository:
 
     def get(self, workflow_id: str) -> WorkflowRun | None:
         with self.database.connection() as conn:
-            row = conn.execute("SELECT * FROM workflow_runs WHERE id=?", (workflow_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM workflow_runs WHERE id=? AND owner_user_id = pu_current_owner()",
+                (workflow_id,),
+            ).fetchone()
         if row is None:
             return None
         return WorkflowRun(
@@ -96,10 +99,10 @@ class SQLiteWorkflowRepository:
         return ResearchWorkflowRequest(**run.request)
 
     def list(self, *, limit: int = 50, status: str | None = None) -> list[WorkflowRun]:
-        sql = "SELECT id FROM workflow_runs"
+        sql = "SELECT id FROM workflow_runs WHERE owner_user_id = pu_current_owner()"
         params: tuple[Any, ...] = ()
         if status:
-            sql += " WHERE status=?"
+            sql += " AND status=?"
             params = (status,)
         sql += " ORDER BY updated_at DESC LIMIT ?"
         params += (limit,)
@@ -113,7 +116,8 @@ class SQLiteWorkflowRepository:
             cur = conn.execute(
                 """UPDATE workflow_runs
                    SET status='running', error=NULL, attempt=attempt+1, updated_at=?
-                   WHERE id=? AND status IN ('failed','interrupted','running')""",
+                   WHERE id=? AND owner_user_id = pu_current_owner()
+                     AND status IN ('failed','interrupted','running')""",
                 (now, workflow_id),
             )
             if cur.rowcount != 1:
@@ -123,7 +127,8 @@ class SQLiteWorkflowRepository:
     def set_current_stage(self, workflow_id: str, stage_name: str) -> None:
         with self.database.connection() as conn:
             conn.execute(
-                "UPDATE workflow_runs SET current_stage=?, updated_at=? WHERE id=?",
+                """UPDATE workflow_runs SET current_stage=?, updated_at=?
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
                 (stage_name, _now(), workflow_id),
             )
 
@@ -141,7 +146,8 @@ class SQLiteWorkflowRepository:
                 (workflow_id, stage_name, payload, now),
             )
             conn.execute(
-                "UPDATE workflow_runs SET current_stage=?, updated_at=? WHERE id=?",
+                """UPDATE workflow_runs SET current_stage=?, updated_at=?
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
                 (stage_name, now, workflow_id),
             )
 
@@ -160,7 +166,9 @@ class SQLiteWorkflowRepository:
     def checkpoints(self, workflow_id: str) -> dict[str, WorkflowCheckpoint]:
         with self.database.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM workflow_stage_checkpoints WHERE workflow_id=? ORDER BY updated_at",
+                """SELECT * FROM workflow_stage_checkpoints
+                   WHERE workflow_id=? AND owner_user_id = pu_current_owner()
+                   ORDER BY updated_at""",
                 (workflow_id,),
             ).fetchall()
         out: dict[str, WorkflowCheckpoint] = {}
@@ -176,7 +184,8 @@ class SQLiteWorkflowRepository:
     def mark_failed(self, workflow_id: str, error: str) -> WorkflowRun:
         with self.database.connection() as conn:
             conn.execute(
-                "UPDATE workflow_runs SET status='failed', error=?, updated_at=? WHERE id=?",
+                """UPDATE workflow_runs SET status='failed', error=?, updated_at=?
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
                 (error[:2000], _now(), workflow_id),
             )
         return self.get(workflow_id)
@@ -188,7 +197,7 @@ class SQLiteWorkflowRepository:
                 """UPDATE workflow_runs
                    SET status='completed', report_id=?, error=NULL,
                        current_stage='completed', updated_at=?, completed_at=?
-                   WHERE id=?""",
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
                 (report_id, now, now, workflow_id),
             )
         return self.get(workflow_id)

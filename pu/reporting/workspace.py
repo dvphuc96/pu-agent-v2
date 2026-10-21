@@ -48,7 +48,9 @@ class WorkspaceRepository:
     def require(self, workspace_id: str) -> dict:
         with self.database.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM research_workspaces WHERE id=?", (workspace_id,)
+                """SELECT * FROM research_workspaces
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
+                (workspace_id,),
             ).fetchone()
         if row is None:
             raise KeyError("Không tìm thấy workspace.")
@@ -75,14 +77,18 @@ class WorkspaceRepository:
             rows = conn.execute("""SELECT w.*,
                 (SELECT COUNT(*) FROM workspace_sources s WHERE s.workspace_id=w.id) AS source_count,
                 (SELECT COUNT(*) FROM workspace_reports r WHERE r.workspace_id=w.id) AS report_count
-                FROM research_workspaces w ORDER BY updated_at DESC LIMIT 200""").fetchall()
+                FROM research_workspaces w
+                WHERE w.owner_user_id = pu_current_owner()
+                ORDER BY updated_at DESC LIMIT 200""").fetchall()
         return [dict(row) for row in rows]
 
     def sources(self, workspace_id: str) -> list[dict]:
         self.require(workspace_id)
         with self.database.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM workspace_sources WHERE workspace_id=? ORDER BY created_at,id",
+                """SELECT * FROM workspace_sources
+                   WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+                   ORDER BY created_at,id""",
                 (workspace_id,),
             ).fetchall()
         items = []
@@ -143,11 +149,14 @@ class WorkspaceRepository:
                 ),
             )
             row = conn.execute(
-                "SELECT id FROM workspace_sources WHERE workspace_id=? AND fingerprint=?",
+                """SELECT id FROM workspace_sources
+                   WHERE workspace_id=? AND fingerprint=? AND owner_user_id = pu_current_owner()""",
                 (workspace_id, fingerprint),
             ).fetchone()
             conn.execute(
-                "UPDATE research_workspaces SET updated_at=? WHERE id=?", (now(), workspace_id)
+                """UPDATE research_workspaces SET updated_at=?
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
+                (now(), workspace_id),
             )
         return next(s for s in self.sources(workspace_id) if s["id"] == row["id"])
 
@@ -156,7 +165,8 @@ class WorkspaceRepository:
             raise TypeError("enabled phải là boolean.")
         with self.database.connection() as conn:
             cur = conn.execute(
-                "UPDATE workspace_sources SET enabled=? WHERE workspace_id=? AND id=?",
+                """UPDATE workspace_sources SET enabled=?
+                   WHERE workspace_id=? AND id=? AND owner_user_id = pu_current_owner()""",
                 (int(enabled), workspace_id, source_id),
             )
             if cur.rowcount != 1:
@@ -182,7 +192,8 @@ class WorkspaceRepository:
             raise ValueError("Report ID không hợp lệ.")
         with self.database.connection() as conn:
             existing = conn.execute(
-                "SELECT content_hash,workspace_id FROM workspace_reports WHERE report_id=?",
+                """SELECT content_hash,workspace_id FROM workspace_reports
+                   WHERE report_id=? AND owner_user_id = pu_current_owner()""",
                 (report_id,),
             ).fetchone()
         if existing:
@@ -212,7 +223,8 @@ class WorkspaceRepository:
         stamp = now()
         with self.database.connection() as conn:
             existing = conn.execute(
-                "SELECT content_hash,workspace_id FROM workspace_reports WHERE report_id=?",
+                """SELECT content_hash,workspace_id FROM workspace_reports
+                   WHERE report_id=? AND owner_user_id = pu_current_owner()""",
                 (report_id,),
             ).fetchone()
             if existing and (
@@ -233,7 +245,8 @@ class WorkspaceRepository:
                 ),
             )
             conn.execute(
-                "UPDATE research_workspaces SET active_report_id=?,updated_at=? WHERE id=?",
+                """UPDATE research_workspaces SET active_report_id=?,updated_at=?
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
                 (report_id, stamp, workspace_id),
             )
         return self.report(workspace_id, report_id)
@@ -243,7 +256,8 @@ class WorkspaceRepository:
         report_id = report_id or workspace["active_report_id"]
         with self.database.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM workspace_reports WHERE workspace_id=? AND report_id=?",
+                """SELECT * FROM workspace_reports
+                   WHERE workspace_id=? AND report_id=? AND owner_user_id = pu_current_owner()""",
                 (workspace_id, report_id),
             ).fetchone()
         if row is None:
@@ -270,21 +284,29 @@ class WorkspaceRepository:
             versions = [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT report_id,content_hash,created_at FROM workspace_reports WHERE workspace_id=? ORDER BY created_at DESC",
+                    """SELECT report_id,content_hash,created_at FROM workspace_reports
+                       WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+                       ORDER BY created_at DESC""",
                     (workspace_id,),
                 )
             ]
             messages = [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT * FROM (SELECT * FROM workspace_messages WHERE workspace_id=? ORDER BY created_at DESC LIMIT 50) ORDER BY created_at",
+                    """SELECT * FROM (
+                           SELECT * FROM workspace_messages
+                           WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+                           ORDER BY created_at DESC LIMIT 50
+                       ) ORDER BY created_at""",
                     (workspace_id,),
                 )
             ]
             deliveries = [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT * FROM workspace_deliveries WHERE workspace_id=? ORDER BY created_at DESC LIMIT 30",
+                    """SELECT * FROM workspace_deliveries
+                       WHERE workspace_id=? AND owner_user_id = pu_current_owner()
+                       ORDER BY created_at DESC LIMIT 30""",
                     (workspace_id,),
                 )
             ]
@@ -315,7 +337,9 @@ class WorkspaceRepository:
         self.require(workspace_id)
         with self.database.connection() as conn:
             conn.execute(
-                "INSERT INTO workspace_messages VALUES(?,?,?,?,?,?)",
+                """INSERT INTO workspace_messages(
+                       id, workspace_id, question, answer, source_ids_json, created_at
+                   ) VALUES(?,?,?,?,?,?)""",
                 (
                     "msg-" + uuid.uuid4().hex,
                     workspace_id,
@@ -325,25 +349,42 @@ class WorkspaceRepository:
                     now(),
                 ),
             )
-            conn.execute("UPDATE research_workspaces SET updated_at=? WHERE id=?", (now(), workspace_id))
+            conn.execute(
+                """UPDATE research_workspaces SET updated_at=?
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
+                (now(), workspace_id),
+            )
 
     def record_delivery(
         self, workspace_id: str, report_id: str, action_hash: str, destination: str, result: dict
     ) -> None:
         with self.database.connection() as conn:
             conn.execute(
-                "INSERT OR IGNORE INTO workspace_deliveries VALUES(?,?,?,?,?,?)",
+                """INSERT OR IGNORE INTO workspace_deliveries(
+                       action_hash, workspace_id, report_id, destination, result_json, created_at
+                   ) VALUES(?,?,?,?,?,?)""",
                 (action_hash, workspace_id, report_id, destination, json.dumps(result), now()),
             )
 
     def import_existing(self) -> None:
         """Expose existing report artifacts without requiring an LLM or rerunning research."""
+        from pu.identity.files import owner_for_home
+
+        owner = owner_for_home(self.home)
         with self.database.connection() as conn:
-            known = {r[0] for r in conn.execute("SELECT report_id FROM workspace_reports")}
+            known = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT report_id FROM workspace_reports WHERE owner_user_id = pu_current_owner()"
+                )
+            }
         for path in sorted(
             (self.home / "reports").glob("report-*.json"), key=lambda p: p.stat().st_mtime
         ):
             if path.stem in known:
+                continue
+            sidecar = path.with_name(path.name + ".owner")
+            if sidecar.is_file() and sidecar.read_text(encoding="utf-8").strip() != owner:
                 continue
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))

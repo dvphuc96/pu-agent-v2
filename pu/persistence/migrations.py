@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 class Migration:
     version: int
     name: str
-    sql: str
+    sql: str = ""
 
 
 MIGRATIONS = (
@@ -195,6 +195,11 @@ ALTER TABLE briefing_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE briefing_jobs ADD COLUMN next_attempt TEXT NOT NULL DEFAULT '';
 ''',
     ),
+    Migration(
+        9005,
+        "owner_user_id_personal_workspace_and_composite_fks",
+        "",
+    ),
 )
 
 
@@ -215,7 +220,12 @@ class SQLiteMigrationRunner:
         for migration in MIGRATIONS:
             if migration.version in applied:
                 continue
-            self.conn.executescript(migration.sql)
+            if migration.version == 9005:
+                from pu.persistence.ownership import apply_ownership_migration
+
+                apply_ownership_migration(self.conn)
+            elif migration.sql:
+                self.conn.executescript(migration.sql)
             self.conn.execute(
                 "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
                 (
@@ -226,4 +236,7 @@ class SQLiteMigrationRunner:
             )
             newly_applied.append(migration.version)
         self.conn.commit()
+        from pu.identity.scope import load_local_owner_cache
+
+        load_local_owner_cache(self.conn)
         return newly_applied

@@ -18,7 +18,11 @@ def make_tool(home: Path) -> Tool:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
         safe_to = "".join(c if c.isalnum() else "-" for c in to)[:40]
         path = home / "outbox" / f"{stamp}-{safe_to}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"To: {to}\n\n{body}\n", encoding="utf-8")
+        from pu.identity.files import note_written
+
+        note_written(home, path)
         return f"Message to {to} placed in outbox ({path.name}). Nothing was sent — review it there."
 
     return Tool(

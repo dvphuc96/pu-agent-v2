@@ -75,6 +75,9 @@ def send_credentials(home):
         credentials.refresh(Request())
         path.write_text(credentials.to_json(), encoding="utf-8")
         path.chmod(0o600)
+        from pu.identity.files import note_written
+
+        note_written(home, path)
     if not credentials.valid:
         raise ValueError("Gmail token không hợp lệ; cần kết nối lại.")
     return credentials
@@ -96,6 +99,9 @@ def connect_send(home) -> str:
     path = home / "gmail-send-token.json"
     path.write_text(credentials.to_json(), encoding="utf-8")
     path.chmod(0o600)
+    from pu.identity.files import note_written
+
+    note_written(home, path)
     return "Đã kết nối Gmail gửi email. Mọi lần gửi vẫn cần phê duyệt."
 
 
@@ -151,7 +157,9 @@ def make_tools(home) -> list[Tool]:
                     (source_id, chunk),
                 )
             conn.execute(
-                "INSERT INTO workspace_deliveries VALUES(?,?,?,?,?,?)",
+                """INSERT INTO workspace_deliveries(
+                       action_hash, workspace_id, report_id, destination, result_json, created_at
+                   ) VALUES(?,?,?,?,?,?)""",
                 (
                     digest,
                     workspace_id,
@@ -235,7 +243,9 @@ def make_tools(home) -> list[Tool]:
                     error=None if result["status"] == "sent" else "delivery_uncertain",
                 )
             conn.execute(
-                "INSERT INTO workspace_deliveries VALUES(?,?,?,?,?,?)",
+                """INSERT INTO workspace_deliveries(
+                       action_hash, workspace_id, report_id, destination, result_json, created_at
+                   ) VALUES(?,?,?,?,?,?)""",
                 (
                     digest,
                     workspace_id,

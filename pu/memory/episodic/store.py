@@ -32,6 +32,7 @@ class SqliteEpisodeStore:
         rows = self.conn.execute(
             "SELECT e.happened_at, e.summary FROM episodes_fts JOIN episodes e "
             "ON e.id = episodes_fts.rowid WHERE episodes_fts MATCH ? "
+            "AND e.owner_user_id = pu_current_owner() "
             "ORDER BY rank, e.happened_at DESC LIMIT ?",
             (fts, top_k),
         ).fetchall()
@@ -39,19 +40,25 @@ class SqliteEpisodeStore:
 
     def recent(self, top_k: int = 3) -> list[str]:
         rows = self.conn.execute(
-            "SELECT happened_at, summary FROM episodes ORDER BY happened_at DESC LIMIT ?",
+            """SELECT happened_at, summary FROM episodes
+               WHERE owner_user_id = pu_current_owner()
+               ORDER BY happened_at DESC LIMIT ?""",
             (top_k,),
         ).fetchall()
         return [f"({r['happened_at']}) {r['summary']}" for r in rows]
 
     def list(self, limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT id, happened_at, summary, created_at FROM episodes ORDER BY id DESC LIMIT ?",
+            """SELECT id, happened_at, summary, created_at FROM episodes
+               WHERE owner_user_id = pu_current_owner() ORDER BY id DESC LIMIT ?""",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 
     def delete(self, episode_id: int) -> bool:
-        cur = self.conn.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
+        cur = self.conn.execute(
+            "DELETE FROM episodes WHERE id=? AND owner_user_id = pu_current_owner()",
+            (episode_id,),
+        )
         self.conn.commit()
         return cur.rowcount > 0

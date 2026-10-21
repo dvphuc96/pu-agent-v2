@@ -103,6 +103,9 @@ class Tracer:
         record["ts"] = _now()
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        from pu.identity.files import note_written
+
+        note_written(self.settings.home, self.path)
 
     def _record_usage(self, event: dict) -> None:
         """Append one LLM call's token usage to a PERMANENT ledger (usage.jsonl).
@@ -114,8 +117,12 @@ class Tracer:
         record = {"ts": _now(), "provider": self.settings.provider,
                   "model": self.settings.model or "", "kind": "loop",
                   "in": usage.get("in", 0), "out": usage.get("out", 0)}
-        with (self.settings.home / "usage.jsonl").open("a", encoding="utf-8") as f:
+        usage_path = self.settings.home / "usage.jsonl"
+        with usage_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
+        from pu.identity.files import note_written
+
+        note_written(self.settings.home, usage_path)
 
     # ---- the Observer: called by the loop for every llm/tool/gate/... event
     def event(self, kind: str, event: dict) -> None:
