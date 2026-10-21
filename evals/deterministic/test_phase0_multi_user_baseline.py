@@ -19,10 +19,11 @@ from pu.approval.repository import SQLiteApprovalRepository
 from pu.config import Settings
 from pu.core.interfaces.tools import ToolResult
 from pu.db import connect
+from pu.harness.audit import ToolAuditRecord
 from pu.ops.agentops import AgentOpsHarness
 from pu.ops.briefing import BriefingService
 from pu.ops.tracing import Tracer
-from pu.persistence import SQLiteAgentEventRepository, SQLiteDatabase
+from pu.persistence import SQLiteAgentEventRepository, SQLiteDatabase, SQLiteToolAuditSink
 from pu.reporting.collection import CollectionConfig, collect_partner_sources
 from pu.reporting.workspace import WorkspaceRepository
 from pu.tools.calendar import make_list_tool
@@ -143,14 +144,8 @@ def _action(action_id: str, principal: str) -> ProposedAction:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "AgentOps ghi SQLite agent_events đã redact, nhưng Tracer.event "
-        "ghi nguyên payload vào JSONL và attribute OTel."
-    ),
-)
-def test_agentops_redacts_canary_before_jsonl_and_otel(tmp_path):
+def _publish_canary(tmp_path):
+    """Publish one canary event through AgentOps into SQLite, JSONL and a fake OTel tracer."""
     home = tmp_path / "home"
     settings = Settings(home=home, otel_endpoint="")
     settings.ensure_home()
@@ -163,15 +158,79 @@ def test_agentops_redacts_canary_before_jsonl_and_otel(tmp_path):
         "tool_complete",
         {"output": CANARY, "api_key": CANARY, "workflow_id": "wf-redact"},
     )
+    return repository, tracer, otel
 
-    leaks = []
-    if CANARY in json.dumps(repository.list()):
-        leaks.append("sqlite")
-    if CANARY in tracer.path.read_text(encoding="utf-8"):
-        leaks.append("jsonl")
-    if CANARY in json.dumps(otel.spans):
-        leaks.append("otel")
-    assert leaks == []
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Tracer.event ghi nguyên payload vào JSONL ngày. "
+        "Phase 2 gỡ đúng marker này; marker OTel thuộc Phase 5."
+    ),
+)
+def test_agentops_redacts_canary_in_jsonl(tmp_path):
+    repository, tracer, _otel = _publish_canary(tmp_path)
+    assert CANARY not in json.dumps(repository.list())
+    assert CANARY not in tracer.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Tracer.event ghi nguyên payload vào attribute span OTel. "
+        "Phase 5 gỡ đúng marker này; marker JSONL thuộc Phase 2."
+    ),
+)
+def test_agentops_redacts_canary_in_otel(tmp_path):
+    repository, _tracer, otel = _publish_canary(tmp_path)
+    assert CANARY not in json.dumps(repository.list())
+    assert CANARY not in json.dumps(otel.spans)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "SQLiteToolAuditSink redact record_json nhưng ghi nguyên reason, "
+        "result_summary và error. Phase 2 gỡ đúng marker này."
+    ),
+)
+def test_sqlite_tool_audit_columns_redact_canary(tmp_path):
+    home = tmp_path / "home"
+    connect(home).close()
+    database = SQLiteDatabase.from_home(home)
+    SQLiteToolAuditSink(database).append(
+        ToolAuditRecord(
+            execution_id="exec-audit",
+            request_id="req-audit",
+            workflow_id="wf-audit",
+            agent_id="report-agent",
+            tool_call_id="call-audit",
+            actor="agent",
+            principal="local-user",
+            tool="send_message",
+            capability="message:write",
+            required_scope="message:write",
+            side_effect=True,
+            external=False,
+            arguments={"text": "hello"},
+            action_hash="b" * 64,
+            status="executed",
+            timestamp="2026-10-21T00:00:00.000Z",
+            policy="allow",
+            reason=CANARY,
+            latency_ms=1,
+            result_summary=CANARY,
+            error=CANARY,
+        )
+    )
+    with database.connection() as conn:
+        row = conn.execute(
+            "SELECT reason, result_summary, error, record_json FROM tool_audit_events"
+        ).fetchone()
+    assert CANARY not in (row["record_json"] or "")
+    assert CANARY not in (row["reason"] or "")
+    assert CANARY not in (row["result_summary"] or "")
+    assert CANARY not in (row["error"] or "")
 
 
 @pytest.mark.xfail(
@@ -312,8 +371,90 @@ def test_collector_calendar_read_goes_through_tool_harness(tmp_path, monkeypatch
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Tracer.__init__ gán self._trace_api = None sau _init_otel, "
-        "nên span con không gắn được parent context."
+        "workspace_action op fetch_source (pu/ops/workspace_api.py) gọi fetch_source "
+        "trực tiếp. Phase 2 gỡ đúng marker này."
+    ),
+)
+def test_workspace_fetch_source_goes_through_tool_harness(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = _fresh_state()
+    monkeypatch.setattr("pu.tools.web_source.fetch_source", _mark_bypass(state, "page"))
+    repo = WorkspaceRepository(home)
+    workspace = repo.create("Acme", "https://acme.example")
+    from pu.ops.workspace_api import workspace_action
+
+    workspace_action(
+        home,
+        {
+            "op": "fetch_source",
+            "workspace_id": workspace["id"],
+            "url": "https://acme.example/about",
+        },
+        app_factory=lambda: _app(state),
+    )
+    assert state["bypasses"] == []
+    assert any(name in PAGE_TOOLS for name in state["harness"])
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "gmail_sync_action (pu/ops/dashboard.py) gọi gmail.sync trực tiếp. "
+        "Phase 2 gỡ đúng marker này."
+    ),
+)
+def test_dashboard_gmail_sync_goes_through_tool_harness(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = _fresh_state()
+    settings = Settings(home=home)
+    settings.ensure_home()
+    monkeypatch.setattr("pu.ops.dashboard.load_settings", lambda: settings)
+    monkeypatch.setattr("pu.tools.gmail.sync", _mark_bypass(state, "gmail"))
+    from pu.ops.dashboard import gmail_sync_action
+
+    gmail_sync_action({})
+    assert state["bypasses"] == []
+    assert any(name in GMAIL_TOOLS for name in state["harness"])
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "todays_events (pu/graph/workflows/triage.py) đọc calendar.ics trực tiếp. "
+        "Phase 2 gỡ đúng marker này."
+    ),
+)
+def test_triage_ics_read_goes_through_tool_harness(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "calendar.ics").write_text(
+        "BEGIN:VEVENT\nSUMMARY:Local\nDTSTART:20261021T090000\nEND:VEVENT\n",
+        encoding="utf-8",
+    )
+    state = _fresh_state()
+    original = Path.read_text
+
+    def _tracking_read(self, *args, **kwargs):
+        if self.name == "calendar.ics" and not state["in_harness"]:
+            state["bypasses"].append("calendar-ics")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _tracking_read)
+    from pu.graph.workflows.triage import todays_events
+
+    todays_events(home)
+    assert state["bypasses"] == []
+    assert any(name in CALENDAR_TOOLS for name in state["harness"])
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Tracer.__init__ gán self._trace_api = None sau _init_otel. "
+        "Test này chỉ kiểm tra lệnh gán đè, không kiểm tra parent span hay exporter. "
+        "Phase 5 gỡ đúng marker này."
     ),
 )
 def test_tracer_init_keeps_otel_trace_api(tmp_path, monkeypatch):

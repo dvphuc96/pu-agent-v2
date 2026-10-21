@@ -82,14 +82,12 @@ Hiện không có `user_id`, không có `owner_user_id`, và mọi bảng SQLite
 - MU-02: A tải artifact của B thì bị từ chối.
 - MU-07: với RLS, truy vấn của A không thấy hàng của B.
 - MU-10: import `local-user` không có bản đồ thì thất bại; có bản đồ thì hàng thuộc đúng user.
-- MU-11: đổi ID trên URL hoặc body không đọc được tài nguyên của người khác.
+- MU-11, phần IDOR: đổi ID trên URL hoặc body không đọc được tài nguyên của người khác. Phần CSRF của MU-11 không thuộc cổng phase này.
 - MU-12: body chứa `owner_user_id` hoặc `workspace_id` của B vẫn ghi và đọc theo principal A.
-
-CSRF của cookie phiên thuộc Phase 2. Phase 1 vẫn phải chặn IDOR khi đã biết principal.
 
 ### Việc xong khi
 
-Toàn bộ cổng trên pass bằng fixture A/B, không dùng dữ liệu người thật. Chưa cần OIDC nếu test gắn principal bằng seam nội bộ đã được ghi trong ADR; seam đó phải bị thay bởi phiên thật trước Phase 6.
+Toàn bộ cổng trên pass bằng fixture A/B, không dùng dữ liệu người thật. Chưa cần OIDC nếu test gắn principal bằng `InternalPrincipalSeam` (`pu.identity.seam`), trường `principal_seam` trên `ApplicationDependencies` do `create_application` trả về, như mục 1.6 của `docs/MULTI_USER_ARCHITECTURE_ROADMAP.md`. Phase 6 xóa module đó và trường đó; sau mốc ấy principal chỉ còn đến từ phiên OIDC.
 
 ---
 
@@ -108,12 +106,12 @@ Dashboard hiện bind `127.0.0.1`, không có phiên, không CSRF, không mã h�
 ### Phạm vi
 
 - OIDC Authorization Code + PKCE.
-- Cookie phiên `HttpOnly`, `Secure`, `SameSite`, cộng CSRF cho mọi yêu cầu đổi trạng thái.
+- Cookie phiên `HttpOnly`, `Secure`, `SameSite=Lax`, cộng CSRF token cho mọi yêu cầu đổi trạng thái. `Lax` giữ cookie `state` và PKCE verifier trên GET callback của IdP. `Strict` làm gãy vòng redirect đó. `Lax` không thay CSRF token.
 - Thu hồi phiên và token chặn ngay thao tác sau đó.
 - Token OAuth mã hóa; khóa không nằm trong DB và không nằm trong telemetry.
-- Đọc Gmail, Calendar và trang web của worker/collector đi qua Tool Harness với principal `WORKER` và `owner_user_id` của job.
+- Đọc Gmail, Calendar và trang web đi qua Tool Harness với principal `WORKER` và `owner_user_id` của job. Cổng harness gồm worker/collector và ba callsite: `pu/ops/workspace_api.py` dòng 160–163 (`fetch_source`), `pu/ops/dashboard.py` dòng 822–823 (`gmail.sync`), `pu/graph/workflows/triage.py` dòng 74–78 (`todays_events` đọc `calendar.ics`).
 - Phục hồi có lease: không fail hàng `executing` của owner khác; không fail hàng mà instance khác còn giữ lease; không thực thi lại side effect đã có thể gửi.
-- Redact trước khi ghi JSONL, OTel, cột `tool_audit_events`, và mọi sink khác.
+- Redact JSONL trace và cột `tool_audit_events.reason`, `result_summary`, `error`. Attribute OTel không thuộc cổng redact của phase này.
 
 ### Phụ thuộc
 
@@ -125,12 +123,13 @@ Dashboard hiện bind `127.0.0.1`, không có phiên, không CSRF, không mã h�
 - MU-04: A phê duyệt hành động của B thì bị từ chối, kể cả khi biết `approval_id`.
 - MU-05: job A và B đồng thời không trộn email, lịch, báo cáo, hay audit.
 - MU-06: sau khi thu hồi phiên hoặc token, request tiếp theo bị chặn.
-- MU-08: canary vắng mặt ở SQLite, JSONL, OTel, cột audit và usage ledger.
+- MU-08, phần JSONL và cột audit: canary vắng mặt ở JSONL trace và ở `reason`, `result_summary`, `error`. Attribute OTel thuộc OPS-02 ở Phase 5.
 - MU-09: instance thứ hai khởi động không làm `failed` thực thi đang sống và không gửi trùng.
+- MU-11, phần CSRF: request đổi trạng thái thiếu CSRF token, hoặc token không khớp phiên, bị từ chối.
 
 ### Việc xong khi
 
-Các `xfail` Phase 0 về redact, `recover_inflight`, và bypass Tool Harness được gỡ vì hành vi đúng đã pass. Không còn đường `gmail.sync`, `read_availability`, `fetch_source` từ worker/collector ngoài harness.
+Gỡ đúng các marker Phase 2, mỗi marker một lần: `test_agentops_redacts_canary_in_jsonl`, `test_sqlite_tool_audit_columns_redact_canary`, `test_recover_inflight_preserves_other_owner_and_live_lease`, bốn test worker/collector, `test_workspace_fetch_source_goes_through_tool_harness`, `test_dashboard_gmail_sync_goes_through_tool_harness`, `test_triage_ics_read_goes_through_tool_harness`. Không gỡ `test_agentops_redacts_canary_in_otel` và `test_tracer_init_keeps_otel_trace_api`. Ba callsite `workspace_api`, `dashboard` và `triage` không còn gọi nhà cung cấp hoặc đọc `calendar.ics` ngoài Tool Harness.
 
 ---
 
@@ -205,7 +204,7 @@ Attachment, hồ sơ công ty, lịch và bộ nhớ đều nằm trong một SQ
 
 ### Việc xong khi
 
-Sáu AE pass với fixture hai user. `xfail` của `list_events` ở Phase 0 được gỡ.
+Sáu AE pass với fixture hai user. Gỡ `test_list_events_surfaces_google_error_instead_of_empty_diary`. Cập nhật `evals/deterministic/test_list_events.py` dòng 74–85 (`test_list_events_graceful_failure_of_one_source`): assertion hiện tại khóa việc nuốt `Google Calendar unavailable` khi lịch local còn sự kiện, và phải đổi để lỗi nguồn vẫn được nêu.
 
 ---
 
@@ -236,7 +235,7 @@ Sáu AE pass với fixture hai user. `xfail` của `list_events` ở Phase 0 đ�
 ### Cổng
 
 - OPS-01: span con nằm dưới span workflow; `_trace_api` còn sau khi OTel khởi tạo.
-- OPS-02: canary vắng mặt ở JSONL, OTel, SQLite, cột audit và usage (cùng MU-08).
+- OPS-02: canary vắng mặt ở attribute OTel và usage ledger. JSONL và cột audit đã khóa ở Phase 2, không giao lại cho OPS-02.
 - OPS-03: mỗi lần gọi LLM ghi token và chi phí theo `owner_user_id`.
 - OPS-04: A không đọc trace của B. Admin chỉ thấy số tổng hợp.
 - OPS-05: eval hai user không dùng chung home, database, hay file trace.
@@ -244,7 +243,7 @@ Sáu AE pass với fixture hai user. `xfail` của `list_events` ở Phase 0 đ�
 
 ### Việc xong khi
 
-Sáu OPS pass. `xfail` của `_trace_api` và phần OTel/JSONL của test redact được gỡ.
+Sáu OPS pass. Gỡ đúng hai marker: `test_agentops_redacts_canary_in_otel` và `test_tracer_init_keeps_otel_trace_api`. Test tracer chỉ chứng minh `__init__` gán đè `_trace_api`; OPS-01 vẫn phải chứng minh span con có parent. Không gỡ marker JSONL.
 
 ---
 
@@ -258,7 +257,7 @@ Sáu OPS pass. `xfail` của `_trace_api` và phần OTel/JSONL của test redac
 
 ### Bối cảnh
 
-Các phase trước mỗi phase giữ một lát cổng. Phase này chạy lại toàn bộ trên cấu hình production: PostgreSQL, RLS buộc, hai instance, OIDC thật hoặc seam đã được thay bằng phiên thật, fixture A/B.
+Các phase trước mỗi phase giữ một lát cổng. Phase này chạy lại toàn bộ trên cấu hình production: PostgreSQL, RLS buộc, hai instance, OIDC thật, fixture A/B. `InternalPrincipalSeam` (`pu.identity.seam`, trường `principal_seam`) đã bị xóa; không còn request nào nhận principal từ seam.
 
 ### Phạm vi
 

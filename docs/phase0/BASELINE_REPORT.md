@@ -26,10 +26,13 @@ Python 3.12.3, pytest 9.1.1.
 | Chỉ extra `dev` | 776 passed, 5 failed, 13 skipped | 13,57s |
 | Thêm `sources`, `pdf`, `gmail`, `gcal` | **783 passed, 0 failed, 11 skipped** | 17,16s |
 
-Năm failure của lần chỉ cài `dev` là thiếu gói tùy chọn, không phải lỗi logic:
+Năm failure của lần chỉ cài `dev` là thiếu gói tùy chọn, không phải lỗi logic. Từng test:
 
-- `test_partner_brief_relevance.py`: `ModuleNotFoundError: pypdf` (extra `sources`).
-- `test_report_rendering.py::test_write_pdf_injects_unicode_font_face_into_source`: `xhtml2pdf` chưa có nên `CreatePDF` là `None` (extra `pdf`).
+1. `evals/deterministic/test_partner_brief_relevance.py::test_pdf_extraction_isolated_and_page_attributed` — `ModuleNotFoundError: No module named 'pypdf'` tại dòng 108. Extra `sources`.
+2. `evals/deterministic/test_partner_brief_relevance.py::test_pdf_rejects_encryption_large_page_count_and_empty_text[options0]` — cùng `ModuleNotFoundError: pypdf` tại dòng 108.
+3. `evals/deterministic/test_partner_brief_relevance.py::test_pdf_rejects_encryption_large_page_count_and_empty_text[options1]` — cùng `ModuleNotFoundError: pypdf` tại dòng 108.
+4. `evals/deterministic/test_partner_brief_relevance.py::test_pdf_rejects_encryption_large_page_count_and_empty_text[options2]` — cùng `ModuleNotFoundError: pypdf` tại dòng 108.
+5. `evals/deterministic/test_report_rendering.py::test_write_pdf_injects_unicode_font_face_into_source` — `AttributeError: None has no attribute 'CreatePDF'` tại dòng 171, vì extra `pdf` (`xhtml2pdf`) chưa được cài.
 
 Mười một skip còn lại đều là eval sống trong `evals/deterministic/test_tool_trigger.py`, chờ `PU_RUN_LIVE_EVALS=1` và một API key. Chúng được bỏ qua có chủ đích.
 
@@ -41,17 +44,20 @@ Sau khi thêm test tái hiện, suite đầy đủ được chạy lại. Kết 
 
 Test tái hiện: `evals/deterministic/test_phase0_multi_user_baseline.py`.  
 Canary cố định, không phải khóa thật: `sk-phase0canarysecretxx`.  
-Mỗi lỗi đã xác nhận là một test `xfail(strict=True)`. Chạy với `--runxfail` thì cả tám test fail đúng assertion mong đợi, không fail vì lỗi dựng fixture.
+Mỗi lỗi đã xác nhận là một test `xfail(strict=True)`. JSONL và OTel là hai test riêng, mỗi marker gỡ ở đúng một phase: JSONL ở Phase 2, OTel ở Phase 5. Chạy với `--runxfail` thì các test fail đúng assertion mong đợi, không fail vì lỗi dựng fixture.
 
 ### 2.1 Redact trên SQLite nhưng không trên JSONL/OTel — đã xác nhận
 
 `SQLiteAgentEventRepository.append` redact payload trước khi ghi `agent_events`. `AgentOpsHarness.publish` sau đó gọi `tracer.event` với payload gốc. `Tracer.event` ghi nguyên dict vào `traces/<ngày>.jsonl` và vào attribute span OTel.
 
-Test `test_agentops_redacts_canary_before_jsonl_and_otel` công bố một sự kiện có canary. Kết quả đo được: SQLite không chứa canary; JSONL và OTel chứa. Danh sách rò là `['jsonl', 'otel']`.
+Hai test dùng cùng helper `_publish_canary`:
 
-Không xác nhận nhầm sang mọi file JSONL. `JsonlToolAuditSink` đã redact, và `evals/deterministic/test_phase5_tool_security_harness.py::test_jsonl_audit_redacts_secret_fields` đang khóa hành vi đó. Lỗ hổng là fan-out JSONL/OTel của tracer, không phải `traces/tool-audit.jsonl`.
+- `test_agentops_redacts_canary_in_jsonl` xác nhận SQLite sạch, rồi fail vì canary còn trong file JSONL. Phase 2 gỡ marker này.
+- `test_agentops_redacts_canary_in_otel` xác nhận SQLite sạch, rồi fail vì canary còn trong attribute span. Phase 5 gỡ marker này.
 
-Quan sát kèm, chỉ bằng đọc mã `SQLiteToolAuditSink.append`: `record_json` được redact, còn cột `result_summary`, `error` và `reason` ghi từ bản ghi gốc. Một bí mật nằm trong các cột đó sẽ còn trong SQLite dù JSON của cùng hàng đã sạch. Chưa có test tái hiện riêng.
+Không xác nhận nhầm sang mọi file JSONL. `JsonlToolAuditSink` đã redact, và `evals/deterministic/test_phase5_tool_security_harness.py::test_jsonl_audit_redacts_secret_fields` đang khóa hành vi đó. Lỗ hổng JSONL là trace ngày của `Tracer`, không phải `traces/tool-audit.jsonl`.
+
+`SQLiteToolAuditSink.append` (`pu/persistence/events.py` dòng 121–126) redact `record_json` nhưng ghi `reason`, `result_summary` và `error` từ bản ghi gốc. `test_sqlite_tool_audit_columns_redact_canary` xác nhận `record_json` không chứa canary, rồi fail vì cả ba cột còn nguyên canary. Phase 2 gỡ marker này.
 
 ### 2.2 `recover_inflight()` fail mọi approval `executing` — đã xác nhận
 
@@ -72,17 +78,17 @@ Test `test_recover_inflight_preserves_other_owner_and_live_lease` tạo hai hàn
 
 Điểm cần nói rõ: job worker có truyền `app` vào collector, nên lần đọc trang của đường đó đi qua Tool Harness. Phát hiện "page reads bypass" đúng với collector không có `app`, không đúng với đường job đã có `app`. Lịch vẫn ngoài harness ở cả hai đường.
 
-Các callsite cùng loại, xác nhận bằng đọc mã, chưa có test riêng:
+Ba callsite cùng loại nằm trong cổng harness của Phase 2 và đã có `xfail` riêng:
 
-- `pu/ops/workspace_api.py`: op `fetch_source` gọi `fetch_source` trực tiếp.
-- `pu/ops/dashboard.py`: `gmail_sync_action` gọi `gmail.sync` trực tiếp.
-- `pu/graph/workflows/triage.py`: đọc `calendar.ics` trực tiếp từ đĩa.
+- `pu/ops/workspace_api.py` dòng 160–163: op `fetch_source` gọi `fetch_source` trực tiếp. `test_workspace_fetch_source_goes_through_tool_harness` ghi bypass `page`.
+- `pu/ops/dashboard.py` dòng 822–823: `gmail_sync_action` gọi `gmail.sync` trực tiếp. `test_dashboard_gmail_sync_goes_through_tool_harness` ghi bypass `gmail`.
+- `pu/graph/workflows/triage.py` dòng 74–78: `todays_events` đọc `calendar.ics` trực tiếp. `test_triage_ics_read_goes_through_tool_harness` ghi bypass `calendar-ics`.
 
 ### 2.4 `Tracer.__init__` xóa `_trace_api` sau khi OTel khởi tạo — đã xác nhận
 
 `_init_otel` gán `self._trace_api = trace`. Ngay sau lời gọi đó, `__init__` gán `self._trace_api = None`. `event()` chỉ gọi `set_span_in_context` khi `_trace_api` khác `None`, nên span con không nhận parent của workflow.
 
-Test `test_tracer_init_keeps_otel_trace_api` thay `_init_otel` bằng một hàm đặt sentinel rồi dựng `Tracer`. Sau `__init__`, `_otel_tracer` còn và `_trace_api` là `None`. Không cần gói exporter để chứng minh lệnh gán đè.
+Test `test_tracer_init_keeps_otel_trace_api` thay `_init_otel` bằng một hàm đặt sentinel rồi dựng `Tracer`. Sau `__init__`, `_otel_tracer` còn và `_trace_api` là `None`. Test chỉ khẳng định lệnh gán đè. Nó không dựng exporter OTel và không kiểm tra span con có parent hay không. Cổng parent span là OPS-01 ở Phase 5. Marker của test gán đè cũng chỉ được gỡ ở Phase 5.
 
 ### 2.5 `list_events` biến lỗi Google thành "không có sự kiện" — đã xác nhận
 
@@ -100,7 +106,9 @@ Khi lịch local có sự kiện, lỗi Google cũng bị bỏ khỏi câu trả
 
 | Phát hiện | Kết luận |
 | --- | --- |
-| Redact SQLite, lọt JSONL/OTel | Đã xác nhận |
+| Redact SQLite event, lọt JSONL | Đã xác nhận; marker Phase 2 |
+| Redact SQLite event, lọt OTel | Đã xác nhận; marker Phase 5 |
+| Cột audit `reason`, `result_summary`, `error` chưa redact | Đã xác nhận; marker Phase 2 |
 | `recover_inflight` bỏ qua owner và lease | Đã xác nhận |
 | Worker/collector vòng qua Tool Harness | Đã xác nhận, với ngoại lệ đọc trang khi collector có `app` |
 | `_trace_api` bị xóa sau OTel init | Đã xác nhận |
@@ -115,9 +123,10 @@ Không có phát hiện nào trong năm mục bị bác.
 Không có kiểu principal `USER` / `WORKER` / `PLATFORM_ADMIN`. Các chuỗi đang dùng:
 
 - `local-user` tại runtime, app, collector, orchestration, scoped agent, và phần lớn test.
-- `local-dashboard-user` khi dashboard phê duyệt.
+- `local-dashboard-user` khi dashboard và `workspace_api` phê duyệt.
 - `graph-local-user` trong `pu/graph/nodes.py`.
 - `automatic-briefing` là `decided_by` của approval do worker tạo.
+- `local-human` là mặc định `decided_by` của `approve` và `reject` trong `pu/approval/service.py`, `pu/approval/repository.py` và `pu/core/interfaces/approval.py`.
 
 `grep` trên `pu/` không thấy `user_id`, `owner_user_id`, `csrf`, `oidc`, `HttpOnly`, hay `SameSite`.
 
@@ -140,8 +149,10 @@ Không có kiểu principal `USER` / `WORKER` / `PLATFORM_ADMIN`. Các chuỗi �
 ### 3.4 Credential từ môi trường và `.pu`
 
 - `pu/config.py` đọc `.env` lúc import (`find_dotenv(usecwd=True)`) và lấy `PU_API_KEY`, `PU_HOME`, cùng các biến nhà cung cấp.
-- `pu/ops/settings_api.py` ghi ngược vào file env.
-- Token và secret trên đĩa, một bộ cho cả home, liệt kê trong `pu/ops/reset.py`: `credentials.json`, `gmail-token.json`, `gmail-send-token.json`, `calendar-token.json`, `google-token.json`, `google-calendar-token.json`, `drive-token.json`, và `token.json` do tool lịch dùng.
+- `pu/ops/settings_api.py` `apply_settings` ghi ngược bằng `set_key` vào `find_dotenv(usecwd=True) or ".env"`. File đó là credential của process, không nằm trong home theo user.
+- `pu/ops/reset.py` `CONFIG_FILES` giữ lại: `credentials.json`, `gmail-token.json`, `gmail-send-token.json`, `calendar-token.json`, `google-token.json`, `google-calendar-token.json`, `drive-token.json`, `models.json`, `.env`. Tập này không có `token.json`.
+- `token.json` là token lịch tại `pu/tools/calendar.py` dòng 90 (`home / "token.json"`). Vì không thuộc `CONFIG_FILES`, `reset_local_data` xóa nó cùng các file dữ liệu khác.
+- `models.json` là shortlist model trong home (`pu/ops/catalog.py`), được reset giữ lại.
 - Không mã hóa token. Khóa mã hóa không tồn tại, nên cũng không nằm ngoài DB.
 
 ### 3.5 Dữ liệu không có chủ
@@ -187,7 +198,7 @@ Hôm nay các biên 1, 5 và 6 chưa có. Biên 3 tồn tại cho agent loop nh�
 | Bí mật rơi vào telemetry | Đã đo trên JSONL và OTel | MU-08 |
 | Instance kia khởi động làm hỏng hoặc gửi trùng side effect | `recover_inflight` fail mọi `executing`; side effect không có lease | MU-09 |
 | Import gán nhầm dữ liệu cũ cho user mới | Không có bản đồ `local-user` | MU-10 |
-| CSRF khi có cookie phiên | Chưa có CSRF; hôm nay chỉ bind loopback | MU-11 |
+| CSRF khi có cookie phiên | Chưa có CSRF; hôm nay chỉ bind loopback. Cookie sẽ là `SameSite=Lax` cộng token; Lax không đủ một mình | MU-11, phần CSRF, cổng Phase 2 |
 | Client tự khai owner | Body `workspace_id` được tin | MU-12 |
 | Worker giữ quyền sau khi job xong | Không có ủy quyền theo job | P3-04 |
 | Admin xem nội dung riêng qua metrics hoặc trace | Trace là file chung; metrics chưa lọc payload | OPS-04, OPS-06 |
@@ -206,11 +217,14 @@ Cột `owner_user_id` đứng trên bảng cha. Bảng con dùng khóa ngoại k
 | --- | --- |
 | `calendar_events` | Lịch người dùng tạo |
 | `facts` | Bộ nhớ dài hạn |
+| `facts_fts` | Chỉ mục FTS5 của `facts`; tìm kiếm phải lọc theo owner của hàng nội dung |
 | `episodes` | Tóm tắt việc đã xảy ra |
+| `episodes_fts` | Chỉ mục FTS5 của `episodes`; cùng quy tắc owner với bảng nội dung |
 | `chat_log` | Hội thoại |
 | `crm_emails` | Hộp thư |
 | `knowledge_sources` | Tài liệu người dùng đưa vào |
 | `knowledge_chunks` | Nội dung của các nguồn đó |
+| `knowledge_fts` | Chỉ mục FTS5 của `knowledge_chunks`; cùng quy tắc owner với bảng nội dung |
 | `proposed_actions` | Hành động chờ duyệt và kết quả thực thi |
 | `workflow_runs` | Một lần chạy agent |
 | `workflow_stage_checkpoints` | Kết quả trung gian |
@@ -235,8 +249,11 @@ Các file này cần một gốc lưu theo `owner_user_id`, không còn một th
 - `outbox/*`
 - `calendar.ics`
 - `SOUL.md`
+- `MEMORY.md`, bản mirror do `Memory.export_markdown` ghi cạnh `state.db` (`pu/memory/__init__.py`)
+- `models.json`
+- file env mà `settings_api.apply_settings` ghi (`find_dotenv(usecwd=True) or ".env"`)
 - thư mục knowledge và skill cài trong home
-- toàn bộ token và `credentials.json` đã liệt kê ở mục 3.4
+- toàn bộ token và `credentials.json` đã liệt kê ở mục 3.4, gồm `token.json` của lịch
 
 Token là dữ liệu riêng và phải mã hóa bằng khóa ngoài DB. Chúng không được nằm trong bảng telemetry.
 
@@ -250,7 +267,7 @@ Token là dữ liệu riêng và phải mã hóa bằng khóa ngoài DB. Chúng 
 | 2 | Lớn | OIDC, cookie, CSRF, mã hóa token, bịt bypass harness, recovery theo lease, redact mọi sink | Sửa session trước khi có owner sẽ phát hành lỗ IDOR có đăng nhập |
 | 3 | Trung bình | Hợp đồng request có kiểu và một state machine workflow | Hai đường workflow tiếp tục lệch trạng thái khi resume |
 | 4 | Lớn | Attachment, công ty, lịch, memory, sáu AE với fixture A/B | Trùng tên công ty làm gộp dữ liệu hai user |
-| 5 | Trung bình | Cây span, chi phí theo owner, eval tách home | Sửa OTel mà quên JSONL thì MU-08 vẫn đỏ |
+| 5 | Trung bình | Cây span, redact attribute OTel, chi phí theo owner, eval tách home | Gỡ nhầm marker JSONL ở phase này, hoặc quên parent span vì test tracer chỉ chứng minh lệnh gán đè |
 | 6 | Trung bình, nhưng là cổng chặn | Chạy lại MU-01..12 trên PostgreSQL và hai instance | Xanh từng phase trên SQLite một process không chứng minh production |
 
 Phase 1 và Phase 2 là phần lớn của rủi ro. Phase 4 rộng vì đụng nhiều agent nhưng đi trên ranh giới đã có ở Phase 1–3. Phase 6 không thêm năng lực; nó chỉ có giá trị nếu mười hai MU chạy cùng một cấu hình production.
@@ -261,12 +278,12 @@ Phase 1 và Phase 2 là phần lớn của rủi ro. Phase 4 rộng vì đụng 
 - Không tạo issue GitHub. Bản dán nằm ở `docs/ROADMAP_ISSUES.md`.
 - Không chạy eval judge và không chạy eval sống.
 
-## 8. Suite sau khi thêm test tái hiện
+## 8. Suite sau test tái hiện và đợt chỉnh review
 
-Lệnh cách ly giống mục 1, gồm file mới:
+Lệnh cách ly giống mục 1, gồm file baseline đã tách JSONL/OTel, thêm cột audit và ba callsite harness:
 
 ```text
-783 passed, 11 skipped, 8 xfailed in 16.61s
+783 passed, 11 skipped, 13 xfailed in 16.82s
 ```
 
-Tám `xfailed` là đúng tám test trong `test_phase0_multi_user_baseline.py`. Không có failure mới. Các test cũ không bị sửa.
+Mười ba `xfailed` là đúng mười ba test trong `test_phase0_multi_user_baseline.py`. Không có failure mới. Các test cũ không bị sửa. Lần 783 passed / 11 skipped ở mục 1 là suite trước các test tái hiện, khi đã cài đủ extra.

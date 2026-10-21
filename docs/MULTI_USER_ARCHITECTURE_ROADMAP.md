@@ -16,8 +16,8 @@ Mô hình được chọn là **ADR-MU-001, mô hình A**.
 ### 1.2 Danh tính và phiên
 
 - Đăng nhập bằng OIDC, luồng Authorization Code kèm PKCE.
-- Sau khi đăng nhập, ứng dụng phát hành phiên của chính nó: cookie `HttpOnly`, `Secure`, `SameSite` chặt.
-- Mọi yêu cầu đổi trạng thái đều có CSRF token gắn với phiên.
+- Sau khi đăng nhập, ứng dụng phát hành phiên của chính nó: cookie `HttpOnly`, `Secure`, `SameSite=Lax`.
+- `Lax` được chọn vì callback OIDC là điều hướng GET cấp cao nhất từ nhà cung cấp danh tính. `Lax` vẫn gửi cookie trên điều hướng đó, nên cookie `state` và PKCE verifier còn sau vòng redirect. `SameSite=Strict` bỏ cookie trên điều hướng cross-site này và làm gãy Authorization Code + PKCE. `Lax` không gửi cookie cho POST hay subresource cross-site. Mọi yêu cầu đổi trạng thái vẫn cần CSRF token gắn với phiên; `Lax` không thay token đó.
 - Thu hồi phiên hoặc token phải chặn thao tác tiếp theo (MU-06).
 
 ### 1.3 Ủy quyền
@@ -39,6 +39,14 @@ Ba loại chủ thể:
 | `PLATFORM_ADMIN` | Vận hành nền tảng | Không đọc dữ liệu riêng theo mặc định |
 
 `WORKER` không có danh tính sở hữu riêng. Ngữ cảnh chủ sở hữu được giao theo job và hết hiệu lực khi job kết thúc hoặc lease hết hạn.
+
+### 1.6 Seam principal nội bộ của Phase 1
+
+Tên: `InternalPrincipalSeam`, module `pu.identity.seam`.
+
+Điểm gắn: trường `principal_seam` trên `ApplicationDependencies`, object do `create_application` và `build_dependencies` trả về. Seam đứng trước Tool Harness, approval và mọi repository khi chúng hỏi principal hiện tại. Fixture Phase 1 gọi `principal_seam.attach(principal)`. Seam trả principal vừa gắn. Seam không đọc `owner_user_id` hay `workspace_id` từ body.
+
+Gỡ ở Phase 6: xóa module `pu.identity.seam` và trường `principal_seam`. Principal cùng `owner_user_id` chỉ còn đến từ phiên OIDC đã xác thực. Cổng phát hành đỏ nếu module còn import được, hoặc nếu request không có cookie phiên vẫn nhận một principal. Đây là seam được nêu ở mục "Việc xong khi" của issue Phase 1.
 
 ### 1.4 Dữ liệu production
 
@@ -96,23 +104,40 @@ Phụ thuộc chạy một chiều: phase sau không bắt đầu phần cổng 
   - Bật RLS + `FORCE RLS`, role ứng dụng không `BYPASSRLS`.
   - Bỏ qua mọi `owner_user_id` / `workspace_id` do client gửi.
   - Nhập dữ liệu `local-user` chỉ khi có bản đồ nguồn → `user_id` được xác nhận. Không có bản đồ thì từ chối, không gán vào user ngẫu nhiên.
-- **Cổng:** MU-01, MU-02, MU-07, MU-10, MU-11, MU-12.
+  - Test gắn principal bằng `InternalPrincipalSeam` (mục 1.6), chưa cần OIDC.
+- **Cổng:** MU-01, MU-02, MU-07, MU-10, phần IDOR của MU-11, MU-12.
   - MU-10 đi cùng phase này vì nó là cổng của bước nhập danh tính. Danh sách cổng ban đầu nêu MU-01, MU-02, MU-07, MU-11, MU-12; MU-10 là cổng kèm theo của cùng lát cắt sở hữu.
-  - MU-11 ở phase này chặn IDOR bằng owner check. CSRF của cookie phiên được hoàn thiện ở Phase 2; Phase 1 vẫn phải từ chối truy cập chéo ID khi chưa có phiên người khác.
+  - Phần IDOR của MU-11 ở phase này: đổi ID trên URL hoặc body không đọc được tài nguyên của người khác khi principal đã biết qua seam.
+  - Phần CSRF của MU-11 không thuộc cổng Phase 1. Cổng đó nằm ở Phase 2, vì cookie phiên chưa tồn tại ở phase này.
 
 ### Phase 2 — Bảo mật phiên và toàn vẹn thực thi
 
 - **Phụ thuộc:** Phase 1 đã có `owner_user_id` và RLS. Không xây session trên schema chưa có chủ sở hữu.
 - **Phạm vi:**
   - OIDC Authorization Code + PKCE.
-  - Cookie phiên `HttpOnly` + `Secure` + `SameSite`, kèm CSRF.
+  - Cookie phiên `HttpOnly` + `Secure` + `SameSite=Lax`, kèm CSRF token cho mọi yêu cầu đổi trạng thái.
   - Thu hồi phiên và token có hiệu lực ngay.
   - Mã hóa token OAuth, khóa nằm ngoài DB.
-  - Mọi đọc Gmail, Calendar và trang web của worker/collector đi qua Tool Harness, kèm principal và owner của job.
+  - Mọi đọc Gmail, Calendar và trang web đi qua Tool Harness, kèm principal và owner của job. Ngoài worker/collector, cổng này gồm đúng ba callsite:
+    - `pu/ops/workspace_api.py` dòng 160–163, op `fetch_source`.
+    - `pu/ops/dashboard.py` dòng 822–823, `gmail.sync` trong `gmail_sync_action`.
+    - `pu/graph/workflows/triage.py` dòng 74–78, `todays_events` đọc `calendar.ics`.
   - `recover_inflight()` chỉ fail-closed hàng `executing` không còn lease sống và thuộc đúng owner của process đang phục hồi. Không đụng hàng của owner khác, không đụng thực thi mà instance khác còn giữ lease.
-  - Redact trước JSONL, OTel và mọi cột audit, không chỉ payload SQLite.
-- **Cổng:** MU-03, MU-04, MU-05, MU-06, MU-08, MU-09.
-- **Gỡ `xfail`:** các test Phase 0 về redact, recovery, harness bypass.
+  - Redact JSONL trace và các cột `tool_audit_events.reason`, `result_summary`, `error`. Attribute OTel thuộc Phase 5, không thuộc cổng redact của phase này.
+- **Cổng:** MU-03, MU-04, MU-05, MU-06, MU-08 cho JSONL và cột audit, MU-09, và phần CSRF của MU-11.
+  - Phần CSRF của MU-11: request đổi trạng thái thiếu CSRF token, hoặc token không khớp phiên, bị từ chối. `SameSite=Lax` không tính là đạt cổng này.
+- **Gỡ `xfail`, mỗi marker một lần, chỉ ở phase này:**
+  - `test_agentops_redacts_canary_in_jsonl`
+  - `test_sqlite_tool_audit_columns_redact_canary`
+  - `test_recover_inflight_preserves_other_owner_and_live_lease`
+  - `test_worker_gmail_read_goes_through_tool_harness`
+  - `test_worker_calendar_read_goes_through_tool_harness`
+  - `test_collector_page_read_without_app_goes_through_tool_harness`
+  - `test_collector_calendar_read_goes_through_tool_harness`
+  - `test_workspace_fetch_source_goes_through_tool_harness`
+  - `test_dashboard_gmail_sync_goes_through_tool_harness`
+  - `test_triage_ics_read_goes_through_tool_harness`
+  - Không gỡ `test_agentops_redacts_canary_in_otel` và `test_tracer_init_keeps_otel_trace_api`. Hai marker đó thuộc Phase 5.
 
 ### Phase 3 — Hợp đồng agent có kiểu và trạng thái workflow thống nhất
 
@@ -135,39 +160,42 @@ Phụ thuộc chạy một chiều: phase sau không bắt đầu phần cổng 
 - **Cổng AE, fixture A/B:**
   - AE-01: attachment của A không đọc hoặc tải được bởi B.
   - AE-02: workspace nghiên cứu công ty của A không lộ nguồn, báo cáo, hay email của B dù trùng tên công ty.
-  - AE-03: lỗi Google Calendar của A thành trạng thái không khả dụng, không thành "không có sự kiện"; lịch của B không được đọc.
+  - AE-03: lỗi Google Calendar của A thành trạng thái không khả dụng, không thành "không có sự kiện"; lịch của B không được đọc. Khi sửa, cập nhật `evals/deterministic/test_list_events.py` dòng 74–85 (`test_list_events_graceful_failure_of_one_source`): test đó đang khóa việc nuốt chuỗi `Google Calendar unavailable` khi lịch local còn sự kiện.
   - AE-04: `search_memory` và knowledge của A không trả fact hoặc chunk của B.
   - AE-05: hai user cùng yêu cầu một công ty thì ra hai báo cáo, hai nguồn, hai hash nội dung.
   - AE-06: agent nghiệp vụ từ chối connection id, thread id, report id và workspace id của người kia trước khi gọi nhà cung cấp.
 
 ### Phase 5 — Eval và AgentOps
 
-- **Phụ thuộc:** Phase 2 đã redact sink; Phase 4 đã có fixture hai user.
-- **Phạm vi:** span OTel đúng cây, chi phí gắn `owner_user_id`, eval không dùng chung state.
+- **Phụ thuộc:** Phase 2 đã redact JSONL và cột audit; Phase 4 đã có fixture hai user.
+- **Phạm vi:** span OTel đúng cây, redact attribute OTel, chi phí gắn `owner_user_id`, eval không dùng chung state.
 - **Cổng OPS:**
-  - OPS-01: span con gắn parent của workflow; `_trace_api` không bị xóa sau khi khởi tạo OTel.
-  - OPS-02: JSONL, OTel, SQLite event, cột audit và usage ledger không chứa canary (cùng MU-08).
+  - OPS-01: span con gắn parent của workflow. `test_tracer_init_keeps_otel_trace_api` chỉ chứng minh lệnh gán đè `_trace_api`; OPS-01 là cổng bổ sung cho parent span thật.
+  - OPS-02: attribute OTel và usage ledger không chứa canary. JSONL và cột audit đã là cổng Phase 2, không giao lại cho OPS-02.
   - OPS-03: token và chi phí của một lượt LLM gắn đúng `owner_user_id`.
   - OPS-04: A không đọc trace của B. Admin chỉ thấy số liệu tổng hợp, không thấy nội dung.
   - OPS-05: eval hai user dùng home/database tách, không dùng `.pu` chung.
   - OPS-06: endpoint metrics không nhúng payload riêng tư.
+- **Gỡ `xfail`, chỉ ở phase này:** `test_agentops_redacts_canary_in_otel` và `test_tracer_init_keeps_otel_trace_api`. Không gỡ marker JSONL hay cột audit.
 
 ### Phase 6 — Sẵn sàng production
 
 - **Phụ thuộc:** Phase 1–5 đã xanh cổng riêng của chúng.
-- **Phạm vi:** cổng phát hành chạy lại toàn bộ MU-01..MU-12 trên PostgreSQL, hai instance, và fixture A/B. Kiểm tra khóa mã hóa không nằm trong DB, role không có `BYPASSRLS`, và đường nhập `local-user` vẫn từ chối khi thiếu bản đồ.
+- **Phạm vi:** cổng phát hành chạy lại toàn bộ MU-01..MU-12 trên PostgreSQL, hai instance, và fixture A/B. Kiểm tra khóa mã hóa không nằm trong DB, role không có `BYPASSRLS`, và đường nhập `local-user` vẫn từ chối khi thiếu bản đồ. Xóa `InternalPrincipalSeam` theo mục 1.6 trước khi chạy cổng này; không còn đường test nào gắn principal bằng seam.
 - **Cổng:** tất cả MU-01..MU-12 pass. Không còn `xfail` của Phase 0 trên các lỗi đã được các phase sau nhận sửa.
 - **Chưa đủ để phát hành:** còn `xfail` đúng lý do, còn sink sót canary, hoặc còn đường đọc nhà cung cấp ngoài Tool Harness.
 
 ## 4. Thứ tự sửa các lỗi baseline
 
-| Lỗi đã xác nhận ở Phase 0 | Phase sửa |
-| --- | --- |
-| Redact chỉ trên payload SQLite, lọt JSONL và OTel | 2 và 5 |
-| `recover_inflight()` fail mọi hàng `executing` | 2 |
-| Worker/collector đọc Gmail, Calendar, trang web ngoài Tool Harness | 2 |
-| `Tracer.__init__` xóa `_trace_api` | 5 |
-| `list_events` biến lỗi Google thành "No events found" | 4 |
+| Lỗi đã xác nhận ở Phase 0 | Marker | Phase gỡ marker |
+| --- | --- | --- |
+| Canary lọt JSONL trace | `test_agentops_redacts_canary_in_jsonl` | 2 |
+| Canary lọt attribute OTel | `test_agentops_redacts_canary_in_otel` | 5 |
+| Cột audit `reason`, `result_summary`, `error` chưa redact | `test_sqlite_tool_audit_columns_redact_canary` | 2 |
+| `recover_inflight()` fail mọi hàng `executing` | `test_recover_inflight_preserves_other_owner_and_live_lease` | 2 |
+| Đọc Gmail, Calendar, trang web ngoài Tool Harness, gồm ba callsite mục Phase 2 | các test harness trong file baseline | 2 |
+| `Tracer.__init__` xóa `_trace_api` (chỉ lệnh gán đè) | `test_tracer_init_keeps_otel_trace_api` | 5 |
+| `list_events` biến lỗi Google thành "No events found", kể cả test cũ dòng 74–85 | `test_list_events_surfaces_google_error_instead_of_empty_diary` và `test_list_events_graceful_failure_of_one_source` | 4 |
 
 ## 5. Tài liệu kèm
 
