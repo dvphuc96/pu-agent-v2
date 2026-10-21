@@ -182,7 +182,7 @@ def verify_id_token(
     nonce: str,
     now: float | None = None,
 ) -> dict:
-    """Validate signature plus iss, aud, exp, and nonce. Returns the claims."""
+    """Validate signature plus iss, aud, azp, exp, and nonce. Returns the claims."""
     header, claims, signing_input, signature = _header_and_claims(token)
     algorithm = header.get("alg")
     if algorithm == "HS256":
@@ -202,8 +202,13 @@ def verify_id_token(
         audience_ok = False
     if not audience_ok:
         raise AuthError("aud")
-    # Multiple audiences must name this client as the authorized party.
-    if isinstance(audience, list) and len(audience) > 1 and claims.get("azp") != provider.client_id:
+    # Several audiences require azp. A single audience rejects azp only when
+    # the claim is present and names a different client.
+    azp = claims.get("azp")
+    several = isinstance(audience, list) and len(audience) > 1
+    if several and azp != provider.client_id:
+        raise AuthError("azp")
+    if not several and azp is not None and azp != provider.client_id:
         raise AuthError("azp")
     current = time.time() if now is None else now
     try:

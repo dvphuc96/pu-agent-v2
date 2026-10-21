@@ -351,7 +351,17 @@ class AuthStore:
         row = self._connection(connection_id)
         if row is None or row["revoked_at"] or row["owner_user_id"] != owner_user_id:
             return None
-        if row["migration_pending"] or is_legacy_ciphertext(row["token_ciphertext"]):
+        if is_legacy_ciphertext(row["token_ciphertext"]):
+            digest = row["legacy_digest"] or ""
+            if not digest or digest != _ciphertext_digest(row["token_ciphertext"]):
+                with self._connect() as conn:
+                    conn.execute(
+                        "UPDATE oauth_connections SET migration_pending = 1 WHERE id = ?",
+                        (connection_id,),
+                    )
+                    conn.commit()
+            return None
+        if row["migration_pending"]:
             return None
         try:
             token = json.loads(
@@ -374,19 +384,13 @@ def _oauth_columns(conn: sqlite3.Connection) -> set[str]:
     return {row[1] for row in conn.execute("PRAGMA table_info(oauth_connections)")}
 
 
-def migrate_legacy_oauth_tokens(conn: sqlite3.Connection) -> None:
-    """Re-encrypt every ``enc1`` token, or pin it so it cannot change owners.
-
-    With ``PU_TOKEN_KEY``, each legacy blob is rewritten as ``enc2`` bound to
-    that row's owner and connection id. Without the key, the row is marked
-    pending and the ciphertext digest is recorded. A later swap of the blob
-    no longer matches the digest, so it is not adopted for the new owner.
-    """
+def _prepare_oauth_migration(conn: sqlite3.Connection) -> bool:
+    """Add pin columns. False when the table does not exist yet."""
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_connections'"
     ).fetchone()
     if not exists:
-        return
+        return False
     columns = _oauth_columns(conn)
     if "migration_pending" not in columns:
         conn.execute(
@@ -396,26 +400,55 @@ def migrate_legacy_oauth_tokens(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE oauth_connections ADD COLUMN legacy_digest TEXT NOT NULL DEFAULT ''"
         )
+    return True
+
+
+def pin_legacy_oauth_tokens(conn: sqlite3.Connection) -> None:
+    """Record the closed ``enc1`` set. Called only from migration 9007.
+
+    Each existing ``enc1`` row gets a digest of that ciphertext. The digest is
+    not cleared later, and rows created after this pass are not added.
+    """
+    if not _prepare_oauth_migration(conn):
+        return
+    rows = conn.execute(
+        "SELECT id, token_ciphertext, legacy_digest FROM oauth_connections"
+    ).fetchall()
+    for row in rows:
+        if row["legacy_digest"]:
+            continue
+        if not is_legacy_ciphertext(row["token_ciphertext"]):
+            continue
+        conn.execute(
+            """UPDATE oauth_connections
+               SET legacy_digest = ?, migration_pending = 1 WHERE id = ?""",
+            (_ciphertext_digest(row["token_ciphertext"]), row["id"]),
+        )
+    conn.commit()
+
+
+def migrate_legacy_oauth_tokens(conn: sqlite3.Connection) -> None:
+    """Re-encrypt rows pinned at 9007. Never pins a new ``enc1`` blob.
+
+    A pinned digest stays on the row after the ciphertext becomes ``enc2``.
+    An ``enc1`` value that does not match that digest is flagged and left
+    unchanged, so a writer cannot clear the pin with a temporary value and
+    then substitute another row's legacy blob.
+    """
+    if not _prepare_oauth_migration(conn):
+        return
     key_ready = len(token_key_material()) >= 16
     rows = conn.execute(
-        """SELECT id, owner_user_id, token_ciphertext, legacy_digest, migration_pending
-           FROM oauth_connections"""
+        """SELECT id, owner_user_id, token_ciphertext, legacy_digest
+           FROM oauth_connections WHERE legacy_digest != ''"""
     ).fetchall()
     for row in rows:
         connection_id = row["id"]
-        owner = row["owner_user_id"]
         ciphertext = row["token_ciphertext"]
-        digest = row["legacy_digest"] or ""
+        digest = row["legacy_digest"]
         if not is_legacy_ciphertext(ciphertext):
-            if digest or row["migration_pending"]:
-                conn.execute(
-                    """UPDATE oauth_connections
-                       SET migration_pending = 0, legacy_digest = '' WHERE id = ?""",
-                    (connection_id,),
-                )
             continue
-        current = _ciphertext_digest(ciphertext)
-        if digest and digest != current:
+        if _ciphertext_digest(ciphertext) != digest:
             conn.execute(
                 "UPDATE oauth_connections SET migration_pending = 1 WHERE id = ?",
                 (connection_id,),
@@ -423,25 +456,30 @@ def migrate_legacy_oauth_tokens(conn: sqlite3.Connection) -> None:
             continue
         if not key_ready:
             conn.execute(
-                """UPDATE oauth_connections
-                   SET migration_pending = 1, legacy_digest = ? WHERE id = ?""",
-                (current, connection_id),
+                "UPDATE oauth_connections SET migration_pending = 1 WHERE id = ?",
+                (connection_id,),
             )
             continue
         try:
-            plaintext = decrypt(ciphertext, owner_user_id=owner, connection_id=connection_id)
+            plaintext = decrypt(
+                ciphertext,
+                owner_user_id=row["owner_user_id"],
+                connection_id=connection_id,
+            )
         except ValueError:
             conn.execute(
-                """UPDATE oauth_connections
-                   SET migration_pending = 1, legacy_digest = ? WHERE id = ?""",
-                (current, connection_id),
+                "UPDATE oauth_connections SET migration_pending = 1 WHERE id = ?",
+                (connection_id,),
             )
             continue
-        upgraded = encrypt(plaintext, owner_user_id=owner, connection_id=connection_id)
+        upgraded = encrypt(
+            plaintext,
+            owner_user_id=row["owner_user_id"],
+            connection_id=connection_id,
+        )
         conn.execute(
             """UPDATE oauth_connections
-               SET token_ciphertext = ?, migration_pending = 0, legacy_digest = ''
-               WHERE id = ?""",
+               SET token_ciphertext = ?, migration_pending = 0 WHERE id = ?""",
             (upgraded, connection_id),
         )
     conn.commit()

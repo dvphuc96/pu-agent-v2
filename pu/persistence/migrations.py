@@ -239,8 +239,12 @@ class SQLiteMigrationRunner:
 
                 install_owner_match_triggers(self.conn)
             elif migration.version == 9007:
-                from pu.identity.session import migrate_legacy_oauth_tokens
+                from pu.identity.session import (
+                    migrate_legacy_oauth_tokens,
+                    pin_legacy_oauth_tokens,
+                )
 
+                pin_legacy_oauth_tokens(self.conn)
                 migrate_legacy_oauth_tokens(self.conn)
             elif migration.sql:
                 self.conn.executescript(migration.sql)
@@ -255,8 +259,8 @@ class SQLiteMigrationRunner:
             newly_applied.append(migration.version)
         from pu.identity.session import migrate_legacy_oauth_tokens
 
-        # 9007 may have run before PU_TOKEN_KEY existed. Retry until every
-        # legacy blob is either enc2 or pinned to the owner that held it.
+        # 9007 pins the enc1 set once. Later connects only re-encrypt those
+        # rows, after PU_TOKEN_KEY exists. They do not admit a new enc1 blob.
         migrate_legacy_oauth_tokens(self.conn)
         self.conn.commit()
         from pu.identity.scope import load_local_owner_cache

@@ -3,9 +3,9 @@
 ``PU_TOKEN_KEY`` is read from the environment at call time. New ciphertext is
 AES-GCM (``enc2``). The key is derived with HKDF and a random salt, and the
 AEAD binds ``owner_user_id`` and the connection id as additional data.
-``enc1`` blobs still decrypt so a migration can rewrite them. Startup
-re-encrypts every stored blob; a blob left as ``enc1`` is pinned to its row
-and is not decrypted for another owner.
+``enc1`` blobs still decrypt so migration 9007 can rewrite the closed set it
+pinned. A digest recorded there is never cleared, and an ``enc1`` blob that
+was not in that set is not re-encrypted.
 """
 
 from __future__ import annotations
