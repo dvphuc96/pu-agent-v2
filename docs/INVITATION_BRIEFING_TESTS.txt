@@ -1,0 +1,46 @@
+KIỂM THỬ BẢN CẬP NHẬT ĐÁNH GIÁ LỜI MỜI HỢP TÁC
+
+Môi trường: Python 3.12, pytest 9.1.1; đã cài optional PDF dependency.
+Toàn bộ deterministic suite: python -m pytest evals/deterministic -q --disable-warnings -rs
+........................................................................ [  9%]
+........................................................................ [ 18%]
+........................................................................ [ 27%]
+........................................................................ [ 36%]
+...................................ss................................... [ 45%]
+........................................................................ [ 54%]
+........................................................................ [ 63%]
+........................................................................ [ 72%]
+........................................................................ [ 81%]
+........................................................................ [ 90%]
+.............................................sssssssssss................ [ 99%]
+..                                                                       [100%]
+=========================== short test summary info ============================
+SKIPPED [2] evals/deterministic/test_only_tracked_skills_ship.py:42: source bundle has no .git metadata; tracked-file assertions are not evaluable
+SKIPPED [11] evals/deterministic/test_tool_trigger.py:122: set PU_RUN_LIVE_EVALS=1 and configure an API key to run live evals
+781 passed, 13 skipped in 31.35s
+
+Sau điều chỉnh cuối về thứ tự câu hỏi và phần chuẩn bị trao đổi:
+........................                                                 [100%]
+24 passed in 2.13s
+
+Lint các file sản phẩm/test đã thay đổi: All checks passed!
+Generated .env.example: PYTHONPATH=. python scripts/generate_env_example.py --check — PASS.
+
+11 live evals cần API key và PU_RUN_LIVE_EVALS=1; chưa chạy.
+2 tracked-skill tests cần .git; source ZIP không có metadata Git.
+Gmail/Calendar/web trong test là API giả lập, không gửi email hoặc tạo sự kiện thật.
+Không xác nhận chất lượng của model thực tế chỉ từ các kiểm thử deterministic.
+Lint toàn bộ source vẫn có các vấn đề có sẵn ở file ngoài phạm vi thay đổi; bản cập nhật chỉ kiểm tra/sửa lint các file đã chạm.
+
+Frontend update:
+ℹ tests 55
+ℹ suites 0
+ℹ pass 55
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 308.416128
+
+Python deterministic suite: 781 passed, 13 skipped in 30.76s.
+Browser visual QA unavailable: Chromium download returned invalid/truncated archives.
