@@ -453,4 +453,54 @@ def test_briefing_worker_does_not_read_while_lease_is_held_or_expired(tmp_path):
 
     service._run_as_owner(user_a.user_id, read_after_claim)
     assert seen == [SECRET]
+    called: list[str] = []
+    assert service._run_as_owner(str(uuid.uuid4()), lambda: called.append("ran")) is None
+    assert called == []
     conn.close()
+
+
+def test_missing_lease_until_fails_closed(tmp_path):
+    home, conn, seam, user_a, _user_b = _open(tmp_path)
+    workflows = SQLiteWorkflowRepository(SQLiteDatabase.from_home(home))
+    with _as(seam, user_a):
+        workflows.create("wf-a", ResearchWorkflowRequest(prompt=SECRET))
+        workflows.save_checkpoint("wf-a", "email", AgentResult(reply=SECRET))
+    job = WorkerJob.open(
+        owner_user_id=user_a.user_id,
+        workspace_id=user_a.workspace_id,
+        expires_at=time.time() + 120,
+        db_path=str(home / "state.db"),
+        watch_db_lease=True,
+    )
+    try:
+        with pytest.raises(PermissionError) as err:
+            workflows.checkpoints("wf-a")
+        assert SECRET not in str(err.value)
+    finally:
+        job.close()
+    conn.close()
+
+
+def test_research_reaches_the_model_only_for_an_admitted_owner(tmp_path):
+    admitted = ScriptedProvider([response([text_block("fixture stage")]) for _ in range(8)])
+    app = create_application(
+        settings=Settings(home=tmp_path / "admitted", api_key="offline", gmail=False, graph_workflows=False),
+        llm_provider=admitted,
+    )
+    result = app.run_research_workflow("Prepare the fixture brief")
+    assert admitted.requests
+    assert result.stages["email"].reply == "fixture stage"
+    assert isinstance(app.agent_runtime, DefaultAgentRuntime)
+    app.close()
+
+    denied = ScriptedProvider([response([text_block("should-not-run")])])
+    blocked = create_application(
+        settings=Settings(home=tmp_path / "denied", api_key="offline", gmail=False, graph_workflows=False),
+        llm_provider=denied,
+    )
+    with pytest.raises(WorkflowExecutionError) as err:
+        blocked.agent_orchestrator.run(ResearchWorkflowRequest(prompt="Prepare the fixture brief"))
+    assert err.value.stage == "email"
+    assert isinstance(err.value.cause, AgentRequestRejected)
+    assert denied.requests == []
+    blocked.close()

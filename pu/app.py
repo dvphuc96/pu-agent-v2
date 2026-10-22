@@ -217,6 +217,8 @@ class PU(BaseAgent):
                 agent_scopes=tuple(sorted(contract.agent_scopes)),
                 tool_scopes=tuple(sorted(contract.tool_scopes)),
                 approval_status=contract.approval_status,
+                principal_kind=contract.principal.kind.value,
+                personal_workspace_id=contract.workspace_id,
                 company=company,
                 evidence_sources=evidence_sources or [],
                 require_semantic_review=require_semantic_review,

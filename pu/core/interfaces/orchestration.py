@@ -18,6 +18,8 @@ class ResearchWorkflowRequest:
     agent_scopes: tuple[str, ...] = ()
     tool_scopes: tuple[str, ...] = ()
     approval_status: str = "not_required"
+    principal_kind: str = ""
+    personal_workspace_id: str = ""
     company: str = ""
     evidence_sources: list[dict[str, Any]] = field(default_factory=list)
     require_semantic_review: bool = False

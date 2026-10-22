@@ -896,7 +896,7 @@ class BriefingService:
                 (owner_user_id,),
             ).fetchone()
         if row is None:
-            return fn()
+            return None
         if not self._claim_lease_if_needed(owner_user_id):
             return None
         job = WorkerJob.open(

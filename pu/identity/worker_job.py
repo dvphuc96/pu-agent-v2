@@ -145,7 +145,7 @@ def _db_lease_expired(grant: JobGrant) -> bool:
     finally:
         conn.close()
     if row is None or row[0] in (None, ""):
-        return False
+        return True
     try:
         return float(row[0]) <= time.time()
     except (TypeError, ValueError):
