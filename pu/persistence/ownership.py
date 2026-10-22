@@ -135,6 +135,11 @@ def apply_ownership_migration(conn: sqlite3.Connection) -> None:
         _KNOWLEDGE_FTS_TRIGGERS,
     )
     _owner_match_triggers(conn)
+    if _exists(conn, "agent_events"):
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_agent_events_workflow_owner
+               ON agent_events(workflow_id, owner_user_id)"""
+        )
     _assert_no_backups(conn)
     conn._pu_local_owner = owner  # type: ignore[attr-defined]
     conn._pu_local_workspace = principal.workspace_id  # type: ignore[attr-defined]
@@ -330,7 +335,11 @@ def _rebuild_checkpoints(conn: sqlite3.Connection) -> None:
         ("workflow_id", "owner_user_id"),
         "workflow_runs",
         ("id", "owner_user_id"),
-    ):
+    ) and _pk(conn, "workflow_stage_checkpoints") == [
+        "workflow_id",
+        "owner_user_id",
+        "stage_name",
+    ]:
         return
     _drop_triggers(conn, "workflow_stage_checkpoints")
     _rebuild(
@@ -344,7 +353,7 @@ def _rebuild_checkpoints(conn: sqlite3.Connection) -> None:
             result_json TEXT,
             error TEXT,
             updated_at TEXT NOT NULL,
-            PRIMARY KEY(workflow_id, stage_name),
+            PRIMARY KEY(workflow_id, owner_user_id, stage_name),
             FOREIGN KEY(workflow_id, owner_user_id)
                 REFERENCES workflow_runs(id, owner_user_id) ON DELETE CASCADE
         )""",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from urllib.parse import urlparse
 
 from pu.core.cancellation import RunCancelled
@@ -63,10 +64,26 @@ class ResearchWorkflowOrchestrator:
     def descriptors(self) -> list[dict]:
         return [a.descriptor.__dict__.copy() for a in self.agents]
 
+    def _with_owner(self, request: ResearchWorkflowRequest) -> ResearchWorkflowRequest:
+        if request.principal and request.owner_user_id:
+            return request
+        from pu.identity.seam import attached_principal
+
+        attached = attached_principal()
+        if attached is None:
+            return request
+        return replace(
+            request,
+            principal=attached.user_id,
+            owner_user_id=request.owner_user_id or attached.user_id,
+        )
+
     def run(self, request: ResearchWorkflowRequest, observer=None) -> ResearchWorkflowResult:
-        workflow_id = f"research-{uuid.uuid4()}"
+        request = self._with_owner(request)
+        workflow_id = (request.workflow_id or "").strip() or f"research-{uuid.uuid4()}"
         if self.workflow_repository is not None:
-            self.workflow_repository.create(workflow_id, request)
+            # One state row per run. Opening an id that already exists does not insert.
+            self.workflow_repository.open_run(workflow_id, request)
         return self._execute(request, workflow_id, observer=observer, resumed=False)
 
     def resume(self, workflow_id: str, observer=None) -> ResearchWorkflowResult:
@@ -77,7 +94,7 @@ class ResearchWorkflowOrchestrator:
             raise KeyError("workflow not found")
         if run.status == "completed":
             raise ValueError("workflow is already completed")
-        request = self.workflow_repository.request(workflow_id)
+        request = self._with_owner(self.workflow_repository.request(workflow_id))
         self.workflow_repository.start_attempt(workflow_id)
         return self._execute(request, workflow_id, observer=observer, resumed=True)
 

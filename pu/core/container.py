@@ -142,7 +142,7 @@ def build_dependencies(
     )
     approved_action_executor = ApprovedActionExecutor(approval_service, harness)
     runtime = agent_runtime or DefaultAgentRuntime(provider, harness)
-    workflow = workflow_engine or GraphWorkflowEngine()
+    workflow = workflow_engine or GraphWorkflowEngine(repository=workflow_repository)
 
     from pu.agents import (
         CalendarAgent,

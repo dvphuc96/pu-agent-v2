@@ -8,7 +8,6 @@ import uuid
 from pathlib import Path
 
 from pu.core.interfaces.llm import LLMRequest
-from pu.core.interfaces.tools import ToolContext
 from pu.harness.tools import InMemoryRateLimiter
 from pu.reporting.workspace import WorkspaceRepository
 
@@ -427,20 +426,26 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
                     subject=payload.get("subject", ""),
                     intro=payload.get("intro", ""),
                 )
+            from pu.identity.contract import invoke_tool, request_for_connection
+
             tool = app.tools.resolve(tool_name)
-            result = app.tool_harness.execute(
+            contract = request_for_connection(
+                app.conn,
+                scopes=frozenset({tool.definition.required_scope}),
+                approval_status="pending",
+            )
+            result = invoke_tool(
+                app.tool_harness,
                 "propose_" + tool_name,
                 arguments,
-                ToolContext(
-                    principal="local-user",
-                    actor="workspace-ui",
-                    agent_id="human-approval-agent",
-                    request_id=str(uuid.uuid4()),
-                    workflow_id=stored["payload"].get("workflow_id"),
-                    scopes=frozenset({tool.definition.required_scope}),
-                    capabilities=frozenset({"action:propose"}),
-                    observer=app.event_publisher.publish,
-                ),
+                contract,
+                actor="workspace-ui",
+                agent_id="human-approval-agent",
+                request_id=str(uuid.uuid4()),
+                workflow_id=stored["payload"].get("workflow_id"),
+                scopes=frozenset({tool.definition.required_scope}),
+                capabilities=frozenset({"action:propose"}),
+                observer=app.event_publisher.publish,
             )
             if not result.ok:
                 raise ValueError(result.output)

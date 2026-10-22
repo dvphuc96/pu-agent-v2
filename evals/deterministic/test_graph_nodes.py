@@ -7,6 +7,7 @@ with its inner llm/tool events surfacing at the outer observer tagged node=.
 from __future__ import annotations
 
 from evals.helpers import ScriptedProvider, response, text_block, tool_block
+from pu.core.interfaces.tools import ToolContext
 from pu.graph import END, START, Graph, run_graph
 from pu.graph.nodes import agent_node, llm_node, tool_node
 from pu.tools.registry import Tool, ToolRegistry
@@ -46,9 +47,18 @@ def test_agent_node_runs_a_real_loop_turn_with_tagged_events():
         response([tool_block("save_note", {"text": "milk"})], "tool_use"),
         response([text_block("Noted!")]),
     ])
-    node = agent_node("full_agent", out_key="result", provider=client,
-                      model="main-model", system="You are a test agent.",
-                      tools=registry)
+    node = agent_node(
+        "full_agent", out_key="result", provider=client,
+        model="main-model", system="You are a test agent.",
+        tools=registry,
+        tool_context=ToolContext(
+            actor="agent",
+            principal="fixture-user",
+            agent_id="full_agent",
+            scopes=registry.scopes(),
+            capabilities=registry.agent_capabilities(),
+        ),
+    )
 
     events: list[tuple[str, dict]] = []
     state = run_graph(one_node_graph(node), {"message": "note milk"},

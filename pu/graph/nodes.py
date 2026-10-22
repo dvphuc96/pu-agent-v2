@@ -6,8 +6,9 @@ from collections.abc import Callable, Iterable
 
 from pu.core.interfaces.llm import LLMProvider, LLMRequest
 from pu.core.interfaces.tools import ToolContext, ToolHarness
-from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolAuditSink
 from pu.graph.engine import Node, NodeFn, RouteFn
+from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolAuditSink
+from pu.identity.contract import AgentRequestRejected
 from pu.loop.agent import run_loop
 from pu.tools.registry import ToolRegistry
 
@@ -50,20 +51,17 @@ def agent_node(name: str, out_key: str, *, provider: LLMProvider,
     resolved_harness = tool_harness or DefaultToolHarness(
         tools, DefaultSecurityHarness(), InMemoryToolAuditSink()
     )
-    resolved_context = tool_context or ToolContext(
-        actor="agent",
-        principal="graph-local-user",
-        agent_id=name,
-        scopes=tools.scopes(),
-        capabilities=tools.capabilities(),
-    )
+    resolved_context = tool_context
 
     def run(state: dict) -> dict:
+        context = resolved_context
+        if context is None or not context.principal:
+            raise AgentRequestRejected("request is missing principal or owner")
         messages = [{"role": "user", "content": state[message_key]}]
         result = run_loop(provider=provider, model=model, system=system,
                           messages=messages, tools=tools, tool_harness=resolved_harness,
                           max_iterations=max_iterations, max_tokens=max_tokens,
-                          observer=state.get("_notify"), tool_context=resolved_context)
+                          observer=state.get("_notify"), tool_context=context)
         return {out_key: result}
 
     return Node(name=name, fn=run, kind="agent", **node_kwargs)

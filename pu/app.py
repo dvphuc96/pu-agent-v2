@@ -14,7 +14,6 @@ from pu.adapters.events import CallableEventPublisher, CompositeEventPublisher
 from pu.agents import BaseAgent
 from pu.core.interfaces.agents import AgentResult, AgentRunRequest
 from pu.core.interfaces.llm import LLMRequest
-from pu.core.interfaces.tools import ToolContext
 from pu.loop.agent import LoopResult, Observer
 from pu.tools.research import make_tool as make_research_tool
 
@@ -198,16 +197,24 @@ class PU(BaseAgent):
         and to the caller observer, exactly like a normal chat turn.
         """
         from pu.core.interfaces.orchestration import ResearchWorkflowRequest
+        from pu.identity.contract import request_for_connection
+
         publisher = CompositeEventPublisher([
             CallableEventPublisher(observer),
             self.event_publisher,
         ])
+        contract = request_for_connection(self.conn, scopes=self.tools.scopes())
         return self.agent_orchestrator.run(
             ResearchWorkflowRequest(
                 prompt=prompt or "Prepare my morning company research brief from recent email and calendar context.",
                 email_days=email_days,
                 max_emails=max_emails,
+                principal=contract.principal.user_id,
+                owner_user_id=contract.owner_user_id,
                 workspace_id=workspace_id,
+                agent_scopes=tuple(sorted(contract.agent_scopes)),
+                tool_scopes=tuple(sorted(contract.tool_scopes)),
+                approval_status=contract.approval_status,
                 company=company,
                 evidence_sources=evidence_sources or [],
                 require_semantic_review=require_semantic_review,
@@ -251,11 +258,14 @@ class PU(BaseAgent):
                 "Do not send, schedule, forward or save knowledge without human approval."
             )
         window = self.settings.history_turns * 2
+        from pu.identity.contract import request_for_connection, tool_context_from_request
+
         messages = self.session.history[-window:] + [{"role": "user", "content": user_message}]
-        context = ToolContext(
+        contract = request_for_connection(self.conn, scopes=self.tools.scopes())
+        context = tool_context_from_request(
+            contract,
             observer=notify,
             actor="agent",
-            principal="local-user",
             request_id=str(uuid.uuid4()),
             workflow_id=None,
             agent_id="pu-agent",

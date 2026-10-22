@@ -369,7 +369,10 @@ class BriefingService:
                    ON CONFLICT(key, owner_user_id) DO UPDATE SET value=excluded.value""",
                     (key, value),
                 )
-            return True
+        from pu.identity.worker_job import arm_worker_lease
+
+        arm_worker_lease()
+        return True
 
     def run_job(self, job, app):
         jid, wid = job["id"], job["workspace_id"]
@@ -810,9 +813,8 @@ class BriefingService:
         return [row[0] for row in rows]
 
     def _run_as_owner(self, owner_user_id: str, fn):
-        """Attach a worker principal for this job's owner, then restore the caller."""
-        from pu.identity.principal import Principal, PrincipalKind
-        from pu.identity.seam import InternalPrincipalSeam
+        """Hold this owner's worker grant for the job, then drop it."""
+        from pu.identity.worker_job import WorkerJob
 
         with self.repo.database.connection() as conn:
             row = conn.execute(
@@ -821,13 +823,16 @@ class BriefingService:
             ).fetchone()
         if row is None:
             return fn()
-        token = InternalPrincipalSeam().attach(
-            Principal(PrincipalKind.WORKER, owner_user_id, row[0])
+        job = WorkerJob.open(
+            owner_user_id=owner_user_id,
+            workspace_id=row[0],
+            expires_at=time.time() + 120,
+            db_path=str(self.home / "state.db"),
         )
         try:
             return fn()
         finally:
-            InternalPrincipalSeam().detach(token)
+            job.close()
 
     def _renew_lease(self) -> None:
         with self.repo.database.connection() as conn:

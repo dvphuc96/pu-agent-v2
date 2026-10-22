@@ -64,7 +64,23 @@ class SQLiteWorkflowRepository:
     def __init__(self, database: SQLiteDatabase):
         self.database = database
 
+    def _guard(self) -> None:
+        from pu.identity.worker_job import owner_from_grant
+
+        owner_from_grant()
+
+    def open_run(self, workflow_id: str, request: ResearchWorkflowRequest) -> WorkflowRun:
+        """Return the one state row for this run. A second open does not insert."""
+        existing = self.get(workflow_id)
+        if existing is not None:
+            return existing
+        return self.create(workflow_id, request)
+
     def create(self, workflow_id: str, request: ResearchWorkflowRequest) -> WorkflowRun:
+        self._guard()
+        existing = self.get(workflow_id)
+        if existing is not None:
+            return existing
         now = _now()
         payload = json.dumps(asdict(request), ensure_ascii=False, sort_keys=True)
         with self.database.connection() as conn:
@@ -77,6 +93,7 @@ class SQLiteWorkflowRepository:
         return self.get(workflow_id)
 
     def get(self, workflow_id: str) -> WorkflowRun | None:
+        self._guard()
         with self.database.connection() as conn:
             row = conn.execute(
                 "SELECT * FROM workflow_runs WHERE id=? AND owner_user_id = pu_current_owner()",
@@ -99,6 +116,7 @@ class SQLiteWorkflowRepository:
         return ResearchWorkflowRequest(**run.request)
 
     def list(self, *, limit: int = 50, status: str | None = None) -> list[WorkflowRun]:
+        self._guard()
         sql = "SELECT id FROM workflow_runs WHERE owner_user_id = pu_current_owner()"
         params: tuple[Any, ...] = ()
         if status:
@@ -111,6 +129,7 @@ class SQLiteWorkflowRepository:
         return [run for wid in ids if (run := self.get(wid)) is not None]
 
     def start_attempt(self, workflow_id: str) -> WorkflowRun:
+        self._guard()
         now = _now()
         with self.database.connection() as conn:
             cur = conn.execute(
@@ -125,6 +144,7 @@ class SQLiteWorkflowRepository:
         return self.get(workflow_id)
 
     def set_current_stage(self, workflow_id: str, stage_name: str) -> None:
+        self._guard()
         with self.database.connection() as conn:
             conn.execute(
                 """UPDATE workflow_runs SET current_stage=?, updated_at=?
@@ -133,14 +153,15 @@ class SQLiteWorkflowRepository:
             )
 
     def save_checkpoint(self, workflow_id: str, stage_name: str, result: AgentResult) -> None:
+        self._guard()
         now = _now()
         payload = json.dumps(_agent_result_to_dict(result), ensure_ascii=False, default=str)
         with self.database.connection() as conn:
             conn.execute(
                 """INSERT INTO workflow_stage_checkpoints(
-                       workflow_id, stage_name, status, result_json, error, updated_at
-                   ) VALUES(?, ?, 'completed', ?, NULL, ?)
-                   ON CONFLICT(workflow_id, stage_name) DO UPDATE SET
+                       workflow_id, owner_user_id, stage_name, status, result_json, error, updated_at
+                   ) VALUES(?, pu_current_owner(), ?, 'completed', ?, NULL, ?)
+                   ON CONFLICT(workflow_id, owner_user_id, stage_name) DO UPDATE SET
                      status='completed', result_json=excluded.result_json,
                      error=NULL, updated_at=excluded.updated_at""",
                 (workflow_id, stage_name, payload, now),
@@ -152,18 +173,21 @@ class SQLiteWorkflowRepository:
             )
 
     def checkpoint_failure(self, workflow_id: str, stage_name: str, error: str) -> None:
+        self._guard()
         now = _now()
         with self.database.connection() as conn:
             conn.execute(
                 """INSERT INTO workflow_stage_checkpoints(
-                       workflow_id, stage_name, status, result_json, error, updated_at
-                   ) VALUES(?, ?, 'failed', NULL, ?, ?)
-                   ON CONFLICT(workflow_id, stage_name) DO UPDATE SET
+                       workflow_id, owner_user_id, stage_name, status, result_json, error, updated_at
+                   ) VALUES(?, pu_current_owner(), ?, 'failed', NULL, ?, ?)
+                   ON CONFLICT(workflow_id, owner_user_id, stage_name) DO UPDATE SET
                      status='failed', error=excluded.error, updated_at=excluded.updated_at""",
                 (workflow_id, stage_name, error, now),
             )
 
     def checkpoints(self, workflow_id: str) -> dict[str, WorkflowCheckpoint]:
+        """Stages for one run, keyed by ``(workflow_id, owner_user_id)``."""
+        self._guard()
         with self.database.connection() as conn:
             rows = conn.execute(
                 """SELECT * FROM workflow_stage_checkpoints
@@ -182,6 +206,7 @@ class SQLiteWorkflowRepository:
         return out
 
     def mark_failed(self, workflow_id: str, error: str) -> WorkflowRun:
+        self._guard()
         with self.database.connection() as conn:
             conn.execute(
                 """UPDATE workflow_runs SET status='failed', error=?, updated_at=?
@@ -191,6 +216,7 @@ class SQLiteWorkflowRepository:
         return self.get(workflow_id)
 
     def mark_completed(self, workflow_id: str, *, report_id: str | None = None) -> WorkflowRun:
+        self._guard()
         now = _now()
         with self.database.connection() as conn:
             conn.execute(

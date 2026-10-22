@@ -90,7 +90,16 @@ def ensure_local_principal(conn: sqlite3.Connection) -> Principal:
 
 
 def current_principal(conn: sqlite3.Connection) -> Principal:
-    """Attached seam principal, otherwise the database-local principal."""
+    """Attached seam principal, otherwise the database-local principal.
+
+    A worker job that has ended or whose lease has expired raises instead of
+    falling back to another owner.
+    """
+    from pu.identity.worker_job import current_grant
+
+    grant = current_grant()
+    if grant is not None:
+        return Principal(PrincipalKind.WORKER, grant.owner_user_id, grant.workspace_id)
     attached = attached_principal()
     if attached is not None:
         if attached.kind is PrincipalKind.PLATFORM_ADMIN:

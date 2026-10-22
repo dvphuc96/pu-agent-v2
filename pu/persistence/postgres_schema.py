@@ -99,7 +99,7 @@ CREATE TABLE workflow_stage_checkpoints (
     status TEXT NOT NULL DEFAULT 'completed',
     result_json TEXT,
     updated_at TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (workflow_id, stage_name),
+    PRIMARY KEY (workflow_id, owner_user_id, stage_name),
     FOREIGN KEY (workflow_id, owner_user_id)
         REFERENCES workflow_runs(id, owner_user_id) ON DELETE CASCADE
 );

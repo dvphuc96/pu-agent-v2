@@ -59,6 +59,11 @@ def load_local_owner_cache(conn: sqlite3.Connection) -> None:
 
 
 def current_owner_user_id(conn: sqlite3.Connection) -> str:
+    from pu.identity.worker_job import owner_from_grant
+
+    granted = owner_from_grant()
+    if granted is not None:
+        return granted
     attached = attached_principal()
     if attached is not None:
         return attached.user_id

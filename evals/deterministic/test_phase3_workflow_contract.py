@@ -1,0 +1,298 @@
+"""Phase 3 gates: typed requests, one workflow row, owner-keyed checkpoints.
+
+Fixtures are synthetic users A and B. Nothing here is a real mailbox, token,
+or customer record.
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+
+from evals.helpers import ScriptedProvider, response, text_block, tool_block
+from pu.adapters import GraphWorkflowEngine
+from pu.config import Settings
+from pu.core.container import create_application
+from pu.core.interfaces.agents import AgentResult, AgentRunRequest
+from pu.core.interfaces.events import AgentEvent
+from pu.core.interfaces.orchestration import ResearchWorkflowRequest
+from pu.db import connect
+from pu.graph import END, START, Graph, Node
+from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolAuditSink
+from pu.identity.contract import AgentRequest, AgentRequestRejected, invoke_tool
+from pu.identity.directory import provision_user
+from pu.identity.principal import Principal, PrincipalKind
+from pu.identity.seam import InternalPrincipalSeam
+from pu.identity.worker_job import WorkerJob
+from pu.orchestration.research import WorkflowExecutionError
+from pu.persistence import SQLiteAgentEventRepository, SQLiteDatabase, SQLiteWorkflowRepository
+from pu.runtime import DefaultAgentRuntime
+from pu.tools.registry import Tool, ToolRegistry
+
+SECRET = "fixture-checkpoint-secret"
+EVENT_SECRET = "fixture-event-secret"
+
+
+@contextmanager
+def _as(seam: InternalPrincipalSeam, principal: Principal):
+    token = seam.attach(principal)
+    try:
+        yield
+    finally:
+        seam.detach(token)
+
+
+def _open(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    conn = connect(home)
+    user_a = provision_user(conn)
+    user_b = provision_user(conn)
+    conn.commit()
+    return home, conn, InternalPrincipalSeam(), user_a, user_b
+
+
+def _counts(home: Path, stage: str, workflow_id: str) -> tuple[int, int]:
+    database = SQLiteDatabase.from_home(home)
+    with database.connection() as conn:
+        runs = conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0]
+        stages = conn.execute(
+            """SELECT COUNT(*) FROM workflow_stage_checkpoints
+               WHERE workflow_id=? AND stage_name=?""",
+            (workflow_id, stage),
+        ).fetchone()[0]
+    return int(runs), int(stages)
+
+
+def test_p3_01_missing_principal_or_owner_is_rejected_before_model_or_tool():
+    calls: list[str] = []
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="echo",
+        description="echo",
+        input_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        fn=lambda text: (calls.append(text), text)[1],
+        capability="test:read",
+        required_scope="test:read",
+    ))
+    harness = DefaultToolHarness(registry, DefaultSecurityHarness(), InMemoryToolAuditSink())
+    provider = ScriptedProvider([
+        response([tool_block("echo", {"text": SECRET})], "tool_use"),
+        response([text_block("should-not-run")]),
+    ])
+    runtime = DefaultAgentRuntime(provider, harness)
+    missing = AgentRequest(principal=None, owner_user_id="", workspace_id="")
+    with pytest.raises(AgentRequestRejected):
+        runtime.run(AgentRunRequest(
+            model="test",
+            system="test",
+            messages=[{"role": "user", "content": "go"}],
+            tools=registry,
+            contract=missing,
+        ))
+    user_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    principal = Principal(PrincipalKind.USER, user_id, workspace_id)
+    missing_owner = AgentRequest(
+        principal=principal,
+        owner_user_id="",
+        workspace_id=workspace_id,
+        agent_scopes=frozenset({"test:read"}),
+        tool_scopes=frozenset({"test:read"}),
+    )
+    with pytest.raises(AgentRequestRejected):
+        invoke_tool(harness, "echo", {"text": SECRET}, missing_owner)
+    assert calls == []
+    assert provider.requests == []
+
+    admitted = AgentRequest(
+        principal=principal,
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+        agent_scopes=frozenset({"test:read"}),
+        tool_scopes=frozenset({"test:read"}),
+    )
+    result = invoke_tool(
+        harness,
+        "echo",
+        {"text": "ok"},
+        admitted,
+        scopes=frozenset({"test:read"}),
+        capabilities=frozenset({"test:read"}),
+    )
+    assert result.ok is True
+    assert calls == ["ok"]
+
+
+class _StopAfterEmail:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def run(self, request, observer=None):
+        agent_id = request.tool_context.agent_id
+        self.calls.append(agent_id)
+        if agent_id == "email-agent":
+            return AgentResult(reply=SECRET)
+        raise RuntimeError("stop after email")
+
+
+def test_p3_02_resume_keeps_one_run_and_skips_completed_stages(tmp_path):
+    first = _StopAfterEmail()
+    app = create_application(
+        settings=Settings(home=tmp_path, api_key="offline", gmail=False, graph_workflows=False),
+        llm_provider=ScriptedProvider([]),
+        agent_runtime=first,
+    )
+    with pytest.raises(WorkflowExecutionError) as err:
+        app.run_research_workflow("Prepare the fixture brief")
+    workflow_id = err.value.workflow_id
+    runs, stages = _counts(tmp_path, "email", workflow_id)
+    assert runs == 1
+    assert stages == 1
+    assert first.calls == ["email-agent", "company-info-agent"]
+    app.close()
+
+    second = _StopAfterEmail()
+    app2 = create_application(
+        settings=Settings(home=tmp_path, api_key="offline", gmail=False, graph_workflows=False),
+        llm_provider=ScriptedProvider([]),
+        agent_runtime=second,
+    )
+    with pytest.raises(WorkflowExecutionError):
+        app2.resume_research_workflow(workflow_id)
+    runs, stages = _counts(tmp_path, "email", workflow_id)
+    assert runs == 1
+    assert stages == 1
+    assert "email-agent" not in second.calls
+    assert second.calls == ["company-info-agent"]
+    app2.close()
+
+
+def test_p3_02_graph_resume_reuses_the_same_run_row(tmp_path):
+    connect(tmp_path).close()
+    repository = SQLiteWorkflowRepository(SQLiteDatabase.from_home(tmp_path))
+    calls: list[str] = []
+
+    def one(state):
+        calls.append("one")
+        return {"value": state["seed"] + 1}
+
+    graph = Graph("phase3-shared")
+    graph.add_node(Node("one", one))
+    graph.add_edge(START, "one")
+    graph.add_edge("one", END)
+    engine = GraphWorkflowEngine(repository=repository)
+    state = {"seed": 4, "_workflow_run_id": "wf-graph"}
+    assert engine.run(graph, state)["value"] == 5
+    assert engine.run(graph, {"seed": 4, "_workflow_run_id": "wf-graph"})["value"] == 5
+    assert calls == ["one"]
+    runs, stages = _counts(tmp_path, "one", "wf-graph")
+    assert runs == 1
+    assert stages == 1
+    # A research open of the same id does not insert a second state row.
+    repository.open_run("wf-graph", ResearchWorkflowRequest(prompt="same run"))
+    runs, stages = _counts(tmp_path, "one", "wf-graph")
+    assert runs == 1
+    assert stages == 1
+
+
+def test_p3_03_checkpoint_of_a_is_not_readable_as_b(tmp_path):
+    home, conn, seam, user_a, user_b = _open(tmp_path)
+    workflows = SQLiteWorkflowRepository(SQLiteDatabase.from_home(home))
+    events = SQLiteAgentEventRepository(SQLiteDatabase.from_home(home))
+    with _as(seam, user_a):
+        workflows.create("wf-a", ResearchWorkflowRequest(prompt=SECRET))
+        workflows.save_checkpoint("wf-a", "email", AgentResult(reply=SECRET))
+        events.append(AgentEvent(
+            kind="workflow_stage_completed",
+            payload={"stage": "email", "body": EVENT_SECRET},
+            workflow_id="wf-a",
+        ))
+    with _as(seam, user_b):
+        workflows.create("wf-b", ResearchWorkflowRequest(prompt="fixture-b"))
+        assert workflows.checkpoints("wf-a") == {}
+        assert workflows.get("wf-a") is None
+        assert events.for_run("wf-a") == []
+        own = workflows.checkpoints("wf-b")
+        assert SECRET not in str(own)
+        assert EVENT_SECRET not in str(events.for_run("wf-b"))
+    conn.close()
+
+
+def test_p3_04_worker_loses_owner_after_job_end_or_lease_expiry(tmp_path):
+    home, conn, seam, user_a, _user_b = _open(tmp_path)
+    workflows = SQLiteWorkflowRepository(SQLiteDatabase.from_home(home))
+    with _as(seam, user_a):
+        workflows.create("wf-a", ResearchWorkflowRequest(prompt=SECRET))
+        workflows.save_checkpoint("wf-a", "email", AgentResult(reply=SECRET))
+        conn.execute(
+            """INSERT INTO briefing_state(key, value, owner_user_id)
+               VALUES('lease_until', ?, ?)""",
+            (str(int(time.time() + 120)), user_a.user_id),
+        )
+        conn.commit()
+
+    job = WorkerJob.open(
+        owner_user_id=user_a.user_id,
+        workspace_id=user_a.workspace_id,
+        expires_at=time.time() + 120,
+        db_path=str(home / "state.db"),
+        watch_db_lease=False,
+    )
+    try:
+        assert workflows.checkpoints("wf-a")["email"].result.reply == SECRET
+        job.finish()
+        with pytest.raises(PermissionError) as ended:
+            workflows.checkpoints("wf-a")
+        assert SECRET not in str(ended.value)
+    finally:
+        job.close()
+
+    with _as(seam, user_a):
+        assert workflows.checkpoints("wf-a")["email"].result.reply == SECRET
+        conn.execute(
+            """UPDATE briefing_state SET value=?
+               WHERE key='lease_until' AND owner_user_id=?""",
+            (str(int(time.time() - 10)), user_a.user_id),
+        )
+        conn.commit()
+
+    expired = WorkerJob.open(
+        owner_user_id=user_a.user_id,
+        workspace_id=user_a.workspace_id,
+        expires_at=time.time() + 120,
+        db_path=str(home / "state.db"),
+        watch_db_lease=True,
+    )
+    try:
+        with pytest.raises(PermissionError) as leased:
+            workflows.checkpoints("wf-a")
+        assert SECRET not in str(leased.value)
+    finally:
+        expired.close()
+
+    with _as(seam, user_a):
+        assert workflows.checkpoints("wf-a")["email"].result.reply == SECRET
+    conn.close()
+
+
+def test_production_modules_do_not_default_local_user():
+    root = Path(__file__).resolve().parents[2] / "pu"
+    offenders = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if "local-user" not in text and "graph-local-user" not in text:
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative == "identity/legacy_import.py" and "graph-local-user" not in text:
+            continue
+        offenders.append(relative)
+    assert offenders == []

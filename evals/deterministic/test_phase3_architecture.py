@@ -92,6 +92,12 @@ def test_default_runtime_preserves_loop_behavior():
         system="test",
         messages=[{"role": "user", "content": "echo hello"}],
         tools=registry,
+        tool_context=ToolContext(
+            actor="agent",
+            principal="fixture-user",
+            scopes=registry.scopes(),
+            capabilities=registry.agent_capabilities(),
+        ),
     ))
     assert result.reply == "done"
     assert result.iterations == 2

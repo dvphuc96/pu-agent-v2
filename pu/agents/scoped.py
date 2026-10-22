@@ -84,7 +84,7 @@ class ScopedAgent(BaseAgent):
         *,
         observer=None,
         workflow_id: str | None = None,
-        principal: str = "local-user",
+        principal: str = "",
         metadata: dict[str, Any] | None = None,
         stream: bool = False,
         max_tokens: int | None = None,

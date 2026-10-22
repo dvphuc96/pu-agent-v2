@@ -11,8 +11,13 @@ class ResearchWorkflowRequest:
     prompt: str = "Prepare my morning company research brief from recent email and calendar context."
     email_days: int = 7
     max_emails: int = 20
-    principal: str = "local-user"
+    principal: str = ""
+    owner_user_id: str = ""
     workspace_id: str | None = None
+    workflow_id: str = ""
+    agent_scopes: tuple[str, ...] = ()
+    tool_scopes: tuple[str, ...] = ()
+    approval_status: str = "not_required"
     company: str = ""
     evidence_sources: list[dict[str, Any]] = field(default_factory=list)
     require_semantic_review: bool = False
