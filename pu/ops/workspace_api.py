@@ -88,6 +88,7 @@ def ask_sources(
         raise ValueError("Câu hỏi cần 1–4.000 ký tự.")
     if not sources:
         raise ValueError("Chọn ít nhất một nguồn để hỏi đáp.")
+    repo.require(workspace_id)
     source_map = {f"S{i}": s for i, s in enumerate(sources, 1)}
     evidence = [
         {"source_id": key, "title": s["title"], "url": s["url"], "content": s["content"]}
@@ -95,6 +96,9 @@ def ask_sources(
     ]
     selected_ids = {s["id"] for s in sources}
     with repo.database.connection() as conn:
+        from pu.identity.contract import request_for_connection
+
+        request_for_connection(conn, scopes=())
         previous = conn.execute(
             """SELECT question,answer,source_ids_json FROM workspace_messages
                WHERE workspace_id=? AND owner_user_id = pu_current_owner()
@@ -196,6 +200,13 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
         from pu.tools.google_calendar import connect
 
         return {"message": connect(home)}
+    if op == "download_attachment":
+        import base64
+
+        from pu.reporting.attachment_store import read_attachment
+
+        name, data = read_attachment(home, str(payload.get("attachment_id") or ""))
+        return {"filename": name, "data": base64.b64encode(data).decode("ascii")}
     with repo.database.connection() as conn:
         workspace_id = coerce_workspace_id(conn, payload.get("workspace_id", ""))
     workspace = repo.require(workspace_id)
@@ -271,10 +282,22 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
             else {"untrusted_input": True},
         )
     elif op == "upload_source":
+        from pu.reporting.attachment_store import store_attachment
         from pu.reporting.attachments import extract_attachment
 
+        filename = payload.get("filename", "")
+        encoded = payload.get("data", "")
+        extracted = extract_attachment(filename, encoded)
+        attachment_id = store_attachment(home, filename, encoded)
+        metadata = dict(extracted.get("metadata") or {})
+        metadata["attachment_id"] = attachment_id
         repo.add_source(
-            workspace_id, **extract_attachment(payload.get("filename", ""), payload.get("data", ""))
+            workspace_id,
+            title=extracted["title"],
+            content=extracted["content"],
+            source_type=extracted.get("source_type", "document"),
+            url=extracted.get("url", ""),
+            metadata=metadata,
         )
     elif op in {"imports", "import_source"}:
         with repo.database.connection() as conn:

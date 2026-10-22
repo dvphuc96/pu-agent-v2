@@ -1,9 +1,8 @@
 """Phase 0 reproductions for static-analysis findings.
 
 These tests encode the multi-user safety properties. A defect that has been
-fixed runs as a normal test. The remaining xfail markers belong to later
-phases (OTel redaction, tracer init, and Google Calendar errors) and stay
-until those phases land.
+fixed runs as a normal test. The remaining xfail markers belong to Phase 5
+(OTel redaction and tracer init) and stay until that phase lands.
 """
 
 from __future__ import annotations
@@ -427,13 +426,6 @@ def test_tracer_init_keeps_otel_trace_api(tmp_path, monkeypatch):
     assert tracer._trace_api is sentinel
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "list_events nuốt lỗi Google Calendar bắt đầu bằng 'Google Calendar unavailable' "
-        "và, khi lịch local trống, trả về 'No events found'."
-    ),
-)
 def test_list_events_surfaces_google_error_instead_of_empty_diary(tmp_path, monkeypatch):
     import sqlite3
 

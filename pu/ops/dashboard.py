@@ -952,7 +952,11 @@ def knowledge_action(payload: dict) -> dict:
             src = kb.get_source(conn, int(payload.get("id", 0)))
             return {"source": src, "chunks": kb.chunks_for(conn, int(payload.get("id", 0)))}
         if op == "reindex":
-            return {"message": kb.reindex_folder(conn, home / "knowledge")}
+            from pu.identity.files import owner_for_home, owner_root
+
+            owner = owner_for_home(home)
+            folder = owner_root(home, owner) / "knowledge" if owner else home / "knowledge"
+            return {"message": kb.reindex_folder(conn, folder)}
         return {"error": f"Unknown knowledge op '{op}'"}
     finally:
         conn.close()

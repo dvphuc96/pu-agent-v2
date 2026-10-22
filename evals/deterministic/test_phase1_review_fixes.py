@@ -462,7 +462,8 @@ CROSS_OWNER_ALLOWLIST = (
 def _has_owner_filter(statement: str) -> bool:
     if "pu_current_owner" in statement:
         return True
-    return re.search(r"(?i)\bowner_user_id\s*=\s*\?", statement) is not None
+    # ``?`` is SQLite. ``%s`` is the same bound owner predicate on PostgreSQL.
+    return re.search(r"(?i)\bowner_user_id\s*=\s*(\?|%s)", statement) is not None
 
 
 def _cross_owner_allowed(path: Path, statement: str) -> str:

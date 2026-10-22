@@ -536,48 +536,72 @@ def _rebuild_workspace_children(conn: sqlite3.Connection) -> None:
         ("id", "owner_user_id"),
     ):
         _drop_triggers(conn, "briefing_jobs")
-        _rebuild(
-            conn,
-            "briefing_jobs",
-            """CREATE TABLE briefing_jobs (
-                id TEXT PRIMARY KEY,
-                fingerprint TEXT NOT NULL UNIQUE,
-                workspace_id TEXT NOT NULL,
-                owner_user_id TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'queued',
-                stage TEXT NOT NULL DEFAULT 'queued',
-                workflow_id TEXT,
-                report_id TEXT,
-                email_ids_json TEXT NOT NULL,
-                error TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                next_attempt TEXT NOT NULL DEFAULT '',
-                FOREIGN KEY(workspace_id, owner_user_id)
-                    REFERENCES research_workspaces(id, owner_user_id)
-            )""",
-            [
-                "id",
-                "fingerprint",
-                "workspace_id",
-                "owner_user_id",
-                "status",
-                "stage",
-                "workflow_id",
-                "report_id",
-                "email_ids_json",
-                "error",
-                "created_at",
-                "updated_at",
-                "attempts",
-                "next_attempt",
-            ],
-        )
+        _rebuild(conn, "briefing_jobs", _BRIEFING_JOBS_CREATE, _BRIEFING_JOBS_COLUMNS)
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_briefing_jobs_status
                ON briefing_jobs(status, created_at)"""
         )
+
+
+_BRIEFING_JOBS_CREATE = """CREATE TABLE briefing_jobs (
+    id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    stage TEXT NOT NULL DEFAULT 'queued',
+    workflow_id TEXT,
+    report_id TEXT,
+    email_ids_json TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt TEXT NOT NULL DEFAULT '',
+    UNIQUE(fingerprint, owner_user_id),
+    FOREIGN KEY(workspace_id, owner_user_id)
+        REFERENCES research_workspaces(id, owner_user_id)
+)"""
+
+_BRIEFING_JOBS_COLUMNS = [
+    "id",
+    "fingerprint",
+    "workspace_id",
+    "owner_user_id",
+    "status",
+    "stage",
+    "workflow_id",
+    "report_id",
+    "email_ids_json",
+    "error",
+    "created_at",
+    "updated_at",
+    "attempts",
+    "next_attempt",
+]
+
+
+def scope_briefing_fingerprint(conn: sqlite3.Connection) -> None:
+    """Allow the same briefing fingerprint for two owners.
+
+    Databases that already applied the global UNIQUE constraint are rebuilt.
+    A table that already has ``UNIQUE(fingerprint, owner_user_id)`` is left
+    as it is.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'briefing_jobs'"
+    ).fetchone()
+    if row is None or not row[0]:
+        return
+    normalized = "".join(row[0].split()).lower()
+    if "unique(fingerprint,owner_user_id)" in normalized:
+        return
+    _drop_triggers(conn, "briefing_jobs")
+    _rebuild(conn, "briefing_jobs", _BRIEFING_JOBS_CREATE, _BRIEFING_JOBS_COLUMNS)
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_briefing_jobs_status
+           ON briefing_jobs(status, created_at)"""
+    )
 
 
 def _needs_pk(conn: sqlite3.Connection, table: str, expected: list[str]) -> bool:

@@ -114,8 +114,52 @@ class ResearchWorkflowOrchestrator:
             personal_workspace_id=request.personal_workspace_id or attached.workspace_id,
         )
 
+    def _refuse_foreign_ids(self, request: ResearchWorkflowRequest) -> None:
+        """Refuse another owner's workspace or evidence id before any stage.
+
+        Repositories without a report root, and homes without a database,
+        keep the previous offline behavior.
+        """
+        root = getattr(self.report_repository, "root", None)
+        if root is None:
+            return
+        from pathlib import Path
+
+        home = Path(root).parent
+        if not (home / "state.db").is_file():
+            return
+        thread_ids: list[str] = []
+        connection_id = ""
+        cache = request.evidence_cache if isinstance(request.evidence_cache, dict) else {}
+        if str(cache.get("thread_id") or "").strip():
+            thread_ids.append(str(cache["thread_id"]))
+        if str(cache.get("connection_id") or "").strip():
+            connection_id = str(cache["connection_id"])
+        for item in request.evidence_sources or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("thread_id") or "").strip():
+                thread_ids.append(str(item["thread_id"]))
+            if not connection_id and str(item.get("connection_id") or "").strip():
+                connection_id = str(item["connection_id"])
+        from pu.agents.isolation import refuse_before_provider
+        from pu.db import connect
+
+        conn = connect(home)
+        try:
+            refuse_before_provider(
+                conn,
+                workspace_id=str(request.workspace_id or ""),
+                connection_id=connection_id,
+                thread_ids=thread_ids,
+                owner=str(request.owner_user_id or ""),
+            )
+        finally:
+            conn.close()
+
     def run(self, request: ResearchWorkflowRequest, observer=None) -> ResearchWorkflowResult:
         request = self._with_owner(request)
+        self._refuse_foreign_ids(request)
         workflow_id = (request.workflow_id or "").strip() or f"research-{uuid.uuid4()}"
         if self.workflow_repository is not None:
             # One state row per run. Opening an id that already exists does not insert.
@@ -131,6 +175,7 @@ class ResearchWorkflowOrchestrator:
         if run.status == "completed":
             raise ValueError("workflow is already completed")
         request = self._with_owner(self.workflow_repository.request(workflow_id))
+        self._refuse_foreign_ids(request)
         self.workflow_repository.start_attempt(workflow_id)
         return self._execute(request, workflow_id, observer=observer, resumed=True)
 
@@ -586,7 +631,9 @@ class ResearchWorkflowOrchestrator:
 
             with performance.measure("evaluation"):
                 evaluation = self.evaluation_harness.evaluate(
-                    structured_report, run_judge=self.run_judge
+                    structured_report,
+                    run_judge=self.run_judge,
+                    contract=_agent_request(request),
                 )
             semantic_review = getattr(evaluation, "status_details", {}).get("semantic_review")
             from pu.reporting.repair import plan_repair, select_repair_candidate
@@ -636,7 +683,11 @@ class ResearchWorkflowOrchestrator:
                 if candidate is not None and not needs_repair(candidate):
                     finalize_context(candidate)
                     with performance.measure("evaluation_repair"):
-                        candidate_evaluation = self.evaluation_harness.evaluate(candidate, run_judge=self.run_judge)
+                        candidate_evaluation = self.evaluation_harness.evaluate(
+                            candidate,
+                            run_judge=self.run_judge,
+                            contract=_agent_request(request),
+                        )
                     selection = select_repair_candidate(structured_report, evaluation, candidate, candidate_evaluation)
                     accepted = selection['accepted']
                     if accepted:

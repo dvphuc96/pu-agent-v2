@@ -63,6 +63,10 @@ class Memory:
 
     # ---- retrieval (gated — see retrieval_gate.py for why)
     def gated_retrieve(self, message: str, notify=None) -> str:
+        from pu.identity.contract import request_for_connection
+
+        # The gate calls the model. Admit the current owner before that call.
+        request_for_connection(self.conn, scopes=())
         retrieve, query, reason = retrieval_gate.should_retrieve(
             self.llm_provider, self.settings.small_model, message
         )

@@ -428,6 +428,18 @@ class InboxChatBriefing:
         return list(groups.values()), excluded
 
     def classify(self, candidates, notify):
+        from pu.agents.isolation import refuse_before_provider
+        from pu.identity.contract import request_for_connection
+
+        request_for_connection(self.app.conn, scopes=())
+        thread_ids = [
+            str(email["thread_id"])
+            for group in candidates
+            for email in (group.get("emails") or [])
+            if isinstance(email, dict) and email.get("thread_id")
+        ]
+        if thread_ids:
+            refuse_before_provider(self.app.conn, thread_ids=thread_ids)
         decisions = []
         # Negative decisions must cover every message, including later pages.
         paged = []

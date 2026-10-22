@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from evals.deterministic.test_report_quality_v2 import _materialize
+from evals.helpers import admitted_judge_contract
 from pu.core.interfaces.llm import LLMResponse, LLMUsage
 from pu.evaluation import DefaultEvaluationHarness, DeterministicReportEvaluator, LLMReportJudge
 from pu.reporting.models import ReportClaim
@@ -36,7 +37,7 @@ def test_every_v2_report_requires_semantic_review_before_final_release():
     preliminary = DeterministicReportEvaluator().evaluate(report)
     assert preliminary.release_allowed is True
     assert preliminary.status_details["semantic_review"] == "unavailable"
-    final = DefaultEvaluationHarness(deterministic=DeterministicReportEvaluator(), judge=None).evaluate(report)
+    final = DefaultEvaluationHarness(deterministic=DeterministicReportEvaluator(), judge=None).evaluate(report, contract=admitted_judge_contract())
     assert final.release_allowed is False
     assert final.status_details["semantic_review"] == "unavailable"
 
@@ -46,7 +47,7 @@ def test_low_valid_judge_is_failed_and_is_retryable_by_orchestrator():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(_materialize("good"))
+    ).evaluate(_materialize("good"), contract=admitted_judge_contract())
     assert result.release_allowed is False
     assert result.status_details["semantic_review"] == "failed"
     assert result.judge is not None and result.judge.score == 4
@@ -57,7 +58,7 @@ def test_high_judge_cannot_override_numeric_grounding_failure():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(_materialize("numeric_mismatch"))
+    ).evaluate(_materialize("numeric_mismatch"), contract=admitted_judge_contract())
     assert result.status_details["semantic_review"] == "passed"
     assert result.release_allowed is False
     assert result.metrics.unsupported_claims >= 1
@@ -68,7 +69,7 @@ def test_bad_or_incomplete_judge_is_distinct_from_a_low_score():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(_materialize("good"))
+    ).evaluate(_materialize("good"), contract=admitted_judge_contract())
     assert result.release_allowed is False
     assert result.status_details["semantic_review"] == "incomplete"
 
@@ -76,7 +77,7 @@ def test_bad_or_incomplete_judge_is_distinct_from_a_low_score():
     unavailable = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(broken, "offline"),
-    ).evaluate(_materialize("good"))
+    ).evaluate(_materialize("good"), contract=admitted_judge_contract())
     assert unavailable.release_allowed is False
     assert unavailable.status_details["semantic_review"] == "unavailable"
 
@@ -86,7 +87,7 @@ def test_passing_judge_is_the_only_v2_final_pass_and_sees_whole_prose():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(_materialize("good"))
+    ).evaluate(_materialize("good"), contract=admitted_judge_contract())
     assert result.release_allowed is True
     assert result.status_details["semantic_review"] == "passed"
     prompt = provider.requests[0].messages[0]["content"]
@@ -106,7 +107,7 @@ def test_explicit_claim_verdict_can_resolve_translation_floor_only():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(report)
+    ).evaluate(report, contract=admitted_judge_contract())
     assert result.status_details["semantic_review"] == "passed"
     assert result.metrics.source_coverage == 1.0
     assert result.release_allowed is True
@@ -125,7 +126,7 @@ def test_partial_claim_verdicts_cannot_release_one_of_six_unresolved():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(report)
+    ).evaluate(report, contract=admitted_judge_contract())
     assert result.status_details["semantic_review"] == "passed"
     assert result.metrics.source_coverage == round(5 / 6, 4)
     assert result.metrics.unsupported_claims == 1
@@ -140,7 +141,7 @@ def test_negative_claim_verdict_blocks_even_when_deterministic_floor_passes():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(_materialize("good"))
+    ).evaluate(_materialize("good"), contract=admitted_judge_contract())
     assert result.status_details["semantic_review"] == "passed"
     assert result.status_details["semantic_negative_claims"] == ["C2"]
     assert result.release_allowed is False
@@ -157,7 +158,7 @@ def test_field_verdict_recomputes_meeting_readiness():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(report)
+    ).evaluate(report, contract=admitted_judge_contract())
     assert result.status_details["semantic_review"] == "passed"
     assert result.metrics.meeting_readiness == 0.9  # Calendar paraphrase does not verify representative authority.
     assert result.release_allowed is True
@@ -168,6 +169,6 @@ def test_factual_support_keeps_seven_point_floor():
     result = DefaultEvaluationHarness(
         deterministic=DeterministicReportEvaluator(),
         judge=LLMReportJudge(provider, "offline"),
-    ).evaluate(_materialize("good"))
+    ).evaluate(_materialize("good"), contract=admitted_judge_contract())
     assert result.status_details["semantic_review"] == "failed"
     assert result.release_allowed is False

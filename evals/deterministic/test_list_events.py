@@ -72,17 +72,19 @@ def test_list_events_empty_names_calendars_checked(conn, home, monkeypatch):
 
 
 def test_list_events_graceful_failure_of_one_source(conn, home, monkeypatch):
-    """One source failing still returns the other source's events rather than an error."""
+    """A failed Google read stays visible when the local calendar still has events."""
     seed_local(conn, "Local Only", "2026-08-16T09:00", "2026-08-16T10:00")
-    
+
     monkeypatch.setattr("pu.tools.google_calendar.is_connected", lambda h: True)
-    monkeypatch.setattr("pu.tools.google_calendar.list_google_events", lambda h, s, e, l: "Google Calendar unavailable: credentials invalid.")
-    
+    monkeypatch.setattr(
+        "pu.tools.google_calendar.list_google_events",
+        lambda h, s, e, l: "Google Calendar unavailable: credentials invalid.",
+    )
+
     tool = make_list_tool(conn, home)
     result = tool.fn()
-    
-    # Should not include the google failure as a section
-    assert "Google Calendar unavailable" not in result 
+
+    assert "Google Calendar unavailable" in result
     assert "From pu's local calendar" in result
     assert "Local Only: 2026-08-16T09:00 → 2026-08-16T10:00" in result
 

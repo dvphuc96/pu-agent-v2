@@ -210,6 +210,11 @@ ALTER TABLE briefing_jobs ADD COLUMN next_attempt TEXT NOT NULL DEFAULT '';
         "reencrypt_legacy_oauth_tokens",
         "",
     ),
+    Migration(
+        9008,
+        "briefing_fingerprint_per_owner",
+        "",
+    ),
 )
 
 
@@ -246,6 +251,10 @@ class SQLiteMigrationRunner:
 
                 pin_legacy_oauth_tokens(self.conn)
                 migrate_legacy_oauth_tokens(self.conn)
+            elif migration.version == 9008:
+                from pu.persistence.ownership import scope_briefing_fingerprint
+
+                scope_briefing_fingerprint(self.conn)
             elif migration.sql:
                 self.conn.executescript(migration.sql)
             self.conn.execute(

@@ -58,6 +58,13 @@ def _token_path(home: Path) -> Path:
     return home / "google-token.json"
 
 
+def _readable_token(home: Path) -> Path | None:
+    """Token file for the current owner, never another user's copy."""
+    from pu.identity.files import private_file
+
+    return private_file(home, "google-token.json")
+
+
 def _load_credentials(home: Path, scopes: list[str]):
     """Cached token → refresh if stale → None. Never launches a browser: that
     only happens in connect(), so a chat turn can never block on a consent
@@ -68,8 +75,8 @@ def _load_credentials(home: Path, scopes: list[str]):
     except ImportError:
         return None
 
-    path = _token_path(home)
-    if not path.exists():
+    path = _readable_token(home)
+    if path is None:
         return None
     try:
         creds = Credentials.from_authorized_user_file(str(path), scopes=scopes)
@@ -128,9 +135,9 @@ def connect(home: Path) -> str:
     path = _token_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(creds.to_json(), encoding="utf-8")
-    from pu.identity.files import note_written
+    from pu.identity.files import claim_private_file
 
-    note_written(home, path)
+    claim_private_file(home, "google-token.json")
     return (
         f"Google Calendar connected (read-only via {client_source}). "
         f"Token cached at {path}."
@@ -187,7 +194,10 @@ def list_google_events(home: Path, start: str = "", end: str = "", limit: int = 
 
 
 def is_connected(home: Path) -> bool:
-    """True when a usable token exists. Cheap and side-effect free: callers use
-    this to decide whether to even mention Google, so it must never trigger a
-    browser or a network call."""
-    return _token_path(home).exists()
+    """True when this owner has a usable token.
+
+    Cheap and side-effect free: callers use this to decide whether to even
+    mention Google, so it must never trigger a browser or a network call.
+    Another user's token does not count.
+    """
+    return _readable_token(home) is not None

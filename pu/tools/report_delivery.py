@@ -114,6 +114,12 @@ def make_tools(home) -> list[Tool]:
 
     def checked(workspace_id, report_id, content_hash):
         repo = WorkspaceRepository(home)
+        with repo.database.connection() as conn:
+            from pu.agents.isolation import refuse_before_provider
+
+            refuse_before_provider(
+                conn, workspace_id=workspace_id, report_id=report_id
+            )
         stored = repo.require_report(workspace_id, report_id, content_hash)
         if not report_can_release(stored["payload"]):
             raise ValueError("Báo cáo chưa đạt quality gate; hãy bổ sung nguồn và nghiên cứu lại.")

@@ -132,6 +132,7 @@ def test_coincidental_copyright_year_cannot_override_a_negative_semantic_verdict
     import json
 
     from evals.deterministic.test_report_gate_regressions import FakeJudgeProvider, _judge_payload
+    from evals.helpers import admitted_judge_contract
     from pu.evaluation.report import DefaultEvaluationHarness, LLMReportJudge
 
     report=_compact()
@@ -139,7 +140,7 @@ def test_coincidental_copyright_year_cannot_override_a_negative_semantic_verdict
     report.claims.append(ReportClaim('COPYRIGHT','Công ty thành lập năm 2019.','company_context',('S2',)))
     payload=json.loads(_judge_payload(9))
     payload['claim_verdicts']=[{'id':'COPYRIGHT','supported':False,'reason':'Copyright không phải năm thành lập.'}]
-    evaluation=DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(json.dumps(payload)),'offline')).evaluate(report)
+    evaluation=DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(json.dumps(payload)),'offline')).evaluate(report, contract=admitted_judge_contract())
     assert not evaluation.release_allowed
     assert evaluation.metrics.unsupported_claims==1
     assert evaluation.metrics.status_details['claims']['COPYRIGHT']['support_reason']=='semantic_rejected'
@@ -166,13 +167,14 @@ def test_editorial_progress_is_measured_by_failed_criteria_not_finding_count():
     import json
 
     from evals.deterministic.test_report_gate_regressions import FakeJudgeProvider, _judge_payload
+    from evals.helpers import admitted_judge_contract
     from pu.evaluation.report import DefaultEvaluationHarness, LLMReportJudge
 
     report=_compact()
     def assess(nondup):
         payload=json.loads(_judge_payload(9))
         payload['criteria'].update(nondup=nondup,relevance=4)
-        return DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(json.dumps(payload)),'offline')).evaluate(report)
+        return DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(json.dumps(payload)),'offline')).evaluate(report, contract=admitted_judge_contract())
     before,after=assess(4),assess(8)
     selection=select_repair_candidate(report,before,deepcopy(report),after)
     assert selection['accepted'] and selection['outcome']=='improved_draft'

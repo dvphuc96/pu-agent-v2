@@ -87,6 +87,21 @@ class ScriptedProvider:
         return result
 
 
+def admitted_judge_contract():
+    """Synthetic owner for offline judge calls. Not a real user."""
+    from pu.identity.contract import AgentRequest
+    from pu.identity.principal import Principal, PrincipalKind
+
+    user_id = "11111111-1111-4111-8111-111111111111"
+    workspace_id = "22222222-2222-4222-8222-222222222222"
+    principal = Principal(PrincipalKind.USER, user_id, workspace_id)
+    return AgentRequest(
+        principal=principal,
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+    )
+
+
 def make_pu(home: Path, llm_provider=None, **settings_overrides):
     """Build a PU with an isolated home dir and optional provider-neutral fake."""
     from pu.config import Settings

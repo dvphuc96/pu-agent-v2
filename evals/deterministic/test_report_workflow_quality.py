@@ -138,7 +138,7 @@ class FixtureEvaluationHarness:
         self.unavailable = unavailable
         self.calls: list[StructuredReport] = []
 
-    def evaluate(self, report, *, run_judge=False):
+    def evaluate(self, report, *, run_judge=False, contract=None):
         self.calls.append(deepcopy(report))
         allowed = report.metadata.get("fixture_quality") == "good" and not self.unavailable
         return FakeEvaluation(report, allowed=allowed, evaluated=not self.unavailable)
