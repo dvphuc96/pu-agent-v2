@@ -172,7 +172,10 @@ def read_availability(
     end = datetime.combine((start + timedelta(days=days)).date(), time(), tzinfo=zone)
     database = SQLiteDatabase.from_home(home)
     with database.connection() as conn:
-        rows = conn.execute('SELECT id,title,start,"end",attendees FROM calendar_events').fetchall()
+        rows = conn.execute(
+            """SELECT id,title,start,"end",attendees FROM calendar_events
+               WHERE owner_user_id = pu_current_owner()"""
+        ).fetchall()
     events = [
         {
             "id": str(r["id"]),

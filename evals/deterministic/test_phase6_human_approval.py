@@ -64,7 +64,7 @@ def agent_context(registry, **metadata):
         actor="agent",
         principal="local-user",
         request_id="req-6",
-        workflow_id="wf-6",
+        workflow_id=None,
         agent_id="research-agent",
         tool_call_id="call-6",
         scopes=registry.scopes(),

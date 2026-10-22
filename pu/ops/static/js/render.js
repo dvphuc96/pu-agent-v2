@@ -289,7 +289,7 @@ async function sendChat(fromInput){
   }, 250);
   try {
     const res = await fetch("/api/chat/stream", {method:"POST",
-      headers:{"Content-Type":"application/json"}, body:JSON.stringify({message:text,request_id:active.requestId})});
+      headers:puMutateHeaders(), body:JSON.stringify({message:text,request_id:active.requestId})});
     if(res.ok===false)throw new Error(`HTTP ${res.status}`);
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = "";

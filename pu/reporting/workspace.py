@@ -317,9 +317,15 @@ class WorkspaceRepository:
         report = self.report(workspace_id, report_id)
         exports = ["md", "docx", "json"]
         if report:
+            from pu.identity.files import owner_for_home, owner_root
+
             rid = report["payload"]["report_id"]
+            owner = owner_for_home(self.home)
+            report_dir = (
+                owner_root(self.home, owner) / "reports" if owner else self.home / "reports"
+            )
             exports += [
-                ext for ext in ("html", "pdf") if (self.home / "reports" / f"{rid}.{ext}").is_file()
+                ext for ext in ("html", "pdf") if (report_dir / f"{rid}.{ext}").is_file()
             ]
         return {
             "workspace": workspace,
@@ -368,7 +374,7 @@ class WorkspaceRepository:
 
     def import_existing(self) -> None:
         """Expose existing report artifacts without requiring an LLM or rerunning research."""
-        from pu.identity.files import owner_for_home
+        from pu.identity.files import owner_for_home, owner_root
 
         owner = owner_for_home(self.home)
         with self.database.connection() as conn:
@@ -378,9 +384,10 @@ class WorkspaceRepository:
                     "SELECT report_id FROM workspace_reports WHERE owner_user_id = pu_current_owner()"
                 )
             }
-        for path in sorted(
-            (self.home / "reports").glob("report-*.json"), key=lambda p: p.stat().st_mtime
-        ):
+        report_dir = owner_root(self.home, owner) / "reports" if owner else self.home / "reports"
+        if not report_dir.is_dir():
+            return
+        for path in sorted(report_dir.glob("report-*.json"), key=lambda p: p.stat().st_mtime):
             if path.stem in known:
                 continue
             sidecar = path.with_name(path.name + ".owner")

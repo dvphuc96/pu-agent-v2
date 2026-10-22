@@ -384,11 +384,16 @@ def make_list_tool(conn: sqlite3.Connection, home: Path | None = None) -> Tool:
     local calendars. Google's API answers the same question in ~0.4s.
     """
     def local_events(start: str = "", end: str = "", limit: int = 20) -> str:
-        query = 'SELECT title, start, "end", attendees FROM calendar_events'
         columns = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)")}
-        clauses, params = [], []
+        table = "calendar_events"
         if "owner_user_id" in columns:
-            clauses.append("owner_user_id = pu_current_owner()")
+            query = (
+                'SELECT title, start, "end", attendees FROM calendar_events '
+                "WHERE owner_user_id = pu_current_owner()"
+            )
+        else:
+            query = f'SELECT title, start, "end", attendees FROM {table}'
+        clauses, params = [], []
         if start:
             clauses.append("start >= ?")
             params.append(start[:10])                 # inclusive from the start of that day
@@ -396,7 +401,7 @@ def make_list_tool(conn: sqlite3.Connection, home: Path | None = None) -> Tool:
             clauses.append("start <= ?")
             params.append(end[:10] + "T23:59")        # inclusive through the end of that day
         if clauses:
-            query += " WHERE " + " AND ".join(clauses)
+            query += (" AND " if "WHERE" in query else " WHERE ") + " AND ".join(clauses)
         query += " ORDER BY start LIMIT ?"
         params.append(max(1, min(int(limit or 20), 100)))
         rows = conn.execute(query, params).fetchall()

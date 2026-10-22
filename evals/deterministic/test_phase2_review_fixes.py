@@ -1,0 +1,624 @@
+"""Fixes from the independent review of PR #10.
+
+A and B are synthetic principals. The identity provider is an in-process fake.
+No real client secret or customer token is used.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import sqlite3
+import threading
+import time
+from datetime import UTC, datetime
+
+import pytest
+
+from pu.config import Settings
+from pu.db import connect
+from pu.identity.crypto import _encrypt_enc1, decrypt, encrypt, is_legacy_ciphertext
+from pu.identity.oidc import AuthError, OidcProvider, sign_hs256, verify_id_token
+from pu.identity.session import AuthStore
+from pu.persistence.ownership import install_owner_match_triggers
+
+TOKEN_KEY = "phase2-review-key-xxxx"
+ISSUER = "https://idp.test"
+CLIENT = "pu-test"
+SECRET = "test-client-secret-xx"
+
+
+def _claims(**overrides):
+    payload = {
+        "sub": "subject-a",
+        "iss": ISSUER,
+        "aud": CLIENT,
+        "exp": int(time.time()) + 600,
+        "nonce": "nonce-a",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _provider(**kwargs) -> OidcProvider:
+    values = {
+        "authorization_endpoint": "https://idp.test/authorize",
+        "token_endpoint": "https://idp.test/token",
+        "client_id": CLIENT,
+        "redirect_uri": "https://app.test/callback",
+        "client_secret": SECRET,
+        "issuer": ISSUER,
+    }
+    values.update(kwargs)
+    return OidcProvider(**values)
+
+
+def test_concurrent_connect_does_not_race_trigger_install(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    first = connect(home)
+    names = {
+        row[0]
+        for row in first.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%owner_match%'"
+        )
+    }
+    first.close()
+    assert "agent_events_owner_match_insert_v1" in names
+    assert "tool_audit_events_owner_match_update_v1" in names
+    assert "proposed_actions_owner_match_insert_v1" in names
+    assert "agent_events_owner_match_insert" not in names
+
+    errors: list[str] = []
+    barrier = threading.Barrier(6)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            conn = connect(home)
+            try:
+                install_owner_match_triggers(conn)
+                conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 9006").fetchone()
+            finally:
+                conn.close()
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+
+
+def test_episodes_update_refreshes_the_fts_index(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    conn = connect(home)
+    conn.execute(
+        "INSERT INTO episodes(happened_at, summary) VALUES('2026-10-21', 'alphafact')"
+    )
+    conn.commit()
+    episode_id = conn.execute("SELECT id FROM episodes").fetchone()[0]
+    conn.execute("UPDATE episodes SET summary = 'betafact' WHERE id = ?", (episode_id,))
+    conn.commit()
+    fresh = conn.execute(
+        "SELECT summary FROM episodes_fts WHERE episodes_fts MATCH 'betafact'"
+    ).fetchall()
+    stale = conn.execute(
+        "SELECT summary FROM episodes_fts WHERE episodes_fts MATCH 'alphafact'"
+    ).fetchall()
+    conn.close()
+    assert [row[0] for row in fresh] == ["betafact"]
+    assert list(stale) == []
+
+
+def test_dashboard_briefing_service_reads_through_the_harness(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "gmail-token.json").write_text("{}", encoding="utf-8")
+    settings = Settings(home=home)
+    settings.ensure_home()
+    connect(home).close()
+    called: list[str] = []
+
+    def sync(*_args, **_kwargs):
+        from pu.harness.gateway import harness_execute_active
+
+        assert harness_execute_active()
+        called.append("sync")
+        return "synced"
+
+    def read_availability(*_args, **_kwargs):
+        from pu.harness.gateway import harness_execute_active
+
+        assert harness_execute_active()
+        called.append("calendar")
+        return {
+            "status": "unknown",
+            "slots": [],
+            "events": [],
+            "checked_sources": [],
+            "warnings": [],
+            "timezone": "Asia/Ho_Chi_Minh",
+        }
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            base = datetime(2026, 10, 21, 8, 30, tzinfo=UTC)
+            return base if tz is None else base.astimezone(tz)
+
+    from pu.ops.briefing import BriefingService, briefing_service
+
+    monkeypatch.setattr("pu.tools.gmail.sync", sync)
+    monkeypatch.setattr("pu.reporting.availability.read_availability", read_availability)
+    monkeypatch.setattr("pu.ops.briefing.datetime", _Frozen)
+    monkeypatch.setattr(BriefingService, "model_configured", lambda self: True)
+    monkeypatch.setattr("pu.config.load_settings", lambda: settings)
+    monkeypatch.setattr("pu.ops.dashboard.load_settings", lambda: settings)
+
+    from pu.ops.dashboard import load_settings
+
+    worker = briefing_service(load_settings().home, start=True)
+    try:
+        assert worker.app_factory is None
+        worker.cycle()
+    finally:
+        worker.close()
+        if worker.thread is not None:
+            worker.thread.join(timeout=5)
+    assert worker.thread is not None and not worker.thread.is_alive()
+    assert "sync" in called
+    assert "calendar" in called
+
+
+def test_id_token_checks_iss_aud_exp_nonce_and_rs256():
+    provider = _provider()
+    now = time.time()
+    good = verify_id_token(
+        sign_hs256(_claims(), SECRET), provider, nonce="nonce-a", now=now
+    )
+    assert good["sub"] == "subject-a"
+    listed = verify_id_token(
+        sign_hs256(_claims(aud=["other", CLIENT], azp=CLIENT), SECRET),
+        provider,
+        nonce="nonce-a",
+        now=now,
+    )
+    assert listed["aud"] == ["other", CLIENT]
+    single = verify_id_token(
+        sign_hs256(_claims(aud=[CLIENT]), SECRET),
+        provider,
+        nonce="nonce-a",
+        now=now,
+    )
+    assert single["aud"] == [CLIENT]
+    matched = verify_id_token(
+        sign_hs256(_claims(azp=CLIENT), SECRET),
+        provider,
+        nonce="nonce-a",
+        now=now,
+    )
+    assert matched["azp"] == CLIENT
+    listed_one = verify_id_token(
+        sign_hs256(_claims(aud=[CLIENT], azp=CLIENT), SECRET),
+        provider,
+        nonce="nonce-a",
+        now=now,
+    )
+    assert listed_one["azp"] == CLIENT
+    with pytest.raises(AuthError) as string_azp:
+        verify_id_token(
+            sign_hs256(_claims(azp="other-client"), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert string_azp.value.code == "azp"
+    with pytest.raises(AuthError) as single_azp:
+        verify_id_token(
+            sign_hs256(_claims(aud=[CLIENT], azp="other-client"), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert single_azp.value.code == "azp"
+    with pytest.raises(AuthError) as missing_azp:
+        verify_id_token(
+            sign_hs256(_claims(aud=["other", CLIENT]), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert missing_azp.value.code == "azp"
+    with pytest.raises(AuthError) as wrong_azp:
+        verify_id_token(
+            sign_hs256(_claims(aud=["other", CLIENT], azp="other"), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert wrong_azp.value.code == "azp"
+    with pytest.raises(AuthError) as iss:
+        verify_id_token(
+            sign_hs256(_claims(iss="https://evil.test"), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert iss.value.code == "iss"
+    with pytest.raises(AuthError) as aud:
+        verify_id_token(
+            sign_hs256(_claims(aud="other-client"), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert aud.value.code == "aud"
+    with pytest.raises(AuthError) as expired:
+        verify_id_token(
+            sign_hs256(_claims(exp=int(now) - 120), SECRET),
+            provider,
+            nonce="nonce-a",
+            now=now,
+        )
+    assert expired.value.code == "exp"
+    with pytest.raises(AuthError) as nonce:
+        verify_id_token(sign_hs256(_claims(), SECRET), provider, nonce="other", now=now)
+    assert nonce.value.code == "nonce"
+    header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps(_claims()).encode()).decode().rstrip("=")
+    with pytest.raises(AuthError) as none_alg:
+        verify_id_token(f"{header}.{body}.", provider, nonce="nonce-a", now=now)
+    assert none_alg.value.code == "id_token"
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    numbers = key.public_key().public_numbers()
+
+    def b64_int(value: int) -> str:
+        length = max((value.bit_length() + 7) // 8, 1)
+        return base64.urlsafe_b64encode(value.to_bytes(length, "big")).decode().rstrip("=")
+
+    jwks = {
+        "keys": [
+            {
+                "kty": "RSA",
+                "alg": "RS256",
+                "use": "sig",
+                "kid": "k1",
+                "n": b64_int(numbers.n),
+                "e": b64_int(numbers.e),
+            }
+        ]
+    }
+    rsa_provider = _provider(jwks=jwks, client_secret="")
+    rsa_header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "typ": "JWT", "kid": "k1"}).encode()
+    ).decode().rstrip("=")
+    rsa_body = base64.urlsafe_b64encode(json.dumps(_claims()).encode()).decode().rstrip("=")
+    signing = f"{rsa_header}.{rsa_body}".encode()
+    signature = key.sign(signing, padding.PKCS1v15(), hashes.SHA256())
+    rsa_sig = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+    token = f"{rsa_header}.{rsa_body}.{rsa_sig}"
+    assert verify_id_token(token, rsa_provider, nonce="nonce-a", now=now)["sub"] == "subject-a"
+    tampered = token[:-2] + ("A" if token[-1] != "A" else "B")
+    with pytest.raises(AuthError) as bad_sig:
+        verify_id_token(tampered, rsa_provider, nonce="nonce-a", now=now)
+    assert bad_sig.value.code == "id_token"
+
+
+def test_enc2_binds_aad_and_migrates_enc1(tmp_path, monkeypatch):
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    blob = encrypt(b"secret-token", owner_user_id="owner-a", connection_id="conn-a")
+    assert not is_legacy_ciphertext(blob)
+    assert decrypt(blob, owner_user_id="owner-a", connection_id="conn-a") == b"secret-token"
+    with pytest.raises(ValueError, match="ciphertext"):
+        decrypt(blob, owner_user_id="owner-a", connection_id="conn-b")
+    assert b"secret-token" not in base64.urlsafe_b64decode(blob.encode())
+
+    home = tmp_path / "home"
+    owner = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    connection_id = "legacy-conn"
+    legacy = _encrypt_enc1(json.dumps({"access_token": "legacy-token"}).encode())
+    _seed_legacy_connections(home, [(connection_id, owner, legacy)])
+    connect(home).close()
+    store = AuthStore(home)
+    seen: list[str] = []
+    assert (
+        store.use_oauth_connection(
+            connection_id,
+            owner_user_id=owner,
+            provider_call=lambda token: seen.append(token["access_token"]) or token["access_token"],
+        )
+        == "legacy-token"
+    )
+    assert seen == ["legacy-token"]
+    row = sqlite3.connect(home / "state.db").execute(
+        "SELECT token_ciphertext, legacy_digest FROM oauth_connections WHERE id=?",
+        (connection_id,),
+    ).fetchone()
+    assert not is_legacy_ciphertext(row[0])
+    assert row[1] == _digest(legacy)
+    assert (
+        decrypt(row[0], owner_user_id=owner, connection_id=connection_id).decode().find("legacy-token")
+        >= 0
+    )
+
+
+def test_reveal_not_found_and_sqlite_schema_stay_hidden(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    connect(home).close()
+    settings = Settings(home=home)
+    settings.ensure_home()
+    monkeypatch.setattr("pu.ops.dashboard.load_settings", lambda: settings)
+    monkeypatch.setattr("pu.config.load_settings", lambda: settings)
+    from pu.ops.dashboard import reveal_path, run_query
+
+    missing = reveal_path("notes/missing.txt")
+    assert missing == {"error": "not found"}
+    assert str(home) not in json.dumps(missing)
+    blocked = run_query({"sql": "SELECT name FROM sqlite_schema"})
+    assert blocked.get("rows") in (None, [])
+    assert "error" in blocked
+    assert "sqlite_schema" not in json.dumps(blocked.get("rows"))
+
+
+def test_search_without_an_app_runs_inside_the_harness(tmp_path, monkeypatch):
+    from pu.reporting.collection import CollectionConfig, collect_partner_sources
+    from pu.reporting.workspace import WorkspaceRepository
+
+    seen: list[bool] = []
+
+    def search_results(_query, _max_results):
+        from pu.harness.gateway import harness_execute_active
+
+        seen.append(harness_execute_active())
+        return [
+            {
+                "title": "Acme",
+                "content": "Acme manufactures industrial widgets for business buyers.",
+                "url": "https://acme.example/about",
+                "source_type": "web",
+                "metadata": {},
+            }
+        ]
+
+    monkeypatch.setattr("pu.reporting.collection.search_results", search_results)
+    monkeypatch.setattr(
+        "pu.reporting.collection.fetch_source",
+        lambda url: {
+            "title": "Acme",
+            "url": url,
+            "content": "Acme manufactures industrial widgets for business buyers.",
+            "source_type": "web",
+            "metadata": {"links": []},
+        },
+    )
+    repo = WorkspaceRepository(tmp_path / "home")
+    workspace = repo.create("Acme", "https://acme.example")
+    collect_partner_sources(
+        repo,
+        workspace["id"],
+        config=CollectionConfig(
+            max_search_queries=1,
+            max_detail_pages=0,
+            max_read_attempts=6,
+            max_web_pages=4,
+            max_duration_seconds=5,
+        ),
+    )
+    assert seen
+    assert all(seen)
+
+
+def _digest(ciphertext: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(ciphertext.encode("ascii")).hexdigest()
+
+
+def _seed_legacy_connections(home, rows: list[tuple[str, str, str]]) -> None:
+    """Insert enc1 rows before migration 9007 records the closed set."""
+    home.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS oauth_connections (
+                   id TEXT PRIMARY KEY,
+                   owner_user_id TEXT NOT NULL,
+                   provider TEXT NOT NULL,
+                   token_ciphertext TEXT NOT NULL,
+                   revoked_at TEXT
+               )"""
+        )
+        conn.executemany(
+            """INSERT INTO oauth_connections(id, owner_user_id, provider, token_ciphertext)
+               VALUES(?, ?, 'gmail', ?)""",
+            rows,
+        )
+
+
+def _oauth_row(home, connection_id: str):
+    return sqlite3.connect(home / "state.db").execute(
+        """SELECT token_ciphertext, legacy_digest, migration_pending
+           FROM oauth_connections WHERE id = ?""",
+        (connection_id,),
+    ).fetchone()
+
+
+def test_enc1_rows_migrate_on_open_and_a_swap_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    home = tmp_path / "home"
+    owner_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    owner_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    blob_a = _encrypt_enc1(json.dumps({"access_token": "token-a"}).encode())
+    blob_b = _encrypt_enc1(json.dumps({"access_token": "token-b"}).encode())
+    _seed_legacy_connections(home, [("conn-a", owner_a, blob_a), ("conn-b", owner_b, blob_b)])
+    connect(home).close()
+    stored = dict(
+        sqlite3.connect(home / "state.db").execute(
+            "SELECT id, token_ciphertext FROM oauth_connections"
+        )
+    )
+    assert not is_legacy_ciphertext(stored["conn-a"])
+    assert not is_legacy_ciphertext(stored["conn-b"])
+    pinned = _oauth_row(home, "conn-a")
+    assert pinned[1] == _digest(blob_a)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            "UPDATE oauth_connections SET token_ciphertext = ? WHERE id = 'conn-a'",
+            (stored["conn-b"],),
+        )
+    store = AuthStore(home)
+    calls: list[str] = []
+    assert (
+        store.use_oauth_connection(
+            "conn-a",
+            owner_user_id=owner_a,
+            provider_call=lambda token: calls.append(token["access_token"]) or token["access_token"],
+        )
+        is None
+    )
+    assert calls == []
+    assert _oauth_row(home, "conn-a")[1] == _digest(blob_a)
+
+
+def test_enc1_without_a_key_is_pinned_and_not_adopted_after_a_swap(tmp_path, monkeypatch):
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    home = tmp_path / "home"
+    owner = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    blob_a = _encrypt_enc1(json.dumps({"access_token": "token-a"}).encode())
+    blob_b = _encrypt_enc1(json.dumps({"access_token": "token-b"}).encode())
+    _seed_legacy_connections(home, [("conn-a", owner, blob_a), ("conn-b", other, blob_b)])
+    monkeypatch.delenv("PU_TOKEN_KEY")
+    connect(home).close()
+    pinned = _oauth_row(home, "conn-a")
+    assert pinned[1] == _digest(blob_a)
+    assert pinned[2] == 1
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            "UPDATE oauth_connections SET token_ciphertext = ? WHERE id = 'conn-a'",
+            (blob_b,),
+        )
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    connect(home).close()
+    store = AuthStore(home)
+    calls: list[str] = []
+    assert (
+        store.use_oauth_connection(
+            "conn-a",
+            owner_user_id=owner,
+            provider_call=lambda token: calls.append(token["access_token"]) or token["access_token"],
+        )
+        is None
+    )
+    assert calls == []
+    leftover = _oauth_row(home, "conn-a")
+    assert leftover[0] == blob_b
+    assert is_legacy_ciphertext(leftover[0])
+    assert leftover[1] == _digest(blob_a)
+    assert leftover[2] == 1
+
+
+def test_intermediate_non_enc1_cannot_reopen_the_enc1_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    home = tmp_path / "home"
+    owner_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    owner_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    blob_a = _encrypt_enc1(json.dumps({"access_token": "token-a"}).encode())
+    blob_b = _encrypt_enc1(json.dumps({"access_token": "token-b"}).encode())
+    _seed_legacy_connections(home, [("conn-a", owner_a, blob_a), ("conn-b", owner_b, blob_b)])
+    monkeypatch.delenv("PU_TOKEN_KEY")
+    connect(home).close()
+    original = _digest(blob_a)
+    assert _oauth_row(home, "conn-a")[1] == original
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            "UPDATE oauth_connections SET token_ciphertext = ? WHERE id = 'conn-a'",
+            ("not-a-ciphertext",),
+        )
+    connect(home).close()
+    after_intermediate = _oauth_row(home, "conn-a")
+    assert after_intermediate[0] == "not-a-ciphertext"
+    assert after_intermediate[1] == original
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            "UPDATE oauth_connections SET token_ciphertext = ? WHERE id = 'conn-a'",
+            (blob_b,),
+        )
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    connect(home).close()
+    store = AuthStore(home)
+    calls: list[str] = []
+    assert (
+        store.use_oauth_connection(
+            "conn-a",
+            owner_user_id=owner_a,
+            provider_call=lambda token: calls.append(token["access_token"]) or token["access_token"],
+        )
+        is None
+    )
+    assert calls == []
+    rebound = _oauth_row(home, "conn-a")
+    assert rebound[0] == blob_b
+    assert is_legacy_ciphertext(rebound[0])
+    assert rebound[1] == original
+    assert rebound[2] == 1
+
+
+def test_enc1_inserted_after_9007_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("PU_TOKEN_KEY", TOKEN_KEY)
+    home = tmp_path / "home"
+    home.mkdir()
+    connect(home).close()
+    owner = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    blob = _encrypt_enc1(json.dumps({"access_token": "late-token"}).encode())
+    store = AuthStore(home)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            """INSERT INTO oauth_connections(id, owner_user_id, provider, token_ciphertext)
+               VALUES('late', ?, 'gmail', ?)""",
+            (owner, blob),
+        )
+    connect(home).close()
+    calls: list[str] = []
+    assert (
+        store.use_oauth_connection(
+            "late",
+            owner_user_id=owner,
+            provider_call=lambda token: calls.append(token["access_token"]) or token["access_token"],
+        )
+        is None
+    )
+    assert calls == []
+    row = _oauth_row(home, "late")
+    assert row[0] == blob
+    assert row[1] == ""
+    assert row[2] == 1
+
+
+def test_no_cookie_request_rejects_a_rebound_host():
+    import io
+
+    from pu.ops.dashboard import Handler
+
+    handler = object.__new__(Handler)
+    body = b"{}"
+    handler.path = "/api/chat/stop"
+    handler.headers = {"Host": "rebind.example", "Content-Length": "2"}
+    handler.rfile = io.BytesIO(body)
+    handler.wfile = io.BytesIO()
+    statuses: list[int] = []
+    handler.send_response = statuses.append
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
+    handler.do_POST()
+    assert statuses == [403]
+    assert json.loads(handler.wfile.getvalue())["error"] == "loopback_host"

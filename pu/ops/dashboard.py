@@ -274,7 +274,10 @@ def collect() -> dict:
         return {
             "source": "sqlite",
             "error": "",
-            "items": rows("SELECT id, happened_at, summary FROM episodes ORDER BY happened_at DESC"),
+            "items": rows(
+                """SELECT id, happened_at, summary FROM episodes
+                   WHERE owner_user_id = pu_current_owner() ORDER BY happened_at DESC"""
+            ),
         }
 
     episodes_data = episodes_payload()
@@ -387,14 +390,29 @@ def collect() -> dict:
         info = conn.execute(f"PRAGMA table_info({name})").fetchall()
         cols = [r["name"] for r in info]
         types = {r["name"]: r["type"] for r in info}
-        count = conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+        owned = " WHERE owner_user_id = pu_current_owner()" if "owner_user_id" in cols else ""
+        count = conn.execute(f"SELECT COUNT(*) FROM {name}{owned}").fetchone()[0]
         # up to 200 newest rows so each table has its own scrollable tab
-        sample = [dict(r) for r in conn.execute(f"SELECT * FROM {name} ORDER BY rowid DESC LIMIT 200").fetchall()]
+        sample = [dict(r) for r in conn.execute(
+            f"SELECT * FROM {name}{owned} ORDER BY rowid DESC LIMIT 200"
+        ).fetchall()]
         return {"name": name, "columns": cols, "types": types, "count": count, "sample": sample}
 
     db_path = home / "state.db"
-    all_tables = [r["name"] for r in
-                  conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()]
+    hidden_tables = {
+        "auth_sessions",
+        "oauth_connections",
+        "oidc_transactions",
+        "oidc_subjects",
+        "users",
+        "identity_local",
+        "schema_migrations",
+    }
+    all_tables = [
+        r["name"]
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        if r["name"] not in hidden_tables and not str(r["name"]).endswith("__pre_owner")
+    ]
     db_info = {
         "path": str(db_path.resolve()),
         "size": db_path.stat().st_size if db_path.exists() else 0,
@@ -452,26 +470,43 @@ def collect() -> dict:
                        for e in events[-200:]][::-1],
         "trace_file": (trace_files[-1].name if trace_files else None),
         "trace_errors": trace_errors,
-        "facts": rows("SELECT id, subject, content, source, created_at FROM facts ORDER BY id DESC"),
+        "facts": rows(
+            """SELECT id, subject, content, source, created_at FROM facts
+               WHERE owner_user_id = pu_current_owner() ORDER BY id DESC"""
+        ),
         "episodes": episodes_data["items"],
         "episodes_source": episodes_data["source"],
         "episodes_error": episodes_data["error"],
         "soul": (home / "SOUL.md").read_text(encoding="utf-8") if (home / "SOUL.md").exists() else "",
-        "chat_pending": conn.execute("SELECT COUNT(*) FROM chat_log WHERE consolidated=0").fetchone()[0],
-        "chat_log": rows("SELECT role, content, consolidated, source, session_id, created_at FROM chat_log ORDER BY id DESC LIMIT 80")[::-1],
+        "chat_pending": conn.execute(
+            "SELECT COUNT(*) FROM chat_log WHERE consolidated=0 AND owner_user_id = pu_current_owner()"
+        ).fetchone()[0],
+        "chat_log": rows(
+            """SELECT role, content, consolidated, source, session_id, created_at FROM chat_log
+               WHERE owner_user_id = pu_current_owner() ORDER BY id DESC LIMIT 80"""
+        )[::-1],
         "sessions": session_list(conn),
         "current_session": (live.session.session_id if live is not None else dash_session()),
         "consolidate_every": settings.consolidate_every,
-        "calendar": rows('SELECT title, start, "end", attendees, created_at FROM calendar_events ORDER BY start'),
+        "calendar": rows(
+            """SELECT title, start, "end", attendees, created_at FROM calendar_events
+               WHERE owner_user_id = pu_current_owner() ORDER BY start"""
+        ),
         # CRM inbox: what has been pulled so far (gmail.py syncs on demand, so
         # this is the local store, never a live Gmail call on page load).
-        "crm": rows("SELECT gmail_id, sender_name, sender_email, subject, snippet, "
-                    "internal_date, unread FROM crm_emails ORDER BY internal_date DESC LIMIT 100"),
+        "crm": rows(
+            """SELECT gmail_id, sender_name, sender_email, subject, snippet,
+                      internal_date, unread FROM crm_emails
+               WHERE owner_user_id = pu_current_owner()
+               ORDER BY internal_date DESC LIMIT 100"""
+        ),
         "gmail_enabled": settings.gmail,
         "gmail_connected": (home / "gmail-token.json").exists(),
         "knowledge_sources": [dict(r) for r in conn.execute(
             """SELECT id, title, "group", origin, path, enabled, chars, added_at
-               FROM knowledge_sources ORDER BY "group", title""")],
+               FROM knowledge_sources
+               WHERE owner_user_id = pu_current_owner()
+               ORDER BY "group", title""")],
         "drive_connected": (home / "drive-token.json").exists(),
         "outbox": outbox,
         "skills": skills,
@@ -514,20 +549,26 @@ def session_list(conn) -> list[dict]:
     session_id label on chat_log rows — the same table, no new storage."""
     groups = conn.execute(
         """SELECT session_id, COUNT(*) AS messages, MAX(created_at) AS last_at
-           FROM chat_log GROUP BY session_id ORDER BY last_at DESC"""
+           FROM chat_log WHERE owner_user_id = pu_current_owner()
+           GROUP BY session_id ORDER BY last_at DESC"""
     ).fetchall()
     out = []
     for g in groups:
         sid = g["session_id"]
         first = conn.execute(
-            "SELECT content FROM chat_log WHERE session_id=? AND role='user' ORDER BY id LIMIT 1",
+            """SELECT content FROM chat_log
+               WHERE session_id=? AND role='user' AND owner_user_id = pu_current_owner()
+               ORDER BY id LIMIT 1""",
             (sid,),
         ).fetchone()
         last = conn.execute(
-            "SELECT role, content FROM chat_log WHERE session_id=? ORDER BY id DESC LIMIT 1", (sid,)
+            """SELECT role, content FROM chat_log
+               WHERE session_id=? AND owner_user_id = pu_current_owner()
+               ORDER BY id DESC LIMIT 1""", (sid,)
         ).fetchone()
         sources = [r["source"] for r in conn.execute(
-            "SELECT DISTINCT source FROM chat_log WHERE session_id=?", (sid,)).fetchall()]
+            """SELECT DISTINCT source FROM chat_log
+               WHERE session_id=? AND owner_user_id = pu_current_owner()""", (sid,)).fetchall()]
         preview = ""
         if last:
             preview = ("you: " if last["role"] == "user" else "pu: ") + last["content"][:80]
@@ -812,7 +853,16 @@ def gmail_sync_action(payload: dict) -> dict:
 
     Sync is always on demand (a click here or a tool call), so this endpoint
     IS the dashboard's trigger. The button must never 500 the page: sync()
-    already reports every failure as a sentence."""
+    already reports every failure as a sentence. The pull goes through the
+    tool harness with a WORKER principal for the job owner.
+    """
+    from pu.harness.gateway import (
+        BoundaryHarness,
+        execute_worker_read,
+        external_harness,
+        job_owner,
+        worker_context,
+    )
     from pu.tools import gmail
 
     settings = load_settings()
@@ -822,9 +872,34 @@ def gmail_sync_action(payload: dict) -> dict:
         max_messages = int(payload.get("max_messages") or settings.gmail_max_messages)
     except (TypeError, ValueError):
         max_messages = settings.gmail_max_messages
+    harness = external_harness(None)
+    owner, workspace_id = job_owner(home)
+    if harness is not None:
+        result = execute_worker_read(
+            harness,
+            "read_gmail_today",
+            {"days": 7, "max_results": 20},
+            owner_user_id=owner,
+            workspace_id=workspace_id,
+            job_id="gmail-sync",
+            scopes=("email:read",),
+            home=home,
+        )
+        text = result.output if result.ok else (result.error or result.output)
+        return {"message": text}
     conn = connect(home)
     try:
-        return {"message": gmail.sync(conn, home, label=label, max_messages=max_messages)}
+        context = worker_context(
+            owner_user_id=owner,
+            workspace_id=workspace_id,
+            job_id="gmail-sync",
+            scopes=("email:read",),
+            tool_name="read_gmail_today",
+        )
+        result = BoundaryHarness(
+            lambda: gmail.sync(conn, home, label=label, max_messages=max_messages)
+        ).execute("read_gmail_today", {}, context)
+        return {"message": result.output}
     finally:
         conn.close()
 
@@ -910,9 +985,14 @@ def drive_action(payload: dict) -> dict:
 
 
 def run_query(payload: dict) -> dict:
-    """A tiny read-only SQL console.
-    Opens state.db in read-only mode so a write can't slip through, and only
-    accepts a single SELECT/WITH statement. Caps at 200 rows."""
+    """A tiny read-only SQL console scoped to the current owner.
+
+    Owned tables are copied into a private connection with only this owner's
+    rows. The shared database file is detached before the query runs.
+    """
+    import re
+    import sqlite3
+
     sql = (payload.get("sql") or "").strip().rstrip(";").strip()
     if not sql:
         return {"error": "Type a SELECT query."}
@@ -921,22 +1001,60 @@ def run_query(payload: dict) -> dict:
         return {"error": "Only SELECT (or WITH … SELECT) queries are allowed."}
     if ";" in sql:
         return {"error": "One statement at a time (no semicolons)."}
-    import sqlite3
-
+    if re.search(r"\b(raw|sqlite_master|sqlite_schema|pragma)\b", low):
+        return {"error": "That schema is not available in the SQL console."}
     settings = load_settings()
     settings.ensure_home()
-    db = (settings.home / "state.db").resolve()
+    from pu.db import connect
+    from pu.identity.scope import current_owner_user_id
+
+    opener = connect(settings.home)
     try:
-        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        c.row_factory = sqlite3.Row
-        cur = c.execute(sql)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        data = [[str(r[i]) if r[i] is not None else "" for i in range(len(cols))]
-                for r in cur.fetchmany(200)]
-        c.close()
+        owner = current_owner_user_id(opener)
+    finally:
+        opener.close()
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", owner or ""):
+        return {"error": "No owner is available for this query."}
+    from pu.persistence.ownership import OWNED_TABLES
+
+    db = (settings.home / "state.db").resolve()
+    memory = sqlite3.connect(":memory:")
+    try:
+        memory.execute("ATTACH DATABASE ? AS raw", (f"file:{db}?mode=ro",))
+        tables = memory.execute(
+            "SELECT name FROM raw.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for (name,) in tables:
+            if name not in OWNED_TABLES or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                continue
+            try:
+                columns = [
+                    row[1] for row in memory.execute(f"PRAGMA raw.table_info({name})").fetchall()
+                ]
+                # A view in this connection cannot point at the attached file.
+                # Copy only this owner's rows, then detach so the shared file is gone.
+                if "owner_user_id" not in columns:
+                    continue
+                memory.execute(
+                    f'CREATE TABLE "{name}" AS SELECT * FROM raw."{name}" '
+                    "WHERE owner_user_id = ?",
+                    (owner,),
+                )
+            except sqlite3.Error:
+                continue
+        memory.execute("DETACH DATABASE raw")
+        memory.row_factory = sqlite3.Row
+        cursor = memory.execute(sql)
+        cols = [item[0] for item in cursor.description] if cursor.description else []
+        data = [
+            [str(row[index]) if row[index] is not None else "" for index in range(len(cols))]
+            for row in cursor.fetchmany(200)
+        ]
         return {"columns": cols, "rows": data}
     except sqlite3.Error as exc:
         return {"error": str(exc)}
+    finally:
+        memory.close()
 
 
 _whisper = None
@@ -951,11 +1069,13 @@ def _thread_history(conn, sid: str) -> list[dict]:
     drift apart (they used to: 'switch' dropped meta and showed only text)."""
     if sid == "__all__":
         rows = conn.execute(
-            "SELECT role, content, meta FROM chat_log ORDER BY id DESC LIMIT 200"
+            """SELECT role, content, meta FROM chat_log
+               WHERE owner_user_id = pu_current_owner() ORDER BY id DESC LIMIT 200"""
         ).fetchall()[::-1]
     else:
         rows = conn.execute(
-            "SELECT role, content, meta FROM chat_log WHERE session_id=? ORDER BY id",
+            """SELECT role, content, meta FROM chat_log
+               WHERE session_id=? AND owner_user_id = pu_current_owner() ORDER BY id""",
             (sid,),
         ).fetchall()
     # History written before usage metadata existed can still recover its token
@@ -1041,28 +1161,67 @@ def _editor_cmd() -> list[str] | None:
     return None
 
 
+def _names_other_owner(raw: str, owner: str) -> bool:
+    """True when a relative path walks through ``owners/<other-uuid>``."""
+    import re
+
+    parts = [part for part in raw.split("/") if part and part != "."]
+    for index, part in enumerate(parts):
+        if part != "owners" or index + 1 >= len(parts):
+            continue
+        named = parts[index + 1]
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", named) and named != owner:
+            return True
+    return False
+
+
+def _resolved_other_owner(target, home, owner: str) -> bool:
+    owners_root = (home / "owners").resolve()
+    if target != owners_root and owners_root not in target.parents:
+        return False
+    if target == owners_root:
+        return False
+    named = target.relative_to(owners_root).parts[0]
+    return named != owner
+
+
 def reveal_path(rel: str) -> dict:
-    """Open a file/folder under PU_HOME — in the user's code editor if one
-    is on PATH (cursor/code/$PU_EDITOR), otherwise reveal in Finder.
-    Restricted to paths inside PU_HOME."""
+    """Open a file under the current owner's root.
+
+    The shared home, ``state.db``, and another user's ``owners/<id>`` tree
+    are not reachable from this endpoint.
+    """
     import subprocess
     import sys
 
     settings = load_settings()
     settings.ensure_home()
     home = settings.home.resolve()
-    target = (home / (rel or ".")).resolve()
-    if target != home and home not in target.parents:
-        return {"error": "path is outside the .pu home"}
+    from pu.identity.files import owner_for_home
+
+    owner = owner_for_home(home)
+    if not owner:
+        return {"error": "no principal"}
+    raw = (rel or ".").replace("\\", "/").lstrip("/")
+    if _names_other_owner(raw, owner):
+        return {"error": "path belongs to another owner"}
+    root = (home / "owners" / owner).resolve()
+    target = (root / raw).resolve()
+    if _resolved_other_owner(target, home, owner):
+        return {"error": "path belongs to another owner"}
+    if raw == ".." or raw.startswith("../") or "/../" in f"/{raw}/":
+        return {"error": "path is outside the owner home"}
+    if target != root and root not in target.parents:
+        return {"error": "path is outside the owner home"}
     if not target.exists():
-        return {"error": f"not found: {target}"}
+        return {"error": "not found"}
 
     editor = _editor_cmd()
     if editor and target.is_file() and target.suffix != ".db":  # editors choke on sqlite
         subprocess.run([*editor, str(target)], check=False)
         return {"ok": True, "opened_in": editor[0], "path": str(target)}
     if sys.platform != "darwin":
-        return {"error": f"no editor found and reveal is macOS-only — the path is {target}"}
+        return {"error": "no editor found and reveal is macOS-only"}
     subprocess.run(
         ["open", "-R", str(target)] if target.is_file() else ["open", str(target)],
         check=False,
@@ -1151,6 +1310,58 @@ def events_since(cursor):
     return {"events": out, "cursor": len(lines)}
 
 
+def _oidc_provider_from_env():
+    """OIDC client from the environment. Login stays off until every endpoint is set."""
+    import urllib.parse
+    import urllib.request
+
+    from pu.identity.oidc import OidcProvider
+
+    authorization = os.environ.get("PU_OIDC_AUTHORIZATION_ENDPOINT", "").strip()
+    token_endpoint = os.environ.get("PU_OIDC_TOKEN_ENDPOINT", "").strip()
+    client_id = os.environ.get("PU_OIDC_CLIENT_ID", "").strip()
+    redirect_uri = os.environ.get("PU_OIDC_REDIRECT_URI", "").strip()
+    issuer = os.environ.get("PU_OIDC_ISSUER", "").strip()
+    jwks_uri = os.environ.get("PU_OIDC_JWKS_URI", "").strip()
+    if not (authorization and token_endpoint and client_id and redirect_uri and issuer):
+        return None
+    secret = os.environ.get("PU_OIDC_CLIENT_SECRET", "")
+
+    def http_post(url: str, form: dict) -> dict:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("oidc token response")
+        return payload
+
+    def http_get(url: str) -> dict:
+        request = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("oidc jwks response")
+        return payload
+
+    return OidcProvider(
+        authorization_endpoint=authorization,
+        token_endpoint=token_endpoint,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        client_secret=secret,
+        issuer=issuer,
+        jwks_uri=jwks_uri,
+        http_post=http_post,
+        http_get=http_get,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, body: bytes, ctype: str, *, no_cache: bool = False) -> None:
         self.send_response(200)
@@ -1164,6 +1375,86 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        from pu.identity.session import attached_decision, evaluate_on_home
+
+        decision = evaluate_on_home(self.headers, mutate=False)
+        if decision.rejected:
+            self._reject(401 if decision.reason == "session_revoked" else 403, decision.reason)
+            return
+        with attached_decision(decision):
+            if self.path.startswith("/api/auth/"):
+                self._auth_get()
+                return
+            self._get_routes()
+
+    def _reject(self, status: int, reason: str) -> None:
+        body = json.dumps({"error": reason}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth_get(self) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        from pu.config import load_settings
+        from pu.identity.session import SESSION_COOKIE, AuthStore, cookie_value
+
+        settings = load_settings()
+        home = settings.ensure_home()
+        store = AuthStore(home)
+        path = self.path.split("?", 1)[0]
+        if path == "/api/auth/csrf":
+            token = store.csrf_token(cookie_value(self.headers, SESSION_COOKIE))
+            if not token:
+                self._reject(401, "session_revoked")
+                return
+            self._send(json.dumps({"csrf_token": token}).encode(), "application/json", no_cache=True)
+            return
+        if path == "/api/auth/login":
+            provider = _oidc_provider_from_env()
+            if provider is None:
+                self._reject(400, "oidc_not_configured")
+                return
+            started = store.begin_oidc(provider)
+            body = json.dumps({"authorization_url": started.authorization_url}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", started.set_cookie)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/api/auth/callback":
+            provider = _oidc_provider_from_env()
+            params = parse_qs(urlparse(self.path).query)
+            if provider is None:
+                self._reject(400, "oidc_not_configured")
+                return
+            try:
+                issued = store.complete_oidc(
+                    provider,
+                    code=params.get("code", [""])[0],
+                    state=params.get("state", [""])[0],
+                    transaction_cookie=cookie_value(self.headers, "pu_oidc"),
+                )
+            except Exception as exc:
+                code = getattr(exc, "code", "oidc")
+                self._reject(400, str(code))
+                return
+            body = json.dumps({"csrf_token": issued.csrf_token, "ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", issued.set_cookie)
+            self.send_header("Set-Cookie", issued.clear_oidc_cookie)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._reject(404, "not_found")
+
+    def _get_routes(self):
         if self.path == "/api/briefing":
             from pu.ops.briefing import briefing_service
             settings = load_settings()
@@ -1238,8 +1529,42 @@ class Handler(BaseHTTPRequestHandler):
         self._send(target.read_bytes(), ctype, no_cache=True)
 
     def do_POST(self):
+        from pu.identity.session import attached_decision, evaluate_on_home
+
+        decision = evaluate_on_home(self.headers, mutate=True)
+        if decision.rejected:
+            self._reject(403, decision.reason)
+            return
+        with attached_decision(decision):
+            if self.path.split("?", 1)[0] == "/api/auth/logout":
+                self._auth_logout()
+                return
+            self._post_routes()
+
+    def _auth_logout(self) -> None:
+        from pu.config import load_settings
+        from pu.identity.session import SESSION_COOKIE, AuthStore, cookie_value, format_set_cookie
+
+        home = load_settings().ensure_home()
+        AuthStore(home).revoke_session(cookie_value(self.headers, SESSION_COOKIE))
+        body = json.dumps({"ok": True}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", format_set_cookie(SESSION_COOKIE, "", max_age=0))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _post_routes(self):
         from urllib.parse import urlparse
+
+        from pu.identity.session import SESSION_COOKIE, cookie_value, host_is_loopback
+
         origin = self.headers.get("Origin")
+        if not cookie_value(self.headers, SESSION_COOKIE) and not host_is_loopback(self.headers):
+            self.send_response(403)
+            self.end_headers()
+            return
         if (origin and (urlparse(origin).netloc != self.headers.get("Host") or urlparse(origin).scheme != "http")) or self.headers.get("Sec-Fetch-Site") == "cross-site":
             self.send_response(403)
             self.end_headers()

@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import json
 from datetime import date
+
 from pu.core.interfaces.llm import LLMProvider, LLMRequest
-
-
 from pu.memory.episodic.store import SqliteEpisodeStore
 from pu.memory.semantic.store import SqliteFactStore
 
@@ -44,7 +43,8 @@ def consolidate_if_due(
 ) -> int:
     """Returns how many new facts were written (0 = not due or nothing worth keeping)."""
     rows = conn.execute(
-        "SELECT id, role, content FROM chat_log WHERE consolidated = 0 ORDER BY id"
+        """SELECT id, role, content FROM chat_log
+           WHERE consolidated = 0 AND owner_user_id = pu_current_owner() ORDER BY id"""
     ).fetchall()
     if len(rows) < every_n * 2:  # each exchange = 2 rows (user + assistant)
         return 0
@@ -70,8 +70,10 @@ def consolidate_if_due(
     if distilled.get("episode"):
         episodes.add(distilled["episode"], happened_at=date.today().isoformat())
 
+    placeholders = ",".join("?" * len(rows))
     conn.execute(
-        f"UPDATE chat_log SET consolidated = 1 WHERE id IN ({','.join('?' * len(rows))})",
+        f"UPDATE chat_log SET consolidated = 1 WHERE owner_user_id = pu_current_owner() "
+        f"AND id IN ({placeholders})",
         [r["id"] for r in rows],
     )
     conn.commit()

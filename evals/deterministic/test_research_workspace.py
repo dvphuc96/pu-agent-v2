@@ -465,8 +465,18 @@ def test_revision_with_invented_or_missing_citation_fails_quality_gate():
 
 
 def test_report_edit_creates_new_version_and_cancels_old_pending_proposal(notebook):
+    from pu.db import connect
+
     repo, wid = notebook
     stored = repo.attach_report(wid, report_payload())
+    conn = connect(repo.home)
+    conn.execute(
+        """INSERT INTO workflow_runs(
+               id, workflow_type, status, request_json, created_at, updated_at
+           ) VALUES('workflow-test', 'morning_research', 'running', '{}', 't', 't')"""
+    )
+    conn.commit()
+    conn.close()
     app = create_application(
         Settings(home=repo.home, api_key="offline"), llm_provider=AnswerProvider()
     )

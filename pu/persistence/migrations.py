@@ -200,6 +200,16 @@ ALTER TABLE briefing_jobs ADD COLUMN next_attempt TEXT NOT NULL DEFAULT '';
         "owner_user_id_personal_workspace_and_composite_fks",
         "",
     ),
+    Migration(
+        9006,
+        "idempotent_owner_match_triggers",
+        "",
+    ),
+    Migration(
+        9007,
+        "reencrypt_legacy_oauth_tokens",
+        "",
+    ),
 )
 
 
@@ -224,10 +234,22 @@ class SQLiteMigrationRunner:
                 from pu.persistence.ownership import apply_ownership_migration
 
                 apply_ownership_migration(self.conn)
+            elif migration.version == 9006:
+                from pu.persistence.ownership import install_owner_match_triggers
+
+                install_owner_match_triggers(self.conn)
+            elif migration.version == 9007:
+                from pu.identity.session import (
+                    migrate_legacy_oauth_tokens,
+                    pin_legacy_oauth_tokens,
+                )
+
+                pin_legacy_oauth_tokens(self.conn)
+                migrate_legacy_oauth_tokens(self.conn)
             elif migration.sql:
                 self.conn.executescript(migration.sql)
             self.conn.execute(
-                "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
                 (
                     migration.version,
                     migration.name,
@@ -235,6 +257,11 @@ class SQLiteMigrationRunner:
                 ),
             )
             newly_applied.append(migration.version)
+        from pu.identity.session import migrate_legacy_oauth_tokens
+
+        # 9007 pins the enc1 set once. Later connects only re-encrypt those
+        # rows, after PU_TOKEN_KEY exists. They do not admit a new enc1 blob.
+        migrate_legacy_oauth_tokens(self.conn)
         self.conn.commit()
         from pu.identity.scope import load_local_owner_cache
 

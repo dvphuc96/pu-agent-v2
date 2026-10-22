@@ -18,6 +18,7 @@ classifiers = [
 dependencies = [
     "anthropic>=0.40",   # Anthropic provider
     "openai>=1.50",      # OpenAI provider
+    "cryptography>=42",  # AES-GCM for provider tokens; RS256 for OIDC
     "python-dotenv>=1.0",
     "rich>=13.0",
 ]

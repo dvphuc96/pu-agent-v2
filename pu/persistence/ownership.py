@@ -8,7 +8,10 @@ PostgreSQL enforces the same columns with RLS.
 
 from __future__ import annotations
 
+import re
 import sqlite3
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 OWNED_TABLES = frozenset(
     {
@@ -61,6 +64,12 @@ CREATE TRIGGER episodes_ad AFTER DELETE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, summary, owner_user_id)
     VALUES ('delete', old.id, old.summary, old.owner_user_id);
 END;
+CREATE TRIGGER episodes_au AFTER UPDATE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, summary, owner_user_id)
+    VALUES ('delete', old.id, old.summary, old.owner_user_id);
+    INSERT INTO episodes_fts(rowid, summary, owner_user_id)
+    VALUES (new.id, new.summary, new.owner_user_id);
+END;
 """
 
 _KNOWLEDGE_FTS_TRIGGERS = """
@@ -84,6 +93,10 @@ END;
 def apply_ownership_migration(conn: sqlite3.Connection) -> None:
     from pu.identity.directory import ensure_local_principal
 
+    # A crash between rename and drop leaves ``table__pre_owner``. Restore that
+    # backup before any "already migrated" check, or the copy is skipped and
+    # version 9005 would still be recorded.
+    _resume_interrupted(conn)
     conn.commit()
     principal = ensure_local_principal(conn)
     owner = principal.user_id
@@ -98,6 +111,7 @@ def apply_ownership_migration(conn: sqlite3.Connection) -> None:
     _rebuild_checkpoints(conn)
     _rebuild_workspace_children(conn)
     _rebuild_briefing_identity(conn)
+    _rebuild_crm_emails(conn)
     _rebuild_knowledge_chunks(conn)
     _upgrade_fts(
         conn,
@@ -121,6 +135,7 @@ def apply_ownership_migration(conn: sqlite3.Connection) -> None:
         _KNOWLEDGE_FTS_TRIGGERS,
     )
     _owner_match_triggers(conn)
+    _assert_no_backups(conn)
     conn._pu_local_owner = owner  # type: ignore[attr-defined]
     conn._pu_local_workspace = principal.workspace_id  # type: ignore[attr-defined]
 
@@ -176,6 +191,73 @@ def _pk(conn: sqlite3.Connection, table: str) -> list[str]:
     return [name for _, name in ranked]
 
 
+def _backup_name(table: str) -> str:
+    return f"{table}__pre_owner"
+
+
+def _count(conn: sqlite3.Connection, table: str) -> int:
+    if not _IDENT.fullmatch(table):
+        raise RuntimeError(f"refusing to touch a non-identifier table name: {table}")
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def _resume_interrupted(conn: sqlite3.Connection) -> None:
+    """Put a half-rebuilt table back so the normal rebuild copies every row.
+
+    SQLite DDL cannot stay in one transaction across ``PRAGMA foreign_keys``.
+    Resuming from the backup is the crash boundary: a live table that is
+    missing or shorter than its backup is discarded, and a finished copy drops
+    the backup. A leftover backup means version 9005 must not be recorded.
+    """
+    backups = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%__pre_owner'"
+        )
+    ]
+    if not backups:
+        return
+    _fk_off(conn)
+    try:
+        for backup in backups:
+            if not backup.endswith("__pre_owner"):
+                continue
+            live = backup[: -len("__pre_owner")]
+            if not _IDENT.fullmatch(live):
+                raise RuntimeError(f"unexpected ownership backup {backup}")
+            backup_count = _count(conn, backup)
+            if not _exists(conn, live):
+                conn.execute(f"ALTER TABLE {backup} RENAME TO {live}")
+                continue
+            live_count = _count(conn, live)
+            if live_count < backup_count:
+                conn.execute(f"DROP TABLE {live}")
+                conn.execute(f"ALTER TABLE {backup} RENAME TO {live}")
+            elif live_count == backup_count:
+                conn.execute(f"DROP TABLE {backup}")
+            else:
+                raise RuntimeError(
+                    f"{live} has {live_count} rows but backup {backup} has {backup_count}; "
+                    "ownership migration will not record a version"
+                )
+    finally:
+        _fk_on(conn)
+
+
+def _assert_no_backups(conn: sqlite3.Connection) -> None:
+    leftover = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%__pre_owner'"
+        )
+    ]
+    if leftover:
+        raise RuntimeError(
+            "ownership migration left backups and will not record version 9005: "
+            + ", ".join(leftover)
+        )
+
+
 def _has_fk(
     conn: sqlite3.Connection,
     table: str,
@@ -183,6 +265,8 @@ def _has_fk(
     ref_table: str,
     ref_columns: tuple[str, ...],
 ) -> bool:
+    if _exists(conn, _backup_name(table)):
+        return False
     if not _exists(conn, table):
         return False
     groups: dict[int, list[tuple[int, str, str, str]]] = {}
@@ -207,20 +291,35 @@ def _fk_on(conn: sqlite3.Connection) -> None:
 
 
 def _rebuild(conn: sqlite3.Connection, table: str, create_sql: str, columns: list[str]) -> None:
+    if not _IDENT.fullmatch(table):
+        raise RuntimeError(f"refusing to rebuild a non-identifier table name: {table}")
+    backup = _backup_name(table)
     if not _exists(conn, table):
-        conn.execute(create_sql)
-        return
+        if _exists(conn, backup):
+            _fk_off(conn)
+            conn.execute(f"ALTER TABLE {backup} RENAME TO {table}")
+            _fk_on(conn)
+        else:
+            conn.execute(create_sql)
+            return
     present = _columns(conn, table)
     copied = [column for column in columns if column in present]
     _fk_off(conn)
-    conn.execute(f"ALTER TABLE {table} RENAME TO {table}__pre_owner")
+    conn.execute(f"ALTER TABLE {table} RENAME TO {backup}")
     conn.execute(create_sql)
     if copied:
         quoted = ", ".join(copied)
-        conn.execute(
-            f"INSERT INTO {table}({quoted}) SELECT {quoted} FROM {table}__pre_owner"
+        conn.execute(f"INSERT INTO {table}({quoted}) SELECT {quoted} FROM {backup}")
+    source = _count(conn, backup)
+    copied_count = _count(conn, table)
+    if copied_count != source:
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {backup} RENAME TO {table}")
+        _fk_on(conn)
+        raise RuntimeError(
+            f"{table} rebuild copied {copied_count} of {source} rows; backup restored"
         )
-    conn.execute(f"DROP TABLE {table}__pre_owner")
+    conn.execute(f"DROP TABLE {backup}")
     _fk_on(conn)
 
 
@@ -472,11 +571,14 @@ def _rebuild_workspace_children(conn: sqlite3.Connection) -> None:
         )
 
 
+def _needs_pk(conn: sqlite3.Connection, table: str, expected: list[str]) -> bool:
+    if _exists(conn, _backup_name(table)):
+        return True
+    return _exists(conn, table) and _pk(conn, table) != expected
+
+
 def _rebuild_briefing_identity(conn: sqlite3.Connection) -> None:
-    if _exists(conn, "briefing_state") and _pk(conn, "briefing_state") != [
-        "key",
-        "owner_user_id",
-    ]:
+    if _needs_pk(conn, "briefing_state", ["key", "owner_user_id"]):
         _drop_triggers(conn, "briefing_state")
         _rebuild(
             conn,
@@ -489,10 +591,7 @@ def _rebuild_briefing_identity(conn: sqlite3.Connection) -> None:
             )""",
             ["key", "value", "owner_user_id"],
         )
-    if _exists(conn, "briefing_seen") and _pk(conn, "briefing_seen") != [
-        "gmail_id",
-        "owner_user_id",
-    ]:
+    if _needs_pk(conn, "briefing_seen", ["gmail_id", "owner_user_id"]):
         _drop_triggers(conn, "briefing_seen")
         _rebuild(
             conn,
@@ -507,6 +606,44 @@ def _rebuild_briefing_identity(conn: sqlite3.Connection) -> None:
             )""",
             ["gmail_id", "owner_user_id", "domain", "reason", "seen_at"],
         )
+
+
+def _rebuild_crm_emails(conn: sqlite3.Connection) -> None:
+    """Match the Postgres primary key ``(gmail_id, owner_user_id)``."""
+    if not _needs_pk(conn, "crm_emails", ["gmail_id", "owner_user_id"]):
+        return
+    _drop_triggers(conn, "crm_emails")
+    _rebuild(
+        conn,
+        "crm_emails",
+        """CREATE TABLE crm_emails (
+            gmail_id TEXT NOT NULL,
+            thread_id TEXT DEFAULT '',
+            sender_name TEXT DEFAULT '',
+            sender_email TEXT DEFAULT '',
+            subject TEXT DEFAULT '',
+            snippet TEXT DEFAULT '',
+            body_text TEXT DEFAULT '',
+            internal_date TEXT NOT NULL,
+            unread INTEGER DEFAULT 1,
+            synced_at TEXT DEFAULT (datetime('now')),
+            owner_user_id TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(gmail_id, owner_user_id)
+        )""",
+        [
+            "gmail_id",
+            "thread_id",
+            "sender_name",
+            "sender_email",
+            "subject",
+            "snippet",
+            "body_text",
+            "internal_date",
+            "unread",
+            "synced_at",
+            "owner_user_id",
+        ],
+    )
 
 
 def _rebuild_knowledge_chunks(conn: sqlite3.Connection) -> None:
@@ -547,6 +684,17 @@ def _drop_triggers(conn: sqlite3.Connection, table: str) -> None:
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
 
 
+def _trigger_names(trigger_sql: str) -> set[str]:
+    return {
+        match.group(1)
+        for match in re.finditer(
+            r"CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+            trigger_sql,
+            re.IGNORECASE,
+        )
+    }
+
+
 def _upgrade_fts(
     conn: sqlite3.Connection,
     fts_name: str,
@@ -556,8 +704,31 @@ def _upgrade_fts(
 ) -> None:
     if not _exists(conn, content):
         return
+    expected = _trigger_names(trigger_sql)
     row = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (fts_name,)).fetchone()
-    if row and row[0] and "owner_user_id" in row[0]:
+    sql = row[0] if row and row[0] else ""
+    present = {
+        name
+        for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+            (content,),
+        )
+    }
+    # External-content FTS5 COUNT(*) follows the content table, so an index
+    # that was never rebuilt still looks full. The docsize shadow counts
+    # indexed rows.
+    indexed = -1
+    docsize = f"{fts_name}_docsize"
+    if _exists(conn, fts_name) and _exists(conn, docsize):
+        try:
+            indexed = _count(conn, docsize)
+        except sqlite3.Error:
+            indexed = -1
+    if (
+        "owner_user_id" in sql
+        and expected <= present
+        and indexed == _count(conn, content)
+    ):
         return
     _drop_triggers(conn, content)
     conn.execute(f"DROP TABLE IF EXISTS {fts_name}")
@@ -576,39 +747,71 @@ def _upgrade_fts(
     conn.execute(f"INSERT INTO {fts_name}({fts_name}) VALUES('rebuild')")
 
 
+# Bump the suffix when the trigger body changes. CREATE IF NOT EXISTS will
+# not replace an existing body, so a new name is the install.
+_OWNER_MATCH_VERSION = "v1"
+
+
+def install_owner_match_triggers(conn: sqlite3.Connection) -> None:
+    """Install workflow owner-match triggers once.
+
+    ``CREATE TRIGGER IF NOT EXISTS`` is safe when several connections migrate
+    or open the database together. Dropping and recreating the same name on
+    every ``connect()`` races: DDL commits implicitly, and the second CREATE
+    then fails with ``trigger already exists``.
+    """
+    _owner_match_triggers(conn)
+    _install_episodes_update_trigger(conn)
+
+
+def _install_episodes_update_trigger(conn: sqlite3.Connection) -> None:
+    if not _exists(conn, "episodes") or not _exists(conn, "episodes_fts"):
+        return
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
+               INSERT INTO episodes_fts(episodes_fts, rowid, summary, owner_user_id)
+               VALUES ('delete', old.id, old.summary, old.owner_user_id);
+               INSERT INTO episodes_fts(rowid, summary, owner_user_id)
+               VALUES (new.id, new.summary, new.owner_user_id);
+           END"""
+    )
+
+
 def _owner_match_triggers(conn: sqlite3.Connection) -> None:
     statements = (
         (
             "agent_events",
             "workflow_id",
-            "agent_events owner_user_id does not match workflow_runs",
+            "agent_events workflow_id must reference workflow_runs for the same owner",
         ),
         (
             "tool_audit_events",
             "workflow_id",
-            "tool_audit_events owner_user_id does not match workflow_runs",
+            "tool_audit_events workflow_id must reference workflow_runs for the same owner",
         ),
         (
             "proposed_actions",
             "workflow_id",
-            "proposed_actions owner_user_id does not match workflow_runs",
+            "proposed_actions workflow_id must reference workflow_runs for the same owner",
         ),
     )
     for table, column, message in statements:
         if not _exists(conn, table):
             continue
         for timing in ("INSERT", "UPDATE"):
-            name = f"{table}_owner_match_{timing.lower()}"
-            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            legacy = f"{table}_owner_match_{timing.lower()}"
+            name = f"{legacy}_{_OWNER_MATCH_VERSION}"
             conn.execute(
-                f"""CREATE TRIGGER {name}
+                f"""CREATE TRIGGER IF NOT EXISTS {name}
                     BEFORE {timing} ON {table}
                     FOR EACH ROW
-                    WHEN NEW.{column} IS NOT NULL AND EXISTS (
+                    WHEN NEW.{column} IS NOT NULL AND NOT EXISTS (
                         SELECT 1 FROM workflow_runs
-                        WHERE id = NEW.{column} AND owner_user_id <> NEW.owner_user_id
+                        WHERE id = NEW.{column} AND owner_user_id = NEW.owner_user_id
                     )
                     BEGIN
                         SELECT RAISE(ABORT, '{message}');
                     END"""
             )
+            if legacy != name:
+                conn.execute(f"DROP TRIGGER IF EXISTS {legacy}")

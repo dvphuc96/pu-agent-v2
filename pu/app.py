@@ -257,7 +257,7 @@ class PU(BaseAgent):
             actor="agent",
             principal="local-user",
             request_id=str(uuid.uuid4()),
-            workflow_id=self.session.session_id,
+            workflow_id=None,
             agent_id="pu-agent",
             scopes=self.tools.scopes(),
             capabilities=self.tools.agent_capabilities(),

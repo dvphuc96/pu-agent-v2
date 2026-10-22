@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
-
 
 SENSITIVE_KEYS = {
     "api_key",
@@ -35,6 +35,9 @@ def redact_text(text: str) -> str:
     redacted = text
     for pattern in SECRET_VALUE_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
+    key = os.environ.get("PU_TOKEN_KEY", "")
+    if len(key) >= 8 and key in redacted:
+        redacted = redacted.replace(key, "[REDACTED]")
     return redacted
 
 

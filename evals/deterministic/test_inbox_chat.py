@@ -412,7 +412,13 @@ def test_same_domain_unrelated_mail_is_not_in_report_sources(tmp_path, monkeypat
     app, _, collected = build(tmp_path, monkeypatch)
     seed(app)
     app.conn.execute(
-        "INSERT INTO crm_emails (gmail_id, thread_id, sender_name, sender_email, subject, body_text, snippet, internal_date, unread) SELECT 'newsletter', thread_id, sender_name, sender_email, 'Weekly digest', 'Unrelated promotion', snippet, internal_date, unread FROM crm_emails"
+        """INSERT INTO crm_emails (
+               gmail_id, thread_id, sender_name, sender_email, subject, body_text,
+               snippet, internal_date, unread, owner_user_id
+           )
+           SELECT 'newsletter', thread_id, sender_name, sender_email, 'Weekly digest',
+                  'Unrelated promotion', snippet, internal_date, unread, owner_user_id
+           FROM crm_emails"""
     )
     app.conn.commit()
     result = app.respond("Hôm nay có email gì mới?")

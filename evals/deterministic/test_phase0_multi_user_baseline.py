@@ -1,9 +1,9 @@
 """Phase 0 reproductions for static-analysis findings.
 
-These tests encode the multi-user safety properties the current single-user
-build does not provide. Each confirmed defect is marked xfail so the suite
-stays green without changing product behavior. A strict xfail becomes an
-error when the underlying defect is fixed and the marker should be removed.
+These tests encode the multi-user safety properties. A defect that has been
+fixed runs as a normal test. The remaining xfail markers belong to later
+phases (OTel redaction, tracer init, and Google Calendar errors) and stay
+until those phases land.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from pu.config import Settings
 from pu.core.interfaces.tools import ToolResult
 from pu.db import connect
 from pu.harness.audit import ToolAuditRecord
+from pu.harness.gateway import bind_harness, reset_bound_harness
 from pu.ops.agentops import AgentOpsHarness
 from pu.ops.briefing import BriefingService
 from pu.ops.tracing import Tracer
@@ -129,7 +130,7 @@ def _action(action_id: str, principal: str) -> ProposedAction:
         principal=principal,
         agent_id="report-agent",
         request_id="req-" + principal,
-        workflow_id="wf-" + principal,
+        workflow_id=None,
         tool_call_id="call-" + principal,
         capability="message:write",
         required_scope="message:write",
@@ -156,18 +157,11 @@ def _publish_canary(tmp_path):
     tracer._otel_tracer = otel
     AgentOpsHarness(repository, tracer=tracer).publish(
         "tool_complete",
-        {"output": CANARY, "api_key": CANARY, "workflow_id": "wf-redact"},
+        {"output": CANARY, "api_key": CANARY},
     )
     return repository, tracer, otel
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Tracer.event ghi nguyên payload vào JSONL ngày. "
-        "Phase 2 gỡ đúng marker này; marker OTel thuộc Phase 5."
-    ),
-)
 def test_agentops_redacts_canary_in_jsonl(tmp_path):
     repository, tracer, _otel = _publish_canary(tmp_path)
     assert CANARY not in json.dumps(repository.list())
@@ -187,13 +181,6 @@ def test_agentops_redacts_canary_in_otel(tmp_path):
     assert CANARY not in json.dumps(otel.spans)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SQLiteToolAuditSink redact record_json nhưng ghi nguyên reason, "
-        "result_summary và error. Phase 2 gỡ đúng marker này."
-    ),
-)
 def test_sqlite_tool_audit_columns_redact_canary(tmp_path):
     home = tmp_path / "home"
     connect(home).close()
@@ -202,7 +189,7 @@ def test_sqlite_tool_audit_columns_redact_canary(tmp_path):
         ToolAuditRecord(
             execution_id="exec-audit",
             request_id="req-audit",
-            workflow_id="wf-audit",
+            workflow_id=None,
             agent_id="report-agent",
             tool_call_id="call-audit",
             actor="agent",
@@ -233,13 +220,6 @@ def test_sqlite_tool_audit_columns_redact_canary(tmp_path):
     assert CANARY not in (row["error"] or "")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "recover_inflight đánh failed mọi proposed_actions status=executing, "
-        "không xét principal/owner_user_id hay lease briefing còn hiệu lực."
-    ),
-)
 def test_recover_inflight_preserves_other_owner_and_live_lease(tmp_path):
     home = tmp_path / "home"
     connect(home).close()
@@ -270,10 +250,6 @@ def test_recover_inflight_preserves_other_owner_and_live_lease(tmp_path):
     assert repo.get("act-other").status is ApprovalStatus.EXECUTING
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Worker cycle gọi pu.tools.gmail.sync trực tiếp, không qua Tool Harness.",
-)
 def test_worker_gmail_read_goes_through_tool_harness(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
@@ -288,13 +264,6 @@ def test_worker_gmail_read_goes_through_tool_harness(tmp_path, monkeypatch):
     assert any(name in GMAIL_TOOLS for name in state["harness"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Worker schedule_meeting_briefs gọi read_availability trực tiếp, "
-        "không qua Tool Harness."
-    ),
-)
 def test_worker_calendar_read_goes_through_tool_harness(tmp_path, monkeypatch):
     home = tmp_path / "home"
     state = _fresh_state()
@@ -315,45 +284,43 @@ def test_worker_calendar_read_goes_through_tool_harness(tmp_path, monkeypatch):
     assert any(name in CALENDAR_TOOLS for name in state["harness"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "collect_partner_sources đọc trang bằng fetch_source khi không có app, "
-        "bỏ qua Tool Harness."
-    ),
-)
 def test_collector_page_read_without_app_goes_through_tool_harness(tmp_path, monkeypatch):
     home = tmp_path / "home"
     state = _fresh_state()
     monkeypatch.setattr("pu.reporting.collection.fetch_source", _mark_bypass(state, "page"))
     monkeypatch.setattr("pu.reporting.collection.search_results", lambda *_a, **_k: [])
     monkeypatch.setattr(
-        "pu.reporting.collection.requested_partner_availability",
+        "pu.reporting.availability.read_availability",
+        _mark_bypass(state, "calendar"),
+    )
+    monkeypatch.setattr(
+        "pu.reporting.availability.requested_partner_availability",
         _mark_bypass(state, "calendar"),
     )
     repo = WorkspaceRepository(home)
     workspace = repo.create("Acme", "https://acme.example")
-    collect_partner_sources(
-        repo,
-        workspace["id"],
-        config=CollectionConfig(max_search_queries=0, max_detail_pages=0, max_duration_seconds=5),
-    )
+    token = bind_harness(_RecordingHarness(state))
+    try:
+        collect_partner_sources(
+            repo,
+            workspace["id"],
+            config=CollectionConfig(max_search_queries=0, max_detail_pages=0, max_duration_seconds=5),
+        )
+    finally:
+        reset_bound_harness(token)
     assert "page" not in state["bypasses"]
     assert any(name in PAGE_TOOLS for name in state["harness"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Collector vẫn gọi requested_partner_availability ngoài Tool Harness "
-        "kể cả khi app đã được truyền cho luồng đọc trang."
-    ),
-)
 def test_collector_calendar_read_goes_through_tool_harness(tmp_path, monkeypatch):
     home = tmp_path / "home"
     state = _fresh_state()
     monkeypatch.setattr(
-        "pu.reporting.collection.requested_partner_availability",
+        "pu.reporting.availability.read_availability",
+        _mark_bypass(state, "calendar"),
+    )
+    monkeypatch.setattr(
+        "pu.reporting.availability.requested_partner_availability",
         _mark_bypass(state, "calendar"),
     )
     repo = WorkspaceRepository(home)
@@ -368,13 +335,6 @@ def test_collector_calendar_read_goes_through_tool_harness(tmp_path, monkeypatch
     assert any(name in CALENDAR_TOOLS for name in state["harness"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "workspace_action op fetch_source (pu/ops/workspace_api.py) gọi fetch_source "
-        "trực tiếp. Phase 2 gỡ đúng marker này."
-    ),
-)
 def test_workspace_fetch_source_goes_through_tool_harness(tmp_path, monkeypatch):
     home = tmp_path / "home"
     state = _fresh_state()
@@ -396,13 +356,6 @@ def test_workspace_fetch_source_goes_through_tool_harness(tmp_path, monkeypatch)
     assert any(name in PAGE_TOOLS for name in state["harness"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "gmail_sync_action (pu/ops/dashboard.py) gọi gmail.sync trực tiếp. "
-        "Phase 2 gỡ đúng marker này."
-    ),
-)
 def test_dashboard_gmail_sync_goes_through_tool_harness(tmp_path, monkeypatch):
     home = tmp_path / "home"
     state = _fresh_state()
@@ -412,18 +365,15 @@ def test_dashboard_gmail_sync_goes_through_tool_harness(tmp_path, monkeypatch):
     monkeypatch.setattr("pu.tools.gmail.sync", _mark_bypass(state, "gmail"))
     from pu.ops.dashboard import gmail_sync_action
 
-    gmail_sync_action({})
+    token = bind_harness(_RecordingHarness(state))
+    try:
+        gmail_sync_action({})
+    finally:
+        reset_bound_harness(token)
     assert state["bypasses"] == []
     assert any(name in GMAIL_TOOLS for name in state["harness"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "todays_events (pu/graph/workflows/triage.py) đọc calendar.ics trực tiếp. "
-        "Phase 2 gỡ đúng marker này."
-    ),
-)
 def test_triage_ics_read_goes_through_tool_harness(tmp_path, monkeypatch):
     from pathlib import Path
 
@@ -444,7 +394,11 @@ def test_triage_ics_read_goes_through_tool_harness(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "read_text", _tracking_read)
     from pu.graph.workflows.triage import todays_events
 
-    todays_events(home)
+    token = bind_harness(_RecordingHarness(state))
+    try:
+        todays_events(home)
+    finally:
+        reset_bound_harness(token)
     assert state["bypasses"] == []
     assert any(name in CALENDAR_TOOLS for name in state["harness"])
 

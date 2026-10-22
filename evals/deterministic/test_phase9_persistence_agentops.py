@@ -107,8 +107,21 @@ def test_workflow_resumes_after_restart_without_rerunning_completed_stages(tmp_p
     app2.close()
 
 
+def _workflow(home, workflow_id: str) -> None:
+    conn = connect(home)
+    conn.execute(
+        """INSERT INTO workflow_runs(
+               id, workflow_type, status, request_json, created_at, updated_at
+           ) VALUES(?, 'morning_research', 'running', '{}', 't', 't')""",
+        (workflow_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
 def test_agentops_events_are_durable_correlated_and_project_to_slos(tmp_path):
     connect(tmp_path).close()
+    _workflow(tmp_path, "wf-1")
     db = SQLiteDatabase.from_home(tmp_path)
     repo = SQLiteAgentEventRepository(db)
     ops = AgentOpsHarness(repo)
@@ -131,6 +144,7 @@ def test_agentops_events_are_durable_correlated_and_project_to_slos(tmp_path):
 
 def test_tool_audit_is_queryable_sql_and_redacted(tmp_path):
     connect(tmp_path).close()
+    _workflow(tmp_path, "wf")
     db = SQLiteDatabase.from_home(tmp_path)
     audit = SQLiteToolAuditSink(db)
     registry = ToolRegistry()
@@ -200,7 +214,7 @@ def test_external_read_retries_transient_error_but_write_never_auto_retries(tmp_
     )
     read_ctx = ToolContext(
         actor="agent", principal="local-user", scopes=frozenset({"web:read"}),
-        capabilities=frozenset({"web:read"}), workflow_id="wf-retry",
+        capabilities=frozenset({"web:read"}), workflow_id=None,
     )
     assert harness.execute("external_read", {"query":"x"}, read_ctx).ok is True
     assert calls["read"] == 2
@@ -211,7 +225,7 @@ def test_external_read_retries_transient_error_but_write_never_auto_retries(tmp_
     args = {"text":"x"}
     write_ctx = ToolContext(
         actor="approved_action_executor", principal="local-user", scopes=frozenset({"web:write"}),
-        capabilities=frozenset({"web:write"}), workflow_id="wf-retry",
+        capabilities=frozenset({"web:write"}), workflow_id=None,
         metadata={"approval_id":"a1", "approval_action_hash":action_hash("external_write", args), "approval_status":"executing"},
     )
     result = harness.execute("external_write", args, write_ctx)
@@ -229,7 +243,7 @@ def test_restart_fails_closed_for_inflight_approved_action(tmp_path):
     action = ProposedAction(
         id="a-restart", tool_name="create_event", arguments={"title":"X","start":"2026-10-05T09:00:00"},
         action_hash="h", status=ApprovalStatus.APPROVED, principal="local-user", agent_id="calendar-agent",
-        request_id="req", workflow_id="wf", tool_call_id="call", capability="calendar:write",
+        request_id="req", workflow_id=None, tool_call_id="call", capability="calendar:write",
         required_scope="calendar:write", side_effect=True, external=True, risk="high",
         created_at=now.isoformat(), updated_at=now.isoformat(),
         expires_at=(now+timedelta(hours=1)).isoformat(), approved_action_hash="h",

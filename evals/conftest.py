@@ -16,3 +16,13 @@ def _reset_principal_seam():
     reset_attached_principal()
     yield
     reset_attached_principal()
+
+
+@pytest.fixture(autouse=True)
+def _reset_bound_harness():
+    """A test may bind a read harness on a contextvar. Clear it around each test."""
+    from pu.harness.gateway import clear_bound_harness
+
+    clear_bound_harness()
+    yield
+    clear_bound_harness()

@@ -69,13 +69,12 @@ def export_workspace_artifact(
             data = FileReportRepository(home).read_bytes(report_id, kind)
         except OwnershipDenied as exc:
             raise KeyError("Artifact không thuộc người dùng hiện tại.") from exc
-        original = home / "reports" / f"{report_id}.json"
-        original_hash = (
-            content_hash(json.loads(original.read_text(encoding="utf-8")))
-            if original.is_file()
-            else ""
-        )
-        if not original.is_file() or original_hash != stored["content_hash"]:
+        try:
+            original_bytes = FileReportRepository(home).read_bytes(report_id, "json")
+        except (KeyError, OwnershipDenied):
+            original_bytes = b""
+        original_hash = content_hash(json.loads(original_bytes)) if original_bytes else ""
+        if not original_bytes or original_hash != stored["content_hash"]:
             raise ValueError("Artifact chưa có hoặc không khớp phiên bản. Có thể xuất Markdown/JSON.")
         content_type = "application/pdf" if kind == "pdf" else "text/html; charset=utf-8"
         return data, content_type, report_id
@@ -216,9 +215,62 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
             metadata={"untrusted_input": True},
         )
     elif op == "fetch_source":
-        from pu.tools.web_source import fetch_source
+        from pu.harness.gateway import (
+            BoundaryHarness,
+            execute_worker_read,
+            external_harness,
+            job_owner,
+            parse_json_output,
+            worker_context,
+        )
 
-        repo.add_source(workspace_id, **fetch_source(payload.get("url", "")))
+        app = app_factory() if app_factory else None
+        harness = external_harness(app)
+        url = payload.get("url", "") or ""
+        owner, workspace_owner = job_owner(home)
+        observer = None
+        if app is not None and getattr(app, "event_publisher", None) is not None:
+            observer = app.event_publisher.publish
+        if harness is None:
+            from pu.tools.web_source import fetch_source
+
+            context = worker_context(
+                owner_user_id=owner,
+                workspace_id=workspace_owner,
+                job_id=str(workspace_id),
+                scopes=("web:read",),
+                tool_name="read_web_page",
+                extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
+            )
+            result = BoundaryHarness(lambda: fetch_source(url)).execute(
+                "read_web_page", {"url": url}, context
+            )
+        else:
+            result = execute_worker_read(
+                harness,
+                "read_web_page",
+                {"url": url},
+                owner_user_id=owner,
+                workspace_id=workspace_owner,
+                job_id=str(workspace_id),
+                scopes=("web:read",),
+                observer=observer,
+                extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
+                home=home,
+            )
+        page = parse_json_output(result)
+        if not isinstance(page, dict):
+            raise ValueError("Nguồn web không khả dụng qua tool harness.")
+        repo.add_source(
+            workspace_id,
+            title=page.get("title") or url,
+            content=page.get("content") or "",
+            source_type=page.get("source_type") or "web",
+            url=page.get("url") or url,
+            metadata=page.get("metadata")
+            if isinstance(page.get("metadata"), dict)
+            else {"untrusted_input": True},
+        )
     elif op == "upload_source":
         from pu.reporting.attachments import extract_attachment
 
@@ -335,8 +387,11 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
                 )
                 with repo.database.connection() as conn:
                     pending = conn.execute(
-                        """SELECT id FROM proposed_actions WHERE status IN ('pending','approved')
-                        AND json_extract(arguments_json,'$.workspace_id')=? AND json_extract(arguments_json,'$.report_id')=?""",
+                        """SELECT id FROM proposed_actions
+                           WHERE owner_user_id = pu_current_owner()
+                             AND status IN ('pending','approved')
+                             AND json_extract(arguments_json,'$.workspace_id')=?
+                             AND json_extract(arguments_json,'$.report_id')=?""",
                         (workspace_id, original["payload"]["report_id"]),
                     ).fetchall()
                 for action in pending:

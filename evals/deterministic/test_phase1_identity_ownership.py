@@ -417,7 +417,7 @@ def test_mu07_rls_hides_other_owner_and_role_cannot_bypass():
         pytest.skip(f"{SKIP_POSTGRES} ({exc})")
     app = None
     try:
-        install(admin)
+        install(admin, password="pu-phase1-fixture", replace_existing=True)
         user_a = str(uuid.uuid4())
         user_b = str(uuid.uuid4())
         _seed_postgres(admin, user_a, "fixture-a-ws", A_MARK)

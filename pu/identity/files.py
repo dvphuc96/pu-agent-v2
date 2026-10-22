@@ -1,9 +1,8 @@
-"""Private files live under an owner root and a legacy path tests already use.
+"""Private files live under an owner root.
 
-New bytes are written under ``owners/<owner_user_id>/``. The historical path
-(``reports/``, ``traces/``, ``calendar.ics``, …) stays so the single-user
-suite can keep reading it. A read through this module refuses another
-owner's file.
+New bytes are written only under ``owners/<owner_user_id>/``. A read may
+still open a legacy path for the database-local user so older single-user
+files keep working. Another owner's file is refused.
 """
 
 from __future__ import annotations
@@ -60,16 +59,13 @@ def owner_root(home: Path, owner_user_id: str) -> Path:
 
 
 def write_owned_bytes(home: Path, relative: str, data: bytes) -> Path:
-    """Write ``relative`` for the current owner and mirror the legacy path."""
+    """Write ``relative`` under the current owner root only."""
     owner = owner_for_home(home)
     if not owner:
         raise OwnershipDenied("no principal is available to own this file")
     path = owner_root(home, owner) / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-    legacy = Path(home) / relative
-    legacy.parent.mkdir(parents=True, exist_ok=True)
-    legacy.write_bytes(data)
     _record(home, relative, owner)
     return path
 
@@ -84,9 +80,6 @@ def read_owned_bytes(home: Path, relative: str) -> bytes:
         raise OwnershipDenied("no principal is available to read this file")
     owned = owner_root(home, owner) / relative
     if owned.is_file():
-        recorded = _recorded_owner(home, relative, owner)
-        if recorded and recorded != owner:
-            raise OwnershipDenied("private file belongs to another user")
         return owned.read_bytes()
     legacy = Path(home) / relative
     if not legacy.is_file():
@@ -165,20 +158,3 @@ def _record(home: Path, relative: str, owner: str) -> None:
         return
     finally:
         conn.close()
-
-
-def _recorded_owner(home: Path, relative: str, owner: str) -> str:
-    database = Path(home) / "state.db"
-    if not database.is_file():
-        return ""
-    conn = sqlite3.connect(database)
-    try:
-        row = conn.execute(
-            "SELECT owner_user_id FROM private_files WHERE relative_path = ? AND owner_user_id = ?",
-            (relative, owner),
-        ).fetchone()
-    except sqlite3.Error:
-        return ""
-    finally:
-        conn.close()
-    return row[0] if row else ""

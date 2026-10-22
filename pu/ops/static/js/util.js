@@ -122,7 +122,15 @@ const reveal = (path, label) => `<a class="reveal" onclick="revealFile('${path}'
 // --- memory CRUD (dashboard side). `editing` pauses the 5s rebuild so an
 // in-progress edit isn't wiped (same idea as the animation guard).
 let editing = false;
-async function postJSON(url, body){ return (await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json(); }
+let puCsrf = "";
+function puMutateHeaders(extra){
+  const headers = Object.assign({"Content-Type":"application/json"}, extra || {});
+  if (puCsrf) headers["X-CSRF-Token"] = puCsrf;
+  return headers;
+}
+async function postJSON(url, body){
+  return (await fetch(url,{method:"POST",headers:puMutateHeaders(),body:JSON.stringify(body)})).json();
+}
 
 // --- Shared row atoms.
 //

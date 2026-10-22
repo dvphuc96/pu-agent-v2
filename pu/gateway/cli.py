@@ -19,13 +19,25 @@ console = Console()
 
 def _memory_snapshot(conn: sqlite3.Connection) -> str:
     """Render a bounded, read-only view of PU's local memory."""
-    fact_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    facts = conn.execute("SELECT subject, content FROM facts ORDER BY id DESC LIMIT 8").fetchall()
-    episode_count = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
-    episodes = conn.execute(
-        "SELECT happened_at, summary FROM episodes ORDER BY happened_at DESC, id DESC LIMIT 5"
+    fact_count = conn.execute(
+        "SELECT COUNT(*) FROM facts WHERE owner_user_id = pu_current_owner()"
+    ).fetchone()[0]
+    facts = conn.execute(
+        """SELECT subject, content FROM facts
+           WHERE owner_user_id = pu_current_owner() ORDER BY id DESC LIMIT 8"""
     ).fetchall()
-    pending = conn.execute("SELECT COUNT(*) FROM chat_log WHERE consolidated = 0").fetchone()[0]
+    episode_count = conn.execute(
+        "SELECT COUNT(*) FROM episodes WHERE owner_user_id = pu_current_owner()"
+    ).fetchone()[0]
+    episodes = conn.execute(
+        """SELECT happened_at, summary FROM episodes
+           WHERE owner_user_id = pu_current_owner()
+           ORDER BY happened_at DESC, id DESC LIMIT 5"""
+    ).fetchall()
+    pending = conn.execute(
+        """SELECT COUNT(*) FROM chat_log
+           WHERE consolidated = 0 AND owner_user_id = pu_current_owner()"""
+    ).fetchone()[0]
 
     lines = [f"Semantic facts ({fact_count})"]
     lines.extend(f"- [{row['subject']}] {row['content']}" for row in facts)

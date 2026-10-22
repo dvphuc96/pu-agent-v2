@@ -100,9 +100,16 @@ class Tracer:
                 for _ in iter_trace_lines(self.path):
                     pass
             self._trace_encoding_checked = True
-        record["ts"] = _now()
+        from pu.harness.audit import redact
+
+        # JSONL is a Phase 2 sink. OTel attributes stay on the original event;
+        # redacting those is OPS-02 in Phase 5.
+        stored = redact(dict(record))
+        if not isinstance(stored, dict):
+            stored = {"value": stored}
+        stored["ts"] = _now()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            f.write(json.dumps(stored, ensure_ascii=False, default=str) + "\n")
         from pu.identity.files import note_written
 
         note_written(self.settings.home, self.path)

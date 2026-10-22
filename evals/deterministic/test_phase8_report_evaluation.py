@@ -219,7 +219,10 @@ def test_research_workflow_produces_structured_report_quality_gate_and_artifact(
     assert result.evaluation.release_allowed is True
     assert result.evaluation.metrics.source_coverage == 1.0
     assert "Đối chiếu dữ kiện" in result.report.reply
-    assert (tmp_path / "reports" / f"{result.structured_report.report_id}.json").exists()
+    from pu.reporting.repository import FileReportRepository
+
+    saved = FileReportRepository(tmp_path).read_bytes(result.structured_report.report_id, "json")
+    assert result.structured_report.report_id in saved.decode()
 
 
 def test_phase8_contract_is_wired_through_composition_root(tmp_path):

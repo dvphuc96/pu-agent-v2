@@ -125,7 +125,11 @@ def make_tool(research_runner: Callable[..., Any], home: Path) -> Tool:
             )
         else:
             verdict = "quality score unavailable"
-        report_root = home / "reports"
+        from pu.identity.files import owner_for_home, owner_root
+
+        owner = owner_for_home(home)
+        owned_root = owner_root(home, owner) / "reports" if owner else None
+        report_root = owned_root if owned_root and owned_root.is_dir() else home / "reports"
         candidates = [
             report_root / f"{report.report_id}.{ext}" for ext in ("pdf", "html", "md")
         ]

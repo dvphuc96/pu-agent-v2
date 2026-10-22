@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -121,7 +122,9 @@ class SQLiteApprovalRepository:
     def get(self, action_id: str) -> ProposedAction | None:
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT * FROM proposed_actions WHERE id=?", (action_id,)
+                """SELECT * FROM proposed_actions
+                   WHERE id=? AND owner_user_id = pu_current_owner()""",
+                (action_id,),
             ).fetchone()
         return _row_to_action(row)
 
@@ -134,12 +137,16 @@ class SQLiteApprovalRepository:
         with self._connection() as conn:
             if status is None:
                 rows = conn.execute(
-                    "SELECT * FROM proposed_actions ORDER BY created_at DESC LIMIT ?",
+                    """SELECT * FROM proposed_actions
+                       WHERE owner_user_id = pu_current_owner()
+                       ORDER BY created_at DESC LIMIT ?""",
                     (limit,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM proposed_actions WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                    """SELECT * FROM proposed_actions
+                       WHERE status=? AND owner_user_id = pu_current_owner()
+                       ORDER BY created_at DESC LIMIT ?""",
                     (status.value, limit),
                 ).fetchall()
         return [item for row in rows if (item := _row_to_action(row)) is not None]
@@ -160,7 +167,8 @@ class SQLiteApprovalRepository:
                        status='pending', decision_note=NULL, decided_by=NULL, decided_at=NULL,
                        execution_id=NULL, executed_at=NULL, result_summary=NULL, error=NULL,
                        revision=revision+1, updated_at=?, expires_at=?
-                   WHERE id=? AND status IN ('pending','approved')""",
+                   WHERE id=? AND status IN ('pending','approved')
+                     AND owner_user_id = pu_current_owner()""",
                 (
                     json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str),
                     action_hash,
@@ -187,7 +195,8 @@ class SQLiteApprovalRepository:
                 """UPDATE proposed_actions
                    SET status='approved', approved_action_hash=action_hash,
                        decision_note=?, decided_by=?, decided_at=?, updated_at=?
-                   WHERE id=? AND status='pending' AND action_hash=? AND expires_at>?""",
+                   WHERE id=? AND status='pending' AND action_hash=? AND expires_at>?
+                     AND owner_user_id = pu_current_owner()""",
                 (note or None, decided_by, now, now, action_id, expected_hash, now),
             )
             conn.commit()
@@ -206,7 +215,8 @@ class SQLiteApprovalRepository:
             cur = conn.execute(
                 """UPDATE proposed_actions
                    SET status='rejected', decision_note=?, decided_by=?, decided_at=?, updated_at=?
-                   WHERE id=? AND status IN ('pending','approved')""",
+                   WHERE id=? AND status IN ('pending','approved')
+                     AND owner_user_id = pu_current_owner()""",
                 (note or None, decided_by, now, now, action_id),
             )
             conn.commit()
@@ -218,7 +228,8 @@ class SQLiteApprovalRepository:
         with self._connection() as conn:
             conn.execute(
                 """UPDATE proposed_actions SET status='expired', updated_at=?
-                   WHERE id=? AND status IN ('pending','approved') AND expires_at<=?""",
+                   WHERE id=? AND status IN ('pending','approved') AND expires_at<=?
+                     AND owner_user_id = pu_current_owner()""",
                 (now, action_id, now),
             )
             conn.commit()
@@ -237,7 +248,9 @@ class SQLiteApprovalRepository:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT * FROM proposed_actions WHERE id=?", (action_id,)
+                    """SELECT * FROM proposed_actions
+                       WHERE id=? AND owner_user_id = pu_current_owner()""",
+                    (action_id,),
                 ).fetchone()
                 action = _row_to_action(row)
                 if (
@@ -253,7 +266,8 @@ class SQLiteApprovalRepository:
                     """UPDATE proposed_actions
                        SET status='executing', execution_id=?, updated_at=?
                        WHERE id=? AND status='approved'
-                         AND action_hash=? AND approved_action_hash=?""",
+                         AND action_hash=? AND approved_action_hash=?
+                         AND owner_user_id = pu_current_owner()""",
                     (execution_id, now, action_id, expected_hash, expected_hash),
                 )
                 if cur.rowcount != 1:
@@ -280,7 +294,8 @@ class SQLiteApprovalRepository:
             cur = conn.execute(
                 """UPDATE proposed_actions
                    SET status=?, executed_at=?, updated_at=?, result_summary=?, error=?
-                   WHERE id=? AND status='executing' AND execution_id=?""",
+                   WHERE id=? AND status='executing' AND execution_id=?
+                     AND owner_user_id = pu_current_owner()""",
                 (status, now, now, result_summary, error, action_id, execution_id),
             )
             conn.commit()
@@ -288,16 +303,19 @@ class SQLiteApprovalRepository:
         return self.get(action_id) if changed else None
 
     def recover_inflight(self) -> list[ProposedAction]:
-        """Fail closed after restart for actions left in ``EXECUTING``.
+        """Fail closed only this owner's executing rows when no live lease remains.
 
-        A process can die after an external side effect but before finalization,
-        so automatic retry would risk duplicate writes. Mark the outcome
-        uncertain and require a fresh human-reviewed proposal.
+        Another owner's row is left alone. A lease that has not expired means
+        some instance may still be inside the side effect, so this process
+        does not mark the row failed and does not run the tool again.
         """
         now = _now()
         with self._connection() as conn:
+            if _lease_is_live(conn):
+                return []
             rows = conn.execute(
-                "SELECT id FROM proposed_actions WHERE status='executing'"
+                """SELECT id FROM proposed_actions
+                   WHERE status='executing' AND owner_user_id = pu_current_owner()"""
             ).fetchall()
             ids = [row[0] for row in rows]
             if ids:
@@ -308,8 +326,21 @@ class SQLiteApprovalRepository:
                              error,
                              'process restarted while action was executing; outcome may be uncertain; review before retry'
                            )
-                       WHERE status='executing'""",
+                       WHERE status='executing' AND owner_user_id = pu_current_owner()""",
                     (now, now),
                 )
                 conn.commit()
         return [item for action_id in ids if (item := self.get(action_id)) is not None]
+
+
+def _lease_is_live(conn) -> bool:
+    row = conn.execute(
+        """SELECT value FROM briefing_state
+           WHERE key='lease_until' AND owner_user_id = pu_current_owner()"""
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        return float(row[0]) > time.time()
+    except (TypeError, ValueError):
+        return False

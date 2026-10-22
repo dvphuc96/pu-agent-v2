@@ -55,13 +55,20 @@ def import_legacy_rows(
             )
         planned.append((table, user_id, dict(values)))
 
-    for table, user_id, values in planned:
-        columns = list(values)
-        columns.append("owner_user_id")
-        placeholders = ", ".join("?" for _ in columns)
-        quoted = ", ".join(columns)
-        conn.execute(
-            f"INSERT INTO {table} ({quoted}) VALUES ({placeholders})",
-            tuple(values[column] for column in values) + (user_id,),
-        )
+    conn.execute("SAVEPOINT legacy_import")
+    try:
+        for table, user_id, values in planned:
+            columns = list(values)
+            columns.append("owner_user_id")
+            placeholders = ", ".join("?" for _ in columns)
+            quoted = ", ".join(columns)
+            conn.execute(
+                f"INSERT INTO {table} ({quoted}) VALUES ({placeholders})",
+                tuple(values[column] for column in values) + (user_id,),
+            )
+    except Exception:
+        conn.execute("ROLLBACK TO legacy_import")
+        conn.execute("RELEASE legacy_import")
+        raise
+    conn.execute("RELEASE legacy_import")
     return len(planned)
