@@ -13,12 +13,15 @@ from contextlib import contextmanager, nullcontext
 
 import pytest
 
+from evals.helpers import ScriptedProvider, make_pu
 from pu.config import Settings
 from pu.core.interfaces.llm import LLMResponse, LLMUsage
+from pu.core.interfaces.tools import ToolContext
 from pu.db import connect
-from pu.evaluation.homes import assign_eval_homes, prepare_eval_home
+from pu.evaluation.homes import RELEASE_GATE_OWNER, assign_eval_homes, prepare_eval_home
+from pu.harness.audit import CompositeToolAuditSink, JsonlToolAuditSink
 from pu.identity.directory import provision_user
-from pu.identity.files import owner_root
+from pu.identity.files import database_local_owner, owner_root
 from pu.identity.principal import Principal, PrincipalKind
 from pu.identity.seam import InternalPrincipalSeam
 from pu.identity.worker_job import WorkerJob
@@ -27,7 +30,7 @@ from pu.ops.agentops import SLOEvaluator, prometheus_text
 from pu.ops.pricing import usage_summary
 from pu.ops.tracing import Tracer, load_trace_events
 from pu.persistence import SQLiteAgentEventRepository, SQLiteDatabase
-from pu.tools.registry import ToolRegistry
+from pu.tools.registry import Tool, ToolRegistry
 
 CANARY = "sk-phase5canarysecretxx"
 PROMPT = "phase5 prompt body alpha"
@@ -35,6 +38,12 @@ EMAIL = "phase5-inbox@fixture.example"
 REPORT = "phase5 report body alpha"
 BETA_TRACE = "beta-trace-body-phase5"
 ALPHA_TRACE = "alpha-trace-body-phase5"
+LOCAL_NOTE = "phase5-local-owner-tool-arg"
+OTHER_NOTE = "phase5-other-owner-tool-arg"
+UNSTAMPED_NOTE = "phase5-unstamped-tool-arg"
+LOCAL_SUMMARY = "11 chars"
+OTHER_SUMMARY = "23 chars"
+UNSTAMPED_SUMMARY = "99 chars"
 
 
 class _ParentSpan:
@@ -383,3 +392,117 @@ def test_ops06_metrics_do_not_embed_prompt_email_or_report(tmp_path):
         assert EMAIL not in document
         assert REPORT not in document
         assert BETA_TRACE not in document
+
+
+def _audit_context(principal: str) -> ToolContext:
+    return ToolContext(
+        actor="agent",
+        principal=principal,
+        scopes=frozenset({"audit:read"}),
+        capabilities=frozenset({"audit:read"}),
+    )
+
+
+def _visible_text(home, seam, principal) -> str:
+    if principal is None:
+        visible, _errors = load_trace_events(home)
+    else:
+        with _attached(seam, principal):
+            visible, _errors = load_trace_events(home)
+    return json.dumps(visible)
+
+
+def test_ops04_production_audit_sink_hides_the_other_owners_tool_args(tmp_path):
+    """Both readers go through the container's JsonlToolAuditSink, not a test double."""
+    home = tmp_path / "home"
+    app = make_pu(
+        home,
+        ScriptedProvider([]),
+        provider="openai",
+        model="gpt-4.1-mini",
+        otel_endpoint="",
+    )
+    try:
+        sinks = app.tool_harness.audit.sinks
+        assert isinstance(app.tool_harness.audit, CompositeToolAuditSink)
+        jsonl = next(sink for sink in sinks if isinstance(sink, JsonlToolAuditSink))
+        assert jsonl.path == home / "traces" / "tool-audit.jsonl"
+        conn = connect(home)
+        other = provision_user(conn)
+        conn.commit()
+        conn.close()
+        local_id = database_local_owner(home)
+        assert local_id and local_id != other.user_id
+        app.tools.register(
+            Tool(
+                name="phase5_audit_probe",
+                description="return the echo so the audit summary length is fixed",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "note": {"type": "string"},
+                        "echo": {"type": "string"},
+                    },
+                    "required": ["note", "echo"],
+                },
+                fn=lambda note, echo: echo,
+                capability="audit:read",
+                required_scope="audit:read",
+            )
+        )
+        local = app.tool_harness.execute(
+            "phase5_audit_probe",
+            {"note": LOCAL_NOTE, "echo": "L" * 11},
+            _audit_context(local_id),
+        )
+        with _attached(app.principal_seam, other):
+            foreign = app.tool_harness.execute(
+                "phase5_audit_probe",
+                {"note": OTHER_NOTE, "echo": "O" * 23},
+                _audit_context(other.user_id),
+            )
+        assert local.ok and foreign.ok
+        shared = home / "traces" / "tool-audit.jsonl"
+        other_file = owner_root(home, other.user_id) / "traces" / "tool-audit.jsonl"
+        poison = (
+            json.dumps({"arguments": {"note": UNSTAMPED_NOTE}, "result_summary": UNSTAMPED_SUMMARY})
+            + "\n"
+        )
+        for path in (shared, other_file):
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(poison)
+        shared_text = shared.read_text(encoding="utf-8")
+        other_text = other_file.read_text(encoding="utf-8")
+        assert LOCAL_NOTE in shared_text and OTHER_NOTE not in shared_text
+        assert local_id in shared_text
+        assert OTHER_NOTE in other_text and LOCAL_NOTE not in other_text
+        assert other.user_id in other_text
+        local_view = _visible_text(home, app.principal_seam, None)
+        other_view = _visible_text(home, app.principal_seam, other)
+        assert LOCAL_NOTE in local_view and LOCAL_SUMMARY in local_view
+        assert OTHER_NOTE not in local_view and OTHER_SUMMARY not in local_view
+        assert UNSTAMPED_NOTE not in local_view and UNSTAMPED_SUMMARY not in local_view
+        assert OTHER_NOTE in other_view and OTHER_SUMMARY in other_view
+        assert LOCAL_NOTE not in other_view and LOCAL_SUMMARY not in other_view
+        assert UNSTAMPED_NOTE not in other_view and UNSTAMPED_SUMMARY not in other_view
+    finally:
+        app.close()
+
+
+def test_ops05_release_gate_report_stays_in_the_eval_home(tmp_path, monkeypatch):
+    from pu.ops.release_gate import report
+
+    process = tmp_path / "process-home"
+    process.mkdir()
+    settings = _settings(process)
+    monkeypatch.setattr("pu.config.load_settings", lambda: settings)
+    report("pass", "skipped", {"deterministic": {"passed": 1, "failed": 0}})
+    assert not (process / "eval_report.json").exists()
+    assert not (process / "eval_runs.jsonl").exists()
+    scoped = process / "eval-homes" / RELEASE_GATE_OWNER
+    report_text = (scoped / "eval_report.json").read_text(encoding="utf-8")
+    assert "pass" in report_text
+    assert "skipped" in (scoped / "eval_runs.jsonl").read_text(encoding="utf-8")
+    owners = process / "owners"
+    assert not owners.is_dir() or not any(owners.rglob("eval_report.json"))
+    assert not owners.is_dir() or not any(owners.rglob("eval_runs.jsonl"))

@@ -6,7 +6,7 @@ One stdlib HTTP server reading the files PU already writes:
   loop + harness   traces/*.jsonl   (turns, gate decisions, tool calls, tokens)
   memory           state.db         (facts, episodes, chat log, consolidation)
   tools            state.db + calendar.ics + outbox/
-  eval             eval_report.json (written by `make gate`)
+  eval             eval-homes/release-gate/eval_report.json (written by `make gate`)
 
 The overview mirrors the architecture diagram — every box is clickable and
 opens that section's live data. The chat dock is a real gateway: type (or speak)
@@ -47,7 +47,13 @@ from pu.ops.browser_agent import agent_lock, dash_session, get_agent, maybe_rota
 from pu.ops.catalog import list_models
 from pu.ops.pricing import price_for, usage_summary
 from pu.ops.settings_api import apply_settings, pin_action, settings_info
-from pu.ops.tracing import TraceEncodingError, iter_trace_lines, load_trace_events, today_trace_path
+from pu.ops.tracing import (
+    TraceEncodingError,
+    _event_visible,
+    iter_trace_lines,
+    load_trace_events,
+    today_trace_path,
+)
 from pu.persistence import (
     SQLiteAgentEventRepository,
     SQLiteDatabase,
@@ -352,12 +358,12 @@ def collect() -> dict:
               for s in SkillLoader([*bundled_skill_dirs(), home / "skills"]).skills]
 
     eval_report = None
-    report_path = home / "eval_report.json"
-    if report_path.exists():
+    report_path = _gate_artifact(home, "eval_report.json")
+    if report_path.is_file():
         eval_report = json.loads(report_path.read_text(encoding="utf-8"))
 
     eval_history = []
-    hist_path = home / "eval_runs.jsonl"
+    hist_path = _gate_artifact(home, "eval_runs.jsonl")
     if hist_path.exists():
         for line in hist_path.read_text(encoding="utf-8").splitlines()[-20:]:
             try:
@@ -1276,6 +1282,16 @@ def memory_action(payload: dict) -> dict:
 
 
 
+def _gate_artifact(home: Path, name: str) -> Path:
+    """Gate report under the eval home, with a legacy process-home fallback."""
+    from pu.evaluation.homes import RELEASE_GATE_OWNER
+
+    scoped = Path(home) / "eval-homes" / RELEASE_GATE_OWNER / name
+    if scoped.is_file():
+        return scoped
+    return Path(home) / name
+
+
 def events_since(cursor):
     """New trace events past `cursor` (a line count in today's trace file).
     Both supported interactive surfaces — browser and CLI — append to this same file,
@@ -1303,12 +1319,8 @@ def events_since(cursor):
             event = json.loads(ln)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict):
-            continue
-        stamped = str(event.get("owner_user_id") or "")
-        if stamped and scope.owner_user_id and stamped != scope.owner_user_id:
-            continue
-        out.append(event)
+        if isinstance(event, dict) and _event_visible(event, scope):
+            out.append(event)
     return {"events": out, "cursor": len(lines)}
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 _SHARED = ".pu"
+RELEASE_GATE_OWNER = "release-gate"
 
 
 def assign_eval_homes(root: Path, owner_user_ids: list[str]) -> dict[str, Path]:

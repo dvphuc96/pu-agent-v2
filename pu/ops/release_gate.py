@@ -45,22 +45,22 @@ def report(deterministic: str, judge: str, suites: dict | None = None) -> None:
     from datetime import datetime
 
     from pu.config import load_settings
+    from pu.evaluation.homes import RELEASE_GATE_OWNER, prepare_eval_home
 
     settings = load_settings()
     settings.ensure_home()
+    # The verdict belongs to the eval home, not the shared process home.
+    home = prepare_eval_home(settings.home, RELEASE_GATE_OWNER)
     record = {
         "deterministic": deterministic,
         "judge": judge,
         "suites": suites or {},
         "ran_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
-    (settings.home / "eval_report.json").write_text(json.dumps(record), encoding="utf-8")
-    runs_path = settings.home / "eval_runs.jsonl"
+    (home / "eval_report.json").write_text(json.dumps(record), encoding="utf-8")
+    runs_path = home / "eval_runs.jsonl"
     with runs_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
-    from pu.identity.files import note_written
-
-    note_written(settings.home, runs_path)
 
 
 def main() -> None:

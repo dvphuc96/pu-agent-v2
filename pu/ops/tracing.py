@@ -281,11 +281,10 @@ def _token_count(value: object) -> int:
 
 
 def _event_visible(event: dict, scope) -> bool:
-    if scope.admin or scope.denied:
+    """Fail closed. A line with no matching owner_user_id is not shown."""
+    if scope.admin or scope.denied or not scope.owner_user_id:
         return False
     stamped = str(event.get("owner_user_id") or "")
-    if not stamped or not scope.owner_user_id:
-        return True
     return stamped == scope.owner_user_id
 
 

@@ -114,16 +114,46 @@ class JsonlToolAuditSink(ToolAuditSink):
         self._lock = threading.Lock()
 
     def append(self, record: ToolAuditRecord) -> None:
-        payload = asdict(record)
-        payload = redact(payload)
-        with self._lock, self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
-        if self.path.parent.name == "traces":
-            from pu.identity.files import note_written
+        payload = redact(asdict(record))
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        path = self._destination(payload)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False, default=str) + "\n"
+        with self._lock, path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
 
-            note_written(self.path.parent.parent, self.path)
+    def _production_home(self) -> Path | None:
+        """Container wires one sink at ``home/traces/tool-audit.jsonl``.
 
+        An explicit path such as a unit-test ``audit.jsonl`` is not that sink
+        and keeps writing exactly where it was constructed.
+        """
+        if self.path.name != "tool-audit.jsonl" or self.path.parent.name != "traces":
+            return None
+        return self.path.parent.parent
 
+    def _destination(self, payload: dict) -> Path | None:
+        """Per-owner tool audit. Never copy one owner's file into another root.
+
+        The database-local owner still uses ``home/traces/tool-audit.jsonl``.
+        Every line is stamped with the principal's ``owner_user_id``. A missing
+        owner, a denied worker grant, or a platform admin writes nothing here.
+        """
+        home = self._production_home()
+        if home is None:
+            return self.path
+        from pu.ops.telemetry import telemetry_scope, trace_dir_for
+
+        scope = telemetry_scope(home)
+        if scope.denied or scope.admin or not scope.owner_user_id:
+            return None
+        payload["owner_user_id"] = scope.owner_user_id
+        if scope.isolated:
+            return trace_dir_for(home, scope) / self.path.name
+        return self.path
 
 
 class CompositeToolAuditSink(ToolAuditSink):
