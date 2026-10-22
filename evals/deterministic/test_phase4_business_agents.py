@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
+from evals.helpers import admitted_judge_contract
 from pu.agents.email import EmailAgent
-from pu.agents.isolation import ForeignResource
+from pu.agents.isolation import ForeignResource, refuse_before_provider
 from pu.agents.scoped import ScopedAgent
 from pu.config import Settings
 from pu.core.interfaces.llm import LLMResponse, LLMUsage
@@ -532,19 +535,39 @@ def test_provider_paths_admit_before_the_model(tmp_path, monkeypatch):
     provider = CountingProvider()
     report, deterministic = _judge_report()
     judge = LLMReportJudge(provider, "offline")
-    assert judge.evaluate(report, deterministic_result=deterministic) is not None
+    score = judge.evaluate(
+        report,
+        deterministic_result=deterministic,
+        contract=admitted_judge_contract(),
+    )
+    assert score is not None
     assert len(provider.requests) == 1
+
+    closed = CountingProvider()
+    with pytest.raises(AgentRequestRejected):
+        LLMReportJudge(closed, "offline").evaluate(
+            report, deterministic_result=deterministic
+        )
+    assert closed.requests == []
 
     admin = Principal(PrincipalKind.PLATFORM_ADMIN, user_a.user_id, user_a.workspace_id)
     blocked = CountingProvider()
-    with _as(seam, admin):
-        assert (
-            LLMReportJudge(blocked, "offline").evaluate(
-                report, deterministic_result=deterministic
-            )
-            is None
+    with _as(seam, admin), pytest.raises(AgentRequestRejected):
+        LLMReportJudge(blocked, "offline").evaluate(
+            report, deterministic_result=deterministic
         )
     assert blocked.requests == []
+
+    class Denied:
+        def complete(self, request, on_text=None):
+            raise PermissionError("denied")
+
+    with pytest.raises(PermissionError, match="denied"):
+        LLMReportJudge(Denied(), "offline").evaluate(
+            report,
+            deterministic_result=deterministic,
+            contract=admitted_judge_contract(),
+        )
 
     seen = []
 
@@ -587,3 +610,181 @@ def test_scoped_agent_without_ids_still_reaches_runtime():
     result = agent.respond("hello", metadata={"source": "unit"})
     assert result.reply == "ok"
     assert provider_calls == ["hello"]
+
+
+def test_research_workflow_admits_the_judge_and_refuses_without_principal(
+    tmp_path, monkeypatch
+):
+    """The production research path admits the workflow owner before the judge.
+
+    ``attached_principal()`` stays unset. The same judge refuses, with zero
+    provider calls, when that contract is missing.
+    """
+    from evals.deterministic.test_phase8_report_evaluation import (
+        JudgeProvider,
+        Phase8Runtime,
+    )
+    from pu.core.container import create_application
+    from pu.evaluation.report import admit as real_admit
+    from pu.identity.directory import current_principal
+    from pu.identity.seam import attached_principal
+
+    provider = JudgeProvider()
+    order: list[tuple[str, str]] = []
+    original = provider.complete
+
+    def wrapped(request, on_text=None):
+        order.append(("provider", request.model))
+        return original(request, on_text)
+
+    provider.complete = wrapped
+
+    def spy(request):
+        assert attached_principal() is None
+        order.append(("admit", request.owner_user_id))
+        return real_admit(request)
+
+    monkeypatch.setattr("pu.evaluation.report.admit", spy)
+    app = create_application(
+        settings=Settings(
+            home=tmp_path,
+            api_key="offline",
+            gmail=False,
+            graph_workflows=False,
+            model="",
+            report_judge_model="judge-fixture",
+            report_judge_enabled=True,
+        ),
+        llm_provider=provider,
+        agent_runtime=Phase8Runtime(),
+    )
+    result = app.run_research_workflow("Prepare Acme")
+    owner = current_principal(app.conn).user_id
+    admits = [item for item in order if item[0] == "admit"]
+    providers = [item for item in order if item[0] == "provider"]
+    assert admits and admits[0][1] == owner
+    assert providers and providers[0][1] == "judge-fixture"
+    assert order.index(admits[0]) < order.index(providers[0])
+    assert result.evaluation.judge is not None
+    assert result.evaluation.judge.score == 8.5
+
+    blocked = CountingProvider()
+    with pytest.raises(AgentRequestRejected):
+        LLMReportJudge(blocked, "offline").evaluate(result.structured_report)
+    assert blocked.requests == []
+
+    harness_provider = CountingProvider()
+    app.evaluation_harness.judge = LLMReportJudge(harness_provider, "offline")
+    with pytest.raises(AgentRequestRejected):
+        app.evaluation_harness.evaluate(result.structured_report, run_judge=True)
+    assert harness_provider.requests == []
+
+
+def test_unknown_id_and_database_error_are_refusals(tmp_path):
+    home, _seam, user_a, _user_b = _open(tmp_path)
+    conn = connect(home)
+    try:
+        conn.execute(
+            """INSERT INTO crm_emails(
+                   gmail_id, thread_id, subject, internal_date, owner_user_id
+               ) VALUES(?,?,?,?,?)""",
+            (
+                "seed-owned",
+                "thread-owned",
+                "Seed",
+                "2026-10-22T00:00:00+00:00",
+                user_a.user_id,
+            ),
+        )
+        conn.commit()
+        with pytest.raises(ForeignResource) as unknown:
+            refuse_before_provider(
+                conn, thread_id="thread-missing", owner=user_a.user_id
+            )
+        assert unknown.value.code == "thread_denied"
+        refuse_before_provider(conn, thread_id="thread-owned", owner=user_a.user_id)
+    finally:
+        conn.close()
+
+    class Broken:
+        def execute(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("fixture")
+
+    with pytest.raises(ForeignResource) as broken:
+        refuse_before_provider(
+            Broken(), thread_id="thread-owned", owner=user_a.user_id
+        )
+    assert broken.value.code == "thread_denied"
+
+
+def test_hidden_postgres_row_is_refused_before_provider():
+    """A foreign id hidden by pu_app row level security is a refusal.
+
+    The role cannot see the other owner's row, so the lookup returns nothing.
+    That absence is a denial, and the caller's own row is still allowed.
+    """
+    dsn = os.environ.get("PU_POSTGRES_DSN", "").strip()
+    if not dsn:
+        pytest.skip("PostgreSQL unavailable: set PU_POSTGRES_DSN")
+    try:
+        import psycopg
+        from psycopg import conninfo
+    except ImportError as exc:
+        pytest.skip(f"PostgreSQL unavailable ({exc})")
+    try:
+        admin = psycopg.connect(dsn, connect_timeout=3)
+    except psycopg.Error as exc:
+        pytest.skip(f"PostgreSQL unavailable ({exc})")
+    app = None
+    try:
+        from pu.persistence.postgres_schema import install, set_owner
+
+        install(admin, password="pu-phase1-fixture", replace_existing=True)
+        user_a = str(uuid.uuid4())
+        user_b = str(uuid.uuid4())
+        rows = (
+            (user_a, "ws-fixture-a", "report-fixture-a"),
+            (user_b, "ws-fixture-b", "report-fixture-b"),
+        )
+        for user, workspace, report in rows:
+            admin.execute("INSERT INTO users(id) VALUES (%s)", (user,))
+            admin.execute(
+                """INSERT INTO research_workspaces(id, owner_user_id, company)
+                   VALUES (%s, %s, %s)""",
+                (workspace, user, "fixture"),
+            )
+            admin.execute(
+                """INSERT INTO workspace_reports(report_id, workspace_id, owner_user_id)
+                   VALUES (%s, %s, %s)""",
+                (report, workspace, user),
+            )
+        admin.commit()
+        params = conninfo.conninfo_to_dict(dsn)
+        host = params.get("host") or "127.0.0.1"
+        if str(host).startswith("/"):
+            host = "127.0.0.1"
+        app = psycopg.connect(
+            host=host,
+            port=params.get("port") or 5432,
+            dbname=params.get("dbname") or admin.info.dbname,
+            user="pu_app",
+            password="pu-phase1-fixture",
+            connect_timeout=3,
+        )
+        with app.transaction():
+            set_owner(app, user_a)
+            with pytest.raises(ForeignResource) as hidden_workspace:
+                refuse_before_provider(app, workspace_id="ws-fixture-b", owner=user_a)
+            assert hidden_workspace.value.code == "workspace_denied"
+            with pytest.raises(ForeignResource) as hidden_report:
+                refuse_before_provider(app, report_id="report-fixture-b", owner=user_a)
+            assert hidden_report.value.code == "report_denied"
+            with pytest.raises(ForeignResource) as missing:
+                refuse_before_provider(app, workspace_id="ws-not-stored", owner=user_a)
+            assert missing.value.code == "workspace_denied"
+            refuse_before_provider(app, workspace_id="ws-fixture-a", owner=user_a)
+            refuse_before_provider(app, report_id="report-fixture-a", owner=user_a)
+    finally:
+        admin.close()
+        if app is not None:
+            app.close()

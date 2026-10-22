@@ -11,6 +11,7 @@ from zipfile import ZipFile
 
 from evals.deterministic.test_report_gate_regressions import FakeJudgeProvider, _judge_payload
 from evals.deterministic.test_report_quality_v2 import _materialize
+from evals.helpers import admitted_judge_contract
 from pu.core.interfaces.agents import AgentResult
 from pu.evaluation.report import (
     DefaultEvaluationHarness,
@@ -44,7 +45,7 @@ def _compact():
 
 
 def _evaluate(report):
-    return DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(_judge_payload(9)), "offline")).evaluate(report)
+    return DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(_judge_payload(9)), "offline")).evaluate(report, contract=admitted_judge_contract())
 
 
 def test_self_reported_contact_and_unknown_details_do_not_become_fully_verified():
@@ -58,7 +59,7 @@ def test_self_reported_contact_and_unknown_details_do_not_become_fully_verified(
     ], {s.id for s in report.sources})
     judge = json.loads(_judge_payload(9))
     judge["preparation_verdicts"] = [{"key": "representative_authority", "contains_answer": True, "scope_matches": True}]
-    result = DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(json.dumps(judge)), "offline")).evaluate(report)
+    result = DefaultEvaluationHarness(judge=LLMReportJudge(FakeJudgeProvider(json.dumps(judge)), "offline")).evaluate(report, contract=admitted_judge_contract())
     assert result.release_allowed
     readiness = result.status_details["readiness"]
     assert readiness["discovery"] == "ready_with_limits"

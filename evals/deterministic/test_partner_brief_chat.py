@@ -86,6 +86,11 @@ def fake_mail(monkeypatch, rows, *, thread_failure=False):
     calls = []
     def search(self, query, max_results=50):
         calls.append(("search", query))
+        # The real reader stores the messages it just fetched before anyone
+        # classifies them. An id that is still invisible stays a refusal.
+        from pu.tools.gmail import upsert_messages
+
+        upsert_messages(self.conn, rows)
         return json.dumps({"fresh": True, "messages": rows, "limited": False, "start": "2026-10-12T07:08:00+00:00", "end": datetime.now(UTC).isoformat()})
     def thread(self, thread_id, max_messages=30):
         calls.append(("thread", thread_id))

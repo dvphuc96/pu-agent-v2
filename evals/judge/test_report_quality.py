@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from evals.helpers import HAS_KEY
+from evals.helpers import HAS_KEY, admitted_judge_contract
 from pu.config import load_settings
 from pu.evaluation import LLMReportJudge
 from pu.providers.llm.catalog import resolve_provider_settings
@@ -35,6 +35,6 @@ def test_grounded_report_clears_qualitative_judge_floor():
             ReportSource(id="S2", stage="web", source_type="web", title="Acme news", excerpt="Acme announced Product X.", url="https://acme.example/news", domain="acme.example", external=True),
         ],
     )
-    result = judge.evaluate(report)
+    result = judge.evaluate(report, contract=admitted_judge_contract())
     assert result is not None
     assert result.score >= 5.0, result.reason

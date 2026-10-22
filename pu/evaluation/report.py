@@ -25,6 +25,7 @@ from pu.evaluation.preparation import (
     readiness_score,
     readiness_summary,
 )
+from pu.identity.contract import AgentRequest, AgentRequestRejected, admit
 from pu.reporting import numeric_evidence
 from pu.reporting.citations import canonical_public_url
 from pu.reporting.models import INFORMATION_FIELDS, REPORT_QUALITY_POLICY_VERSION, StructuredReport
@@ -595,6 +596,22 @@ class DeterministicReportEvaluator:
         return issues
 
 
+def _admit_judge(contract: AgentRequest | None) -> AgentRequest:
+    """Admit the workflow owner. Refuse before the provider when nobody owns the call."""
+    from pu.identity.seam import attached_principal
+
+    if contract is None:
+        attached = attached_principal()
+        if attached is None:
+            raise AgentRequestRejected("request is missing principal or owner")
+        contract = AgentRequest(
+            principal=attached,
+            owner_user_id=attached.user_id,
+            workspace_id=attached.workspace_id,
+        )
+    return admit(contract)
+
+
 class LLMReportJudge:
     """Optional qualitative judge. It never overrides deterministic failures."""
 
@@ -602,9 +619,18 @@ class LLMReportJudge:
         self.provider = provider
         self.model = model
 
-    def evaluate(self, report: StructuredReport, *, deterministic_result: ReportEvaluation | None = None) -> JudgeScore | None:
+    def evaluate(
+        self,
+        report: StructuredReport,
+        *,
+        deterministic_result: ReportEvaluation | None = None,
+        contract: AgentRequest | None = None,
+    ) -> JudgeScore | None:
         from pu.reporting.evidence import _relevant_excerpt
 
+        # The workflow owner is admitted before any provider call. A missing
+        # principal fails closed: the model never sees the report.
+        _admit_judge(contract)
         deterministic = deterministic_result if deterministic_result is not None else DeterministicReportEvaluator().evaluate(report)
         pending = deterministic.status_details
         view = report.metadata.get("reading_view") or {}
@@ -642,18 +668,6 @@ class LLMReportJudge:
             + json.dumps(compact, ensure_ascii=False)
         )
         try:
-            from pu.identity.contract import AgentRequest, admit
-            from pu.identity.seam import attached_principal
-
-            attached = attached_principal()
-            if attached is not None:
-                admit(
-                    AgentRequest(
-                        principal=attached,
-                        owner_user_id=attached.user_id,
-                        workspace_id=attached.workspace_id,
-                    )
-                )
             response = self.provider.complete(LLMRequest(model=self.model, max_tokens=4000, messages=[{"role": "user", "content": prompt}]))
             from pu.reporting.evidence import StructuredReportBuilder
             data = StructuredReportBuilder._parse_json(response.text)
@@ -669,6 +683,8 @@ class LLMReportJudge:
             return JudgeScore(score=max(0.0, min(10.0, score)), reason=str(data.get("reason") or "")[:300],
                               criteria={key: max(0.0, min(10.0, value)) for key, value in criteria.items()}, model=self.model,
                               claim_verdicts=claim_verdicts, field_verdicts=field_verdicts, preparation_verdicts=preparation_verdicts)
+        except PermissionError:
+            raise
         except Exception:
             return None
 
@@ -795,11 +811,19 @@ class DefaultEvaluationHarness:
                 if not any(field in warning for field in resolved_fields)
             ]
 
-    def evaluate(self, report: StructuredReport, *, run_judge: bool = False) -> ReportEvaluation:
+    def evaluate(
+        self,
+        report: StructuredReport,
+        *,
+        run_judge: bool = False,
+        contract: AgentRequest | None = None,
+    ) -> ReportEvaluation:
         result = self.deterministic.evaluate(report)
         required = result.evaluated or bool(report.metadata.get("require_semantic_review"))
         if (run_judge or required) and self.judge is not None:
-            result.judge = self.judge.evaluate(report, deterministic_result=result)
+            result.judge = self.judge.evaluate(
+                report, deterministic_result=result, contract=contract
+            )
         if required:
             if result.judge is not None:
                 self._apply_pending_verdicts(result)

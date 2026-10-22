@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from evals.helpers import ScriptedProvider
+from evals.helpers import ScriptedProvider, admitted_judge_contract
 from pu.config import Settings
 from pu.core.container import create_application
 from pu.core.interfaces.agents import AgentResult
@@ -127,7 +127,7 @@ def test_llm_judge_is_provider_neutral_and_cannot_override_deterministic_failure
     )
     report = strong_report()
     report.claims.append(ReportClaim(id="C4", text="No evidence", section="company"))
-    result = harness.evaluate(report, run_judge=True)
+    result = harness.evaluate(report, run_judge=True, contract=admitted_judge_contract())
     assert result.judge.score == 8.5
     assert result.gate_status == "fail"
     assert result.release_allowed is False

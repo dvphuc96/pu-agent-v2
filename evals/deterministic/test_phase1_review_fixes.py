@@ -452,22 +452,18 @@ def test_install_requires_a_password_and_refuses_to_drop_existing_rows():
 
 
 # The briefing worker must see every due owner, then attach that owner per job.
-# The business-agent probe reads only owner_user_id so it can refuse another
-# person's id before a provider call. It does not return that person's content.
-# Mentioning the column is not a filter; these statements are the allowlist.
+# Mentioning the column is not a filter; these two statements are the allowlist.
 CROSS_OWNER_ALLOWLIST = (
     ("pu/ops/briefing.py", "SELECT DISTINCT owner_user_id FROM briefing_jobs"),
     ("pu/ops/briefing.py", "SELECT owner_user_id FROM briefing_state"),
-    ("pu/agents/isolation.py", "SELECT owner_user_id FROM crm_emails WHERE thread_id=?"),
-    ("pu/agents/isolation.py", "SELECT owner_user_id FROM workspace_reports WHERE report_id=?"),
-    ("pu/agents/isolation.py", "SELECT owner_user_id FROM research_workspaces WHERE id=?"),
 )
 
 
 def _has_owner_filter(statement: str) -> bool:
     if "pu_current_owner" in statement:
         return True
-    return re.search(r"(?i)\bowner_user_id\s*=\s*\?", statement) is not None
+    # ``?`` is SQLite. ``%s`` is the same bound owner predicate on PostgreSQL.
+    return re.search(r"(?i)\bowner_user_id\s*=\s*(\?|%s)", statement) is not None
 
 
 def _cross_owner_allowed(path: Path, statement: str) -> str:

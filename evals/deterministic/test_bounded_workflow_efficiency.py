@@ -82,7 +82,7 @@ class PassingHarness:
     def __init__(self):
         self.reports = []
 
-    def evaluate(self, report, *, run_judge=False):
+    def evaluate(self, report, *, run_judge=False, contract=None):
         self.reports.append(report)
         return PassingEvaluation()
 

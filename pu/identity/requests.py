@@ -25,7 +25,12 @@ def discard_client_owner(payload: dict) -> dict:
 
 
 def coerce_workspace_id(conn: sqlite3.Connection, requested: str | None) -> str:
-    """Map a client workspace id onto the current principal's own workspace."""
+    """Map a client workspace id onto the current principal's own workspace.
+
+    MU-12: an explicit id this owner does not hold is replaced by their
+    personal workspace. It is not a 403. Agent and provider calls use
+    ``refuse_before_provider`` and reject that same id before the model.
+    """
     ensure_identity_tables(conn)
     principal = current_principal(conn)
     requested = (requested or "").strip()

@@ -22,6 +22,10 @@ class ForeignResource(PermissionError):
         super().__init__(code)
 
 
+def _postgres(conn: object) -> bool:
+    return type(conn).__module__.startswith("psycopg")
+
+
 def foreign_code(
     conn: sqlite3.Connection,
     *,
@@ -31,47 +35,38 @@ def foreign_code(
     workspace_id: str = "",
     owner: str = "",
 ) -> str | None:
-    """Return a denial code when an id is stored for a different owner.
+    """Return a denial code unless this owner can see the id.
 
-    An id this owner holds, or an id that is not stored, is not a denial.
-    The caller still has to refuse a stored foreign id before any provider.
-    ``owner`` overrides the attached principal for a worker job.
+    A foreign row hidden by row level security looks the same as a missing
+    row. Both are refusals, and a database error is a refusal too. The
+    error carries no private content. ``owner`` overrides the attached
+    principal for a worker job.
     """
     from pu.identity.directory import current_principal
 
     owner = owner or current_principal(conn).user_id
+    mark = "%s" if _postgres(conn) else "?"
     checks = (
-        (
-            "connection_denied",
-            connection_id,
-            "SELECT owner_user_id FROM oauth_connections WHERE id=?",
-        ),
-        (
-            "thread_denied",
-            thread_id,
-            "SELECT owner_user_id FROM crm_emails WHERE thread_id=?",
-        ),
-        (
-            "report_denied",
-            report_id,
-            "SELECT owner_user_id FROM workspace_reports WHERE report_id=?",
-        ),
-        (
-            "workspace_denied",
-            workspace_id,
-            "SELECT owner_user_id FROM research_workspaces WHERE id=?",
-        ),
+        ("connection_denied", connection_id, "oauth_connections", "id"),
+        ("thread_denied", thread_id, "crm_emails", "thread_id"),
+        ("report_denied", report_id, "workspace_reports", "report_id"),
+        ("workspace_denied", workspace_id, "research_workspaces", "id"),
     )
-    for code, value, sql in checks:
+    for code, value, table, column in checks:
         token = str(value or "").strip()
         if not token:
             continue
+        sql = (
+            f"SELECT 1 FROM {table} WHERE {column}={mark} "
+            f"AND owner_user_id={mark}"
+        )
         try:
-            rows = conn.execute(sql, (token,)).fetchall()
-        except sqlite3.Error:
-            continue
-        owners = {row[0] for row in rows if row[0]}
-        if owners and owner not in owners:
+            row = conn.execute(sql, (token, owner)).fetchone()
+        except PermissionError:
+            raise
+        except Exception:
+            return code
+        if row is None:
             return code
     return None
 

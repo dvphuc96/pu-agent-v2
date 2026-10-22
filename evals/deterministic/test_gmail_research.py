@@ -69,6 +69,12 @@ def test_thread_retains_sent_reply_and_uses_newest_messages_with_limit_warning(t
     first, reply = _api_message(id="first", date_ms="1700000000000"), _api_message(id="reply", date_ms="1800000000000")
     reply["labelIds"] = ["SENT"]
     instance = reader(tmp_path, monkeypatch, FakeGmail({}, {}, thread={"messages": [reply, first]}))
+    instance.conn.execute(
+        """INSERT INTO crm_emails(gmail_id, thread_id, subject, internal_date)
+           VALUES(?,?,?,?)""",
+        ("seed-thread1", "thread1", "Seed", "2026-10-22T00:00:00+00:00"),
+    )
+    instance.conn.commit()
     result = json.loads(instance.thread("thread1", 1))
     assert result["limited"] and result["messages"][0]["gmail_id"] == "reply"
     assert result["messages"][0]["sent"] is True

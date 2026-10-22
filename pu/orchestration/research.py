@@ -631,7 +631,9 @@ class ResearchWorkflowOrchestrator:
 
             with performance.measure("evaluation"):
                 evaluation = self.evaluation_harness.evaluate(
-                    structured_report, run_judge=self.run_judge
+                    structured_report,
+                    run_judge=self.run_judge,
+                    contract=_agent_request(request),
                 )
             semantic_review = getattr(evaluation, "status_details", {}).get("semantic_review")
             from pu.reporting.repair import plan_repair, select_repair_candidate
@@ -681,7 +683,11 @@ class ResearchWorkflowOrchestrator:
                 if candidate is not None and not needs_repair(candidate):
                     finalize_context(candidate)
                     with performance.measure("evaluation_repair"):
-                        candidate_evaluation = self.evaluation_harness.evaluate(candidate, run_judge=self.run_judge)
+                        candidate_evaluation = self.evaluation_harness.evaluate(
+                            candidate,
+                            run_judge=self.run_judge,
+                            contract=_agent_request(request),
+                        )
                     selection = select_repair_candidate(structured_report, evaluation, candidate, candidate_evaluation)
                     accepted = selection['accepted']
                     if accepted:
