@@ -122,6 +122,8 @@ class PU(BaseAgent):
             if result is None and self.settings.graph_workflows:
                 try:
                     result = self._respond_via_graph(user_message, notify, stream)
+                except PermissionError:
+                    raise
                 except Exception as exc:
                     notify("graph_end", {
                         "workflow": "triage", "ms": 0, "steps": 0, "path": [], "error": repr(exc),
@@ -288,14 +290,20 @@ class PU(BaseAgent):
         )
 
     def _respond_via_graph(self, user_message: str, notify, stream: bool) -> AgentResult | None:
+        from pu.core.interfaces.orchestration import ResearchWorkflowRequest
         from pu.graph.workflows.triage import (
             QUICK_REPLY_PROMPT,
             build_triage_graph,
             classify_message,
             todays_events,
         )
+        from pu.identity.contract import admit, request_for_connection
+
+        contract = request_for_connection(self.conn, scopes=self.tools.scopes())
+        workflow_id = str(uuid.uuid4())
 
         def quick_reply(state: dict) -> str:
+            admit(contract)
             prompt = QUICK_REPLY_PROMPT.format(
                 calendar=state.get("calendar", ""), message=state["message"]
             )
@@ -315,14 +323,32 @@ class PU(BaseAgent):
             return response.text
 
         graph = build_triage_graph(
-            classify_fn=lambda m: classify_message(self.llm_provider, self.settings.small_model, m),
+            classify_fn=lambda m: classify_message(
+                self.llm_provider, self.settings.small_model, m, contract
+            ),
             calendar_fn=lambda: todays_events(self.settings.home),
             quick_fn=quick_reply,
             full_fn=lambda state: self._run_full_turn(
                 state["message"], state.get("_notify", notify), stream
             ),
         )
-        state = self.workflow_engine.run(graph, {"message": user_message}, observer=notify)
+        state = self.workflow_engine.run(
+            graph,
+            {
+                "message": user_message,
+                "_workflow_run_id": workflow_id,
+                "_request": ResearchWorkflowRequest(
+                    prompt=user_message,
+                    principal=contract.principal.user_id,
+                    owner_user_id=contract.owner_user_id,
+                    workflow_id=workflow_id,
+                    agent_scopes=tuple(sorted(contract.agent_scopes)),
+                    tool_scopes=tuple(sorted(contract.tool_scopes)),
+                    approval_status=contract.approval_status,
+                ),
+            },
+            observer=notify,
+        )
         if isinstance(state.get("result"), LoopResult):
             return state["result"]
         if state.get("reply"):

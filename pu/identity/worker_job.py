@@ -130,7 +130,10 @@ class WorkerJob:
 def _db_lease_expired(grant: JobGrant) -> bool:
     if not grant.db_path:
         return False
-    conn = sqlite3.connect(grant.db_path, timeout=1)
+    try:
+        conn = sqlite3.connect(grant.db_path, timeout=1)
+    except sqlite3.Error:
+        return True
     try:
         row = conn.execute(
             """SELECT value FROM briefing_state
@@ -138,7 +141,7 @@ def _db_lease_expired(grant: JobGrant) -> bool:
             (grant.owner_user_id,),
         ).fetchone()
     except sqlite3.Error:
-        return False
+        return True
     finally:
         conn.close()
     if row is None or row[0] in (None, ""):

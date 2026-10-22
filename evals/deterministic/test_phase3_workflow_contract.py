@@ -20,14 +20,17 @@ from pu.core.container import create_application
 from pu.core.interfaces.agents import AgentResult, AgentRunRequest
 from pu.core.interfaces.events import AgentEvent
 from pu.core.interfaces.orchestration import ResearchWorkflowRequest
+from pu.core.interfaces.tools import ToolContext
 from pu.db import connect
-from pu.graph import END, START, Graph, Node
+from pu.graph import END, START, Graph, Node, run_graph
+from pu.graph.nodes import agent_node, llm_node
 from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolAuditSink
 from pu.identity.contract import AgentRequest, AgentRequestRejected, invoke_tool
 from pu.identity.directory import provision_user
 from pu.identity.principal import Principal, PrincipalKind
 from pu.identity.seam import InternalPrincipalSeam
-from pu.identity.worker_job import WorkerJob
+from pu.identity.worker_job import WorkerJob, owner_from_grant
+from pu.ops.briefing import BriefingService
 from pu.orchestration.research import WorkflowExecutionError
 from pu.persistence import SQLiteAgentEventRepository, SQLiteDatabase, SQLiteWorkflowRepository
 from pu.runtime import DefaultAgentRuntime
@@ -286,13 +289,168 @@ def test_p3_04_worker_loses_owner_after_job_end_or_lease_expiry(tmp_path):
 
 def test_production_modules_do_not_default_local_user():
     root = Path(__file__).resolve().parents[2] / "pu"
+    # legacy_import maps the old label. contract.py names it only to reject it.
+    allowed = {"identity/legacy_import.py", "identity/contract.py"}
     offenders = []
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         if "local-user" not in text and "graph-local-user" not in text:
             continue
         relative = path.relative_to(root).as_posix()
-        if relative == "identity/legacy_import.py" and "graph-local-user" not in text:
+        if relative in allowed:
             continue
         offenders.append(relative)
     assert offenders == []
+
+
+def test_p3_01_graph_chat_makes_no_provider_call_without_an_admitted_principal(tmp_path):
+    provider = ScriptedProvider([response([text_block("should-not-run")])])
+    app = create_application(
+        settings=Settings(home=tmp_path, api_key="offline", gmail=False, graph_workflows=True),
+        llm_provider=provider,
+    )
+    job = WorkerJob.open(
+        owner_user_id=str(uuid.uuid4()),
+        workspace_id=str(uuid.uuid4()),
+        expires_at=time.time() + 120,
+    )
+    job.finish()
+    try:
+        with pytest.raises(PermissionError):
+            app.respond("thanks")
+    finally:
+        job.close()
+    assert provider.requests == []
+    app.close()
+
+
+def test_p3_01_llm_node_admits_before_the_provider():
+    provider = ScriptedProvider([response([text_block("should-not-run")])])
+    rejected = llm_node(
+        "classify",
+        "Message: {message}",
+        "route",
+        provider=provider,
+        model="small-model",
+        request=AgentRequest(principal=None),
+    )
+    with pytest.raises(AgentRequestRejected):
+        rejected.fn({"message": "thanks"})
+    assert provider.requests == []
+
+    user_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    admitted = AgentRequest(
+        principal=Principal(PrincipalKind.USER, user_id, workspace_id),
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    allowed = ScriptedProvider([response([text_block("quick")])])
+    node = llm_node(
+        "classify",
+        "Message: {message}",
+        "route",
+        provider=allowed,
+        model="small-model",
+        request=admitted,
+    )
+    assert node.fn({"message": "thanks"}) == {"route": "quick"}
+    assert len(allowed.requests) == 1
+
+
+def test_p3_01_string_principal_does_not_reach_the_model():
+    provider = ScriptedProvider([
+        response([text_block("should-not-run")]),
+        response([text_block("should-not-run")]),
+    ])
+    registry = ToolRegistry()
+    harness = DefaultToolHarness(registry, DefaultSecurityHarness(), InMemoryToolAuditSink())
+    runtime = DefaultAgentRuntime(provider, harness)
+    with pytest.raises(AgentRequestRejected):
+        runtime.run(AgentRunRequest(
+            model="test",
+            system="test",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=registry,
+            tool_context=ToolContext(principal="local-user"),
+        ))
+    node = agent_node(
+        "full_agent",
+        out_key="result",
+        provider=provider,
+        model="test",
+        system="test",
+        tools=registry,
+        tool_context=ToolContext(principal="local-user"),
+    )
+    graph = Graph("string-principal")
+    graph.add_node(node)
+    graph.add_edge(START, node.name)
+    graph.add_edge(node.name, END)
+    state = run_graph(graph, {"message": "hello"})
+    assert provider.requests == []
+    assert "full_agent" in state["errors"]
+
+
+def test_lease_read_error_fails_closed(tmp_path):
+    job = WorkerJob.open(
+        owner_user_id=str(uuid.uuid4()),
+        workspace_id=str(uuid.uuid4()),
+        expires_at=time.time() + 120,
+        db_path=str(tmp_path),
+        watch_db_lease=True,
+    )
+    try:
+        with pytest.raises(PermissionError) as err:
+            owner_from_grant()
+        assert str(err.value) == "worker job ended or lease expired"
+    finally:
+        job.close()
+
+
+def test_briefing_worker_does_not_read_while_lease_is_held_or_expired(tmp_path):
+    home, conn, seam, user_a, _user_b = _open(tmp_path)
+    workflows = SQLiteWorkflowRepository(SQLiteDatabase.from_home(home))
+    with _as(seam, user_a):
+        workflows.create("wf-a", ResearchWorkflowRequest(prompt=SECRET))
+        workflows.save_checkpoint("wf-a", "email", AgentResult(reply=SECRET))
+        conn.execute(
+            """INSERT INTO briefing_state(key, value, owner_user_id)
+               VALUES('lease_owner', 'other-process', ?)""",
+            (user_a.user_id,),
+        )
+        conn.execute(
+            """INSERT INTO briefing_state(key, value, owner_user_id)
+               VALUES('lease_until', ?, ?)""",
+            (str(int(time.time() + 120)), user_a.user_id),
+        )
+        conn.commit()
+    service = BriefingService(home)
+    seen: list[str] = []
+
+    def read_secret():
+        seen.append(workflows.checkpoints("wf-a")["email"].result.reply)
+
+    assert service._run_as_owner(user_a.user_id, read_secret) is None
+    assert seen == []
+
+    with _as(seam, user_a):
+        conn.execute(
+            """UPDATE briefing_state SET value=?
+               WHERE key='lease_until' AND owner_user_id=?""",
+            (str(int(time.time() - 10)), user_a.user_id),
+        )
+        conn.commit()
+
+    def read_after_claim():
+        with service.repo.database.connection() as owned:
+            row = owned.execute(
+                """SELECT value FROM briefing_state
+                   WHERE key='lease_until' AND owner_user_id = pu_current_owner()"""
+            ).fetchone()
+        assert float(row[0]) > time.time()
+        seen.append(workflows.checkpoints("wf-a")["email"].result.reply)
+
+    service._run_as_owner(user_a.user_id, read_after_claim)
+    assert seen == [SECRET]
+    conn.close()

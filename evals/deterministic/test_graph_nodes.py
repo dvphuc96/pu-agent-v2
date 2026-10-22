@@ -6,11 +6,27 @@ with its inner llm/tool events surfacing at the outer observer tagged node=.
 
 from __future__ import annotations
 
+import uuid
+
 from evals.helpers import ScriptedProvider, response, text_block, tool_block
-from pu.core.interfaces.tools import ToolContext
 from pu.graph import END, START, Graph, run_graph
 from pu.graph.nodes import agent_node, llm_node, tool_node
+from pu.identity.contract import AgentRequest, admit, tool_context_from_request
+from pu.identity.principal import Principal, PrincipalKind
 from pu.tools.registry import Tool, ToolRegistry
+
+
+def _admitted(**scopes: object) -> AgentRequest:
+    user_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    scope_values = frozenset(scopes.get("scopes") or ())
+    return admit(AgentRequest(
+        principal=Principal(PrincipalKind.USER, user_id, workspace_id),
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+        agent_scopes=scope_values,
+        tool_scopes=scope_values,
+    ))
 
 
 def one_node_graph(node) -> Graph:
@@ -29,8 +45,10 @@ def test_tool_node_maps_in_keys_to_out_key():
 
 def test_llm_node_formats_prompt_from_state_and_writes_reply():
     client = ScriptedProvider([response([text_block("quick")])])
-    node = llm_node("classify", "Message: {message}", out_key="route",
-                    provider=client, model="small-model")
+    node = llm_node(
+        "classify", "Message: {message}", out_key="route",
+        provider=client, model="small-model", request=_admitted(),
+    )
     state = run_graph(one_node_graph(node), {"message": "thanks!"})
     assert state["route"] == "quick"
 
@@ -51,9 +69,9 @@ def test_agent_node_runs_a_real_loop_turn_with_tagged_events():
         "full_agent", out_key="result", provider=client,
         model="main-model", system="You are a test agent.",
         tools=registry,
-        tool_context=ToolContext(
+        tool_context=tool_context_from_request(
+            _admitted(scopes=registry.scopes()),
             actor="agent",
-            principal="fixture-user",
             agent_id="full_agent",
             scopes=registry.scopes(),
             capabilities=registry.agent_capabilities(),

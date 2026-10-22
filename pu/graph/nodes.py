@@ -8,7 +8,7 @@ from pu.core.interfaces.llm import LLMProvider, LLMRequest
 from pu.core.interfaces.tools import ToolContext, ToolHarness
 from pu.graph.engine import Node, NodeFn, RouteFn
 from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolAuditSink
-from pu.identity.contract import AgentRequestRejected
+from pu.identity.contract import AgentRequest, admit, admit_call
 from pu.loop.agent import run_loop
 from pu.tools.registry import ToolRegistry
 
@@ -24,11 +24,16 @@ def tool_node(name: str, fn: Callable[..., object], in_keys: Iterable[str],
 
 
 def llm_node(name: str, prompt_template: str, out_key: str, *,
-             provider: LLMProvider, model: str,
+             provider: LLMProvider, model: str, request: AgentRequest,
              max_tokens: int = 600, **node_kwargs) -> Node:
-    """One provider-neutral model call with no tools."""
+    """One provider-neutral model call with no tools.
+
+    ``request`` is admitted before the provider sees the prompt. A missing
+    principal or owner raises and the provider is not called.
+    """
 
     def run(state: dict) -> dict:
+        admit(request)
         prompt = prompt_template.format(**{k: v for k, v in state.items()
                                            if not k.startswith("_")})
         response = provider.complete(LLMRequest(
@@ -55,8 +60,7 @@ def agent_node(name: str, out_key: str, *, provider: LLMProvider,
 
     def run(state: dict) -> dict:
         context = resolved_context
-        if context is None or not context.principal:
-            raise AgentRequestRejected("request is missing principal or owner")
+        admit_call(contract=state.get("_agent_request"), context=context)
         messages = [{"role": "user", "content": state[message_key]}]
         result = run_loop(provider=provider, model=model, system=system,
                           messages=messages, tools=tools, tool_harness=resolved_harness,

@@ -26,6 +26,7 @@ deterministic, so traces read the same way twice and evals can pin the path.
 
 from __future__ import annotations
 
+import contextvars
 import threading
 import time
 from collections import defaultdict
@@ -162,8 +163,15 @@ def run_graph(graph: Graph, state: dict, observer: Observer | None = None,
         if len(wave) == 1:  # solo node runs on this thread: trace order stays exact
             results = [run_one(wave[0])]
         else:
+            # Each parallel node gets its own copy of the caller's principal.
+            # One Context cannot be entered on two threads at once, and a raw
+            # pool thread would checkpoint the run under a different owner.
             with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                results = [f.result() for f in [pool.submit(run_one, n) for n in wave]]
+                futures = [
+                    pool.submit(contextvars.copy_context().run, run_one, name)
+                    for name in wave
+                ]
+                results = [future.result() for future in futures]
 
         jumps: list[str] = []
         wave_writes: dict[str, str] = {}

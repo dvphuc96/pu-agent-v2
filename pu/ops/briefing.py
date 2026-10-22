@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -347,7 +348,69 @@ class BriefingService:
                 (*values.values(), now(), jid),
             )
 
+    def _claim_lease_if_needed(self, owner_user_id: str) -> bool:
+        """Take an expired lease, or keep a live one this process already holds.
+
+        The check and the write use a raw connection, so an expired lease does
+        not select owner rows through ``pu_current_owner``. A database error
+        refuses the claim. A different live holder also refuses it.
+        """
+        try:
+            conn = sqlite3.connect(self.home / "state.db", timeout=1)
+        except sqlite3.Error:
+            return False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            holder_row = conn.execute(
+                """SELECT value FROM briefing_state
+                   WHERE key='lease_owner' AND owner_user_id=?""",
+                (owner_user_id,),
+            ).fetchone()
+            until_row = conn.execute(
+                """SELECT value FROM briefing_state
+                   WHERE key='lease_until' AND owner_user_id=?""",
+                (owner_user_id,),
+            ).fetchone()
+            holder = holder_row[0] if holder_row and holder_row[0] else ""
+            try:
+                until = float(until_row[0]) if until_row and until_row[0] not in (None, "") else None
+            except (TypeError, ValueError):
+                until = None
+            now_s = time.time()
+            if until is not None and until > now_s and holder and holder != self.owner:
+                conn.rollback()
+                return False
+            if until is None or until <= now_s:
+                fresh = str(int(now_s + 120))
+                for key, value in (("lease_owner", self.owner), ("lease_until", fresh)):
+                    conn.execute(
+                        """INSERT INTO briefing_state(key, value, owner_user_id)
+                           VALUES(?,?,?)
+                           ON CONFLICT(key, owner_user_id) DO UPDATE SET value=excluded.value""",
+                        (key, value, owner_user_id),
+                    )
+                conn.commit()
+            else:
+                conn.rollback()
+            return True
+        except sqlite3.Error:
+            return False
+        finally:
+            conn.close()
+
     def lease(self):
+        from pu.identity.worker_job import _GRANT, _db_lease_expired, arm_worker_lease
+
+        grant = _GRANT.get()
+        if grant is not None and (grant.closed or grant.expires_at <= time.time()):
+            return False
+        if (
+            grant is not None
+            and grant.db_path
+            and _db_lease_expired(grant)
+            and not self._claim_lease_if_needed(grant.owner_user_id)
+        ):
+            return False
         with self.repo.database.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             owner = conn.execute(
@@ -369,8 +432,6 @@ class BriefingService:
                    ON CONFLICT(key, owner_user_id) DO UPDATE SET value=excluded.value""",
                     (key, value),
                 )
-        from pu.identity.worker_job import arm_worker_lease
-
         arm_worker_lease()
         return True
 
@@ -706,6 +767,19 @@ class BriefingService:
                 )
 
     def cycle(self):
+        from pu.identity.worker_job import _GRANT, _db_lease_expired
+
+        grant = _GRANT.get()
+        if grant is not None and (grant.closed or grant.expires_at <= time.time()):
+            return
+        # An expired database lease is renewed before any owner-scoped read.
+        if (
+            grant is not None
+            and grant.db_path
+            and _db_lease_expired(grant)
+            and not self.lease()
+        ):
+            return
         if self.state("enabled", "1") != "1" or not self.lease():
             return
         if not self.app_factory and not self.model_configured():
@@ -823,11 +897,14 @@ class BriefingService:
             ).fetchone()
         if row is None:
             return fn()
+        if not self._claim_lease_if_needed(owner_user_id):
+            return None
         job = WorkerJob.open(
             owner_user_id=owner_user_id,
             workspace_id=row[0],
             expires_at=time.time() + 120,
             db_path=str(self.home / "state.db"),
+            watch_db_lease=True,
         )
         try:
             return fn()

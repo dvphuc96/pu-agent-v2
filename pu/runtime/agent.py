@@ -7,7 +7,7 @@ from dataclasses import replace
 from pu.core.interfaces.agents import AgentResult, AgentRunRequest, AgentRuntime
 from pu.core.interfaces.llm import LLMProvider
 from pu.core.interfaces.tools import ToolHarness
-from pu.identity.contract import AgentRequestRejected, admit, tool_context_from_request
+from pu.identity.contract import admit_call, tool_context_from_request
 from pu.loop.agent import run_loop
 
 
@@ -19,13 +19,9 @@ class DefaultAgentRuntime(AgentRuntime):
         self.tool_harness = tool_harness
 
     def run(self, request: AgentRunRequest, observer=None) -> AgentResult:
-        contract = request.contract
-        if contract is not None:
-            admit(contract)
         context = request.tool_context
-        if context is None:
-            if contract is None:
-                raise AgentRequestRejected("request is missing principal or owner")
+        contract = admit_call(contract=request.contract, context=context)
+        if context is None or not context.principal:
             context = tool_context_from_request(
                 contract,
                 observer=observer,
@@ -34,8 +30,6 @@ class DefaultAgentRuntime(AgentRuntime):
                 scopes=request.tools.scopes(),
                 capabilities=request.tools.agent_capabilities(),
             )
-        elif not context.principal:
-            raise AgentRequestRejected("request is missing principal or owner")
         elif context.observer is None:
             context = replace(context, observer=observer)
         return run_loop(

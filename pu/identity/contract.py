@@ -6,6 +6,7 @@ model or tool call. Production code does not substitute a local default.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 
 from pu.core.interfaces.tools import ToolContext, ToolHarness, ToolResult
@@ -14,6 +15,12 @@ from pu.identity.principal import Principal, PrincipalKind
 
 APPROVAL_STATUSES = frozenset(
     {"not_required", "pending", "approved", "rejected", "expired"}
+)
+
+# Labels the single-user code used before a backend UUID existed. A model or
+# tool call may not present one of these as its principal.
+LEGACY_PRINCIPALS = frozenset(
+    {"local-user", "graph-local-user", "local-dashboard-user", "local-human"}
 )
 
 
@@ -36,6 +43,17 @@ class AgentRequest:
         object.__setattr__(self, "agent_scopes", frozenset(self.agent_scopes))
         object.__setattr__(self, "tool_scopes", frozenset(self.tool_scopes))
         object.__setattr__(self, "approval_status", str(self.approval_status or ""))
+
+
+def is_backend_user_id(value: object) -> bool:
+    """True for a canonical UUID. Legacy labels and other strings are not."""
+    if not isinstance(value, str) or value in LEGACY_PRINCIPALS:
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return str(parsed) == value
 
 
 def admit(request: AgentRequest) -> AgentRequest:
@@ -68,6 +86,55 @@ def request_for_connection(conn, *, scopes, approval_status: str = "not_required
             approval_status=approval_status,
         )
     )
+
+
+def request_from_tool_context(context: ToolContext) -> AgentRequest:
+    """Rebuild a request from a context that ``tool_context_from_request`` wrote.
+
+    A bare string such as ``local-user`` has no principal kind or owner and is
+    rejected before ``admit``.
+    """
+    if context is None or not is_backend_user_id(context.principal):
+        raise AgentRequestRejected("request is missing principal or owner")
+    meta = context.metadata or {}
+    kind_name = meta.get("principal_kind")
+    try:
+        kind = PrincipalKind(kind_name)
+        principal = Principal(
+            kind,
+            str(meta.get("owner_user_id") or ""),
+            str(meta.get("workspace_id") or ""),
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentRequestRejected("request is missing principal or owner") from exc
+    if context.principal != principal.user_id:
+        raise AgentRequestRejected("owner does not match principal")
+    return AgentRequest(
+        principal=principal,
+        owner_user_id=principal.user_id,
+        workspace_id=principal.workspace_id,
+        agent_scopes=frozenset(meta.get("agent_scopes") or context.capabilities),
+        tool_scopes=frozenset(meta.get("tool_scopes") or context.scopes),
+        approval_status=str(meta.get("approval_status") or "not_required"),
+    )
+
+
+def admit_call(
+    *,
+    contract: AgentRequest | None,
+    context: ToolContext | None,
+) -> AgentRequest:
+    """Admit every model call. A string or legacy principal never qualifies."""
+    if context is not None and context.principal and not is_backend_user_id(context.principal):
+        raise AgentRequestRejected("request is missing principal or owner")
+    if contract is None:
+        if context is None:
+            raise AgentRequestRejected("request is missing principal or owner")
+        contract = request_from_tool_context(context)
+    admitted = admit(contract)
+    if context is not None and context.principal and context.principal != admitted.principal.user_id:
+        raise AgentRequestRejected("owner does not match principal")
+    return admitted
 
 
 def tool_context_from_request(request: AgentRequest, **overrides) -> ToolContext:
