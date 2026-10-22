@@ -452,10 +452,15 @@ def test_install_requires_a_password_and_refuses_to_drop_existing_rows():
 
 
 # The briefing worker must see every due owner, then attach that owner per job.
-# Mentioning the column is not a filter; these two statements are the allowlist.
+# Platform admin metrics count every owner and select no payload text.
+# Mentioning the column is not a filter; these statements are the allowlist.
 CROSS_OWNER_ALLOWLIST = (
     ("pu/ops/briefing.py", "SELECT DISTINCT owner_user_id FROM briefing_jobs"),
     ("pu/ops/briefing.py", "SELECT owner_user_id FROM briefing_state"),
+    (
+        "pu/persistence/events.py",
+        "SELECT kind, status, duration_ms",
+    ),
 )
 
 

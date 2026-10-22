@@ -27,6 +27,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pu.config import Settings
+from pu.harness.audit import redact, redact_text
+from pu.ops.telemetry import (
+    readable_trace_files,
+    telemetry_scope,
+    trace_dir_for,
+    trace_write_path,
+    usage_write_path,
+)
 
 
 def _now() -> str:
@@ -62,11 +70,14 @@ class Tracer:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.path = settings.home / "traces" / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
-        self._otel_tracer = self._init_otel(settings)
         self._span_ctx = None
         self._workflow_spans = {}
+        # ``_init_otel`` stores the OpenTelemetry trace API here. Leaving the
+        # assignment until after that call used to wipe the parent-span API.
         self._trace_api = None
-        self._trace_encoding_checked = False
+        self._otel_provider = None
+        self._trace_encoding_checked_paths: set[str] = set()
+        self._otel_tracer = self._init_otel(settings)
 
     def _init_otel(self, settings: Settings):
         if not settings.otel_endpoint:
@@ -91,45 +102,81 @@ class Tracer:
                   "pip install 'pu-agent[tracing]'. JSONL tracing still on.")
             return None
 
-    def _write(self, record: dict) -> None:
+    def _destination(self) -> Path:
+        """Per-owner trace file. The shared ``home/traces`` file stays the local owner's."""
+        scope = telemetry_scope(self.settings.home)
+        if scope.denied:
+            raise PermissionError("telemetry owner is not available")
+        if scope.isolated:
+            return trace_write_path(self.settings.home, self.path.name)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return self.path
+
+    def _ensure_encoding(self, path: Path) -> None:
         # An older Windows release may have created this daily file in GBK.
         # Refuse to make a mixed-encoding JSONL file: validate once, explain how
         # to preserve the old file, and never guess or rewrite user data.
-        if not self._trace_encoding_checked:
-            if self.path.exists():
-                for _ in iter_trace_lines(self.path):
-                    pass
-            self._trace_encoding_checked = True
-        from pu.harness.audit import redact
+        key = str(path)
+        if key in self._trace_encoding_checked_paths:
+            return
+        if path.exists():
+            for _ in iter_trace_lines(path):
+                pass
+        self._trace_encoding_checked_paths.add(key)
 
-        # JSONL is a Phase 2 sink. OTel attributes stay on the original event;
-        # redacting those is OPS-02 in Phase 5.
+    def _write(self, record: dict) -> None:
+        path = self._destination()
+        self._ensure_encoding(path)
         stored = redact(dict(record))
         if not isinstance(stored, dict):
             stored = {"value": stored}
+        scope = telemetry_scope(self.settings.home)
+        if scope.owner_user_id and not scope.admin:
+            stored["owner_user_id"] = scope.owner_user_id
         stored["ts"] = _now()
-        with self.path.open("a", encoding="utf-8") as f:
+        with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(stored, ensure_ascii=False, default=str) + "\n")
-        from pu.identity.files import note_written
+        if path == self.path:
+            from pu.identity.files import note_written
 
-        note_written(self.settings.home, self.path)
+            note_written(self.settings.home, path)
 
     def _record_usage(self, event: dict) -> None:
-        """Append one LLM call's token usage to a PERMANENT ledger (usage.jsonl).
-        Unlike traces (which can be reset for a clean demo), this is the running
-        record of what you've actually spent — never wiped, summarized per day on
-        the dashboard. Tokens are the ground truth; dollar cost is derived from
-        them (pricing can change), so we store tokens + provider/model."""
-        usage = event.get("usage", {})
-        record = {"ts": _now(), "provider": self.settings.provider,
-                  "model": self.settings.model or "", "kind": "loop",
-                  "in": usage.get("in", 0), "out": usage.get("out", 0)}
-        usage_path = self.settings.home / "usage.jsonl"
-        with usage_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-        from pu.identity.files import note_written
+        """Append one LLM call's tokens, cost, and owner to the permanent ledger.
 
-        note_written(self.settings.home, usage_path)
+        The ledger stores tokens plus the cost derived from the current price
+        table. It does not store prompts, tool output, mail, or report text.
+        ``owner_user_id`` comes from the principal, never from the event body.
+        """
+        from pu.ops.pricing import price_for
+
+        usage = event.get("usage") or {}
+        tokens_in = _token_count(usage.get("in", 0))
+        tokens_out = _token_count(usage.get("out", 0))
+        scope = telemetry_scope(self.settings.home)
+        if scope.denied:
+            raise PermissionError("telemetry owner is not available")
+        provider = redact_text(str(self.settings.provider or event.get("provider") or ""))
+        model = redact_text(str(self.settings.model or event.get("model") or ""))
+        price_in, price_out = price_for(provider, model)
+        cost = round(tokens_in / 1e6 * price_in + tokens_out / 1e6 * price_out, 6)
+        record = redact({
+            "ts": _now(),
+            "provider": provider,
+            "model": model,
+            "kind": "loop",
+            "in": tokens_in,
+            "out": tokens_out,
+            "owner_user_id": scope.owner_user_id,
+            "cost": cost,
+        })
+        usage_path = usage_write_path(self.settings.home)
+        with usage_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        if usage_path == self.settings.home / "usage.jsonl":
+            from pu.identity.files import note_written
+
+            note_written(self.settings.home, usage_path)
 
     # ---- the Observer: called by the loop for every llm/tool/gate/... event
     def event(self, kind: str, event: dict) -> None:
@@ -143,24 +190,31 @@ class Tracer:
                      "model": self.settings.model or "", **event}
         self._write({"type": kind, **event})
         if self._otel_tracer:
-            workflow_id = event.get("workflow_id")
+            safe = redact(dict(event))
+            if not isinstance(safe, dict):
+                safe = {"value": safe}
+            workflow_id = safe.get("workflow_id")
             if kind in {"workflow_started", "workflow_resumed"} and workflow_id and workflow_id not in self._workflow_spans:
                 self._workflow_spans[workflow_id] = self._otel_tracer.start_span(
-                    f"workflow.{event.get('workflow', 'research')}",
-                    attributes={"openinference.span.kind": "CHAIN", "pu.workflow_id": workflow_id},
+                    redact_text(f"workflow.{safe.get('workflow', 'research')}"),
+                    attributes={
+                        "openinference.span.kind": "CHAIN",
+                        "pu.workflow_id": redact_text(str(workflow_id)),
+                    },
                 )
             parent = self._span_ctx or (self._workflow_spans.get(workflow_id) if workflow_id else None)
             context = self._trace_api.set_span_in_context(parent) if (parent is not None and self._trace_api) else None
             kwargs = {
                 "attributes": {
                     "openinference.span.kind": {"llm": "LLM", "tool": "TOOL"}.get(kind, "CHAIN"),
-                    **{f"pu.{k}": json.dumps(v, default=str) for k, v in event.items()},
+                    **{f"pu.{k}": json.dumps(v, default=str) for k, v in safe.items()},
                 }
             }
             if context is not None:
                 kwargs["context"] = context
+            label = safe.get("tool", safe.get("decision", ""))
             with self._otel_tracer.start_as_current_span(
-                f"{kind}.{event.get('tool', event.get('decision', ''))}".rstrip("."),
+                redact_text(f"{kind}.{label}".rstrip(".")),
                 **kwargs,
             ):
                 pass
@@ -176,7 +230,10 @@ class Tracer:
         if self._otel_tracer:
             with self._otel_tracer.start_as_current_span(
                 "agent_run",
-                attributes={"openinference.span.kind": "AGENT", "pu.user_message": user_message},
+                attributes={
+                    "openinference.span.kind": "AGENT",
+                    "pu.user_message": redact_text(user_message),
+                },
             ) as span:
                 self._span_ctx = span
                 try:
@@ -206,6 +263,64 @@ class Tracer:
                 provider.force_flush(timeout_millis=2000)
             except Exception:
                 pass
+
+
+def _token_count(value: object) -> int:
+    """Token counts are integers. A secret string is not a token count."""
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return 0
+
+
+def _event_visible(event: dict, scope) -> bool:
+    if scope.admin or scope.denied:
+        return False
+    stamped = str(event.get("owner_user_id") or "")
+    if not stamped or not scope.owner_user_id:
+        return True
+    return stamped == scope.owner_user_id
+
+
+def load_trace_events(home: Path) -> tuple[list[dict], list[dict]]:
+    """Trace events the current principal may see, plus encoding errors.
+
+    A platform admin receives no events. Lines stamped for another owner are
+    dropped even if they sit in a file this caller was allowed to open.
+    """
+    scope = telemetry_scope(home)
+    events: list[dict] = []
+    errors: list[dict] = []
+    if scope.admin or scope.denied:
+        return events, errors
+    for path in readable_trace_files(home):
+        try:
+            lines = list(iter_trace_lines(path))
+        except TraceEncodingError as exc:
+            errors.append({"file": path.name, "error": str(exc)})
+            continue
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and _event_visible(event, scope):
+                events.append(event)
+    return events, errors
+
+
+def today_trace_path(home: Path) -> Path:
+    """Today's trace file for the current principal. Does not create it."""
+    scope = telemetry_scope(home)
+    name = f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+    return trace_dir_for(home, scope) / name
 
 
 def compose(*observers) -> callable:

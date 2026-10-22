@@ -107,19 +107,74 @@ def price_for(provider: str, model: str) -> tuple[float, float]:
     return PRICING.get(provider, (3.0, 15.0))
 
 
-def usage_summary(home) -> dict:
-    """Read the PERMANENT spend ledger (usage.jsonl) → all-time tokens + dollar
-    cost, plus per-day and per-provider breakdowns. Cost is derived from tokens
-    with PRICING (approximate, labelled 'est'). This survives demo resets, so the
-    number is the real running total — trustworthy, not a per-session guess."""
+def _usage_records(paths) -> list[dict]:
     recs = []
-    path = home / "usage.jsonl"
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
             try:
-                recs.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError:
-                pass
+                continue
+            if isinstance(record, dict):
+                recs.append(record)
+    return recs
+
+
+def _ledger_label(value: object) -> str:
+    """Provider and model ids only. Sentences, mail, and secrets are dropped."""
+    from pu.harness.audit import redact_text
+
+    text = str(value or "")
+    if not text or len(text) > 120 or any(char in text for char in " \n\t@"):
+        return ""
+    redacted = redact_text(text)
+    if redacted != text:
+        return ""
+    return text
+
+
+def _numeric_usage(record: dict) -> dict:
+    """Drop free text. Provider and model stay because cost is keyed by them."""
+    stamp = str(record.get("ts") or "")
+    if len(stamp) < 10 or stamp[4] != "-" or stamp[7] != "-":
+        stamp = ""
+    return {
+        "ts": stamp[:32],
+        "provider": _ledger_label(record.get("provider")),
+        "model": _ledger_label(record.get("model")),
+        "in": record.get("in", 0) if isinstance(record.get("in", 0), (int, float)) and not isinstance(record.get("in", 0), bool) else 0,
+        "out": record.get("out", 0) if isinstance(record.get("out", 0), (int, float)) and not isinstance(record.get("out", 0), bool) else 0,
+    }
+
+
+def usage_summary(home) -> dict:
+    """Read the permanent spend ledger → tokens and dollar cost.
+
+    A user sees only their own ledger. A platform admin sees numeric totals
+    across ledgers and none of the prompt, mail, or report text. Cost is
+    derived from tokens with PRICING (approximate, labelled 'est').
+    """
+    from pathlib import Path
+
+    from pu.ops.telemetry import all_usage_files, telemetry_scope, usage_read_paths
+
+    home = Path(home)
+    scope = telemetry_scope(home)
+    if scope.denied:
+        recs = []
+    elif scope.admin:
+        recs = [_numeric_usage(record) for record in _usage_records(all_usage_files(home))]
+    else:
+        recs = []
+        for record in _usage_records(usage_read_paths(home)):
+            stamped = str(record.get("owner_user_id") or "")
+            if stamped and scope.owner_user_id and stamped != scope.owner_user_id:
+                continue
+            recs.append(_numeric_usage(record))
 
     def cost(r) -> float:
         # the ledger stores tokens + provider/model, so old rows reprice too

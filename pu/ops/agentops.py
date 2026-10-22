@@ -128,32 +128,51 @@ class SLOEvaluator:
         }
 
 
+_METRIC_NUMBERS = (
+    ("events", "pu_agentops_events_total", "counter", "Durable structured AgentOps events.", 0, int),
+    ("llm_p95_ms", "pu_llm_p95_latency_ms", "gauge", "Observed LLM p95 latency in milliseconds.", 0, float),
+    ("tool_error_rate", "pu_tool_error_rate", "gauge", "Tool execution error ratio.", 0, float),
+    ("workflow_success_rate", "pu_workflow_success_rate", "gauge", "Workflow success ratio.", 1, float),
+    ("approval_failure_rate", "pu_approval_failure_rate", "gauge", "Approved action execution failure ratio.", 0, float),
+    ("security_blocks", "pu_security_blocks_total", "gauge", "Security-policy blocks in retained event window.", 0, int),
+)
+
+_SLO_NAMES = frozenset({
+    "llm_p95_latency",
+    "tool_error_rate",
+    "workflow_success_rate",
+    "approval_failure_rate",
+    "security_blocks",
+})
+
+
+def _metric_number(metrics: dict[str, Any], key: str, default: float, cast):
+    value = metrics.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return cast(default)
+    return cast(value)
+
+
 def prometheus_text(metrics: dict[str, Any], slo: dict[str, Any]) -> str:
-    """Dependency-free Prometheus exposition backed by durable AgentOps events."""
-    lines = [
-        "# HELP pu_agentops_events_total Durable structured AgentOps events.",
-        "# TYPE pu_agentops_events_total counter",
-        f"pu_agentops_events_total {int(metrics.get('events', 0))}",
-        "# HELP pu_llm_p95_latency_ms Observed LLM p95 latency in milliseconds.",
-        "# TYPE pu_llm_p95_latency_ms gauge",
-        f"pu_llm_p95_latency_ms {float(metrics.get('llm_p95_ms', 0))}",
-        "# HELP pu_tool_error_rate Tool execution error ratio.",
-        "# TYPE pu_tool_error_rate gauge",
-        f"pu_tool_error_rate {float(metrics.get('tool_error_rate', 0))}",
-        "# HELP pu_workflow_success_rate Workflow success ratio.",
-        "# TYPE pu_workflow_success_rate gauge",
-        f"pu_workflow_success_rate {float(metrics.get('workflow_success_rate', 1))}",
-        "# HELP pu_approval_failure_rate Approved action execution failure ratio.",
-        "# TYPE pu_approval_failure_rate gauge",
-        f"pu_approval_failure_rate {float(metrics.get('approval_failure_rate', 0))}",
-        "# HELP pu_security_blocks_total Security-policy blocks in retained event window.",
-        "# TYPE pu_security_blocks_total gauge",
-        f"pu_security_blocks_total {int(metrics.get('security_blocks', 0))}",
-        "# HELP pu_slo_healthy Whether every configured SLO is currently healthy.",
-        "# TYPE pu_slo_healthy gauge",
-        f"pu_slo_healthy {1 if slo.get('healthy') else 0}",
-    ]
+    """Dependency-free Prometheus exposition of numeric AgentOps series.
+
+    Only allowlisted numbers and SLO names are rendered. Prompts, mail,
+    report text, and other payload fields are not series and not labels.
+    """
+    lines = []
+    for key, name, kind, help_text, default, cast in _METRIC_NUMBERS:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {kind}")
+        lines.append(f"{name} {_metric_number(metrics, key, default, cast)}")
+    lines.append("# HELP pu_slo_healthy Whether every configured SLO is currently healthy.")
+    lines.append("# TYPE pu_slo_healthy gauge")
+    lines.append(f"pu_slo_healthy {1 if slo.get('healthy') else 0}")
     for check in slo.get("checks", []):
-        label = json.dumps(check["name"])
-        lines.append(f"pu_slo_check_ok{{name={label}}} {1 if check['ok'] else 0}")
+        if not isinstance(check, dict):
+            continue
+        label_name = check.get("name")
+        if label_name not in _SLO_NAMES:
+            continue
+        label = json.dumps(label_name)
+        lines.append(f"pu_slo_check_ok{{name={label}}} {1 if check.get('ok') else 0}")
     return "\n".join(lines) + "\n"

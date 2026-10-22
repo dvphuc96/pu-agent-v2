@@ -1,8 +1,9 @@
 """Phase 0 reproductions for static-analysis findings.
 
 These tests encode the multi-user safety properties. A defect that has been
-fixed runs as a normal test. The remaining xfail markers belong to Phase 5
-(OTel redaction and tracer init) and stay until that phase lands.
+fixed runs as a normal test. The OpenTelemetry canary and the tracer
+``_trace_api`` assignment are fixed in Phase 5. The parent-span gate is
+OPS-01, separate from the assignment test below.
 """
 
 from __future__ import annotations
@@ -10,8 +11,6 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
-
-import pytest
 
 from pu.approval.models import ApprovalStatus, ProposedAction
 from pu.approval.repository import SQLiteApprovalRepository
@@ -167,13 +166,6 @@ def test_agentops_redacts_canary_in_jsonl(tmp_path):
     assert CANARY not in tracer.path.read_text(encoding="utf-8")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Tracer.event ghi nguyên payload vào attribute span OTel. "
-        "Phase 5 gỡ đúng marker này; marker JSONL thuộc Phase 2."
-    ),
-)
 def test_agentops_redacts_canary_in_otel(tmp_path):
     repository, _tracer, otel = _publish_canary(tmp_path)
     assert CANARY not in json.dumps(repository.list())
@@ -402,14 +394,6 @@ def test_triage_ics_read_goes_through_tool_harness(tmp_path, monkeypatch):
     assert any(name in CALENDAR_TOOLS for name in state["harness"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Tracer.__init__ gán self._trace_api = None sau _init_otel. "
-        "Test này chỉ kiểm tra lệnh gán đè, không kiểm tra parent span hay exporter. "
-        "Phase 5 gỡ đúng marker này."
-    ),
-)
 def test_tracer_init_keeps_otel_trace_api(tmp_path, monkeypatch):
     sentinel = object()
 
