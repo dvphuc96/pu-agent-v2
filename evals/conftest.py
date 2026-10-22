@@ -12,10 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def _reset_principal_seam():
     """Phase 1 tests attach a principal on a contextvar. Clear it after each test."""
     from pu.identity.seam import reset_attached_principal
+    from pu.identity.worker_job import reset_worker_grant
 
     reset_attached_principal()
+    reset_worker_grant()
     yield
     reset_attached_principal()
+    reset_worker_grant()
 
 
 @pytest.fixture(autouse=True)

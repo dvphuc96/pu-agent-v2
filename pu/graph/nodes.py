@@ -6,8 +6,9 @@ from collections.abc import Callable, Iterable
 
 from pu.core.interfaces.llm import LLMProvider, LLMRequest
 from pu.core.interfaces.tools import ToolContext, ToolHarness
-from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolAuditSink
 from pu.graph.engine import Node, NodeFn, RouteFn
+from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolAuditSink
+from pu.identity.contract import AgentRequest, admit, admit_call
 from pu.loop.agent import run_loop
 from pu.tools.registry import ToolRegistry
 
@@ -23,11 +24,16 @@ def tool_node(name: str, fn: Callable[..., object], in_keys: Iterable[str],
 
 
 def llm_node(name: str, prompt_template: str, out_key: str, *,
-             provider: LLMProvider, model: str,
+             provider: LLMProvider, model: str, request: AgentRequest,
              max_tokens: int = 600, **node_kwargs) -> Node:
-    """One provider-neutral model call with no tools."""
+    """One provider-neutral model call with no tools.
+
+    ``request`` is admitted before the provider sees the prompt. A missing
+    principal or owner raises and the provider is not called.
+    """
 
     def run(state: dict) -> dict:
+        admit(request)
         prompt = prompt_template.format(**{k: v for k, v in state.items()
                                            if not k.startswith("_")})
         response = provider.complete(LLMRequest(
@@ -50,20 +56,16 @@ def agent_node(name: str, out_key: str, *, provider: LLMProvider,
     resolved_harness = tool_harness or DefaultToolHarness(
         tools, DefaultSecurityHarness(), InMemoryToolAuditSink()
     )
-    resolved_context = tool_context or ToolContext(
-        actor="agent",
-        principal="graph-local-user",
-        agent_id=name,
-        scopes=tools.scopes(),
-        capabilities=tools.capabilities(),
-    )
+    resolved_context = tool_context
 
     def run(state: dict) -> dict:
+        context = resolved_context
+        admit_call(contract=state.get("_agent_request"), context=context)
         messages = [{"role": "user", "content": state[message_key]}]
         result = run_loop(provider=provider, model=model, system=system,
                           messages=messages, tools=tools, tool_harness=resolved_harness,
                           max_iterations=max_iterations, max_tokens=max_tokens,
-                          observer=state.get("_notify"), tool_context=resolved_context)
+                          observer=state.get("_notify"), tool_context=context)
         return {out_key: result}
 
     return Node(name=name, fn=run, kind="agent", **node_kwargs)

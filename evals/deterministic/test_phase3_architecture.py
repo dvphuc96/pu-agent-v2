@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import inspect
+import uuid
 from pathlib import Path
 
 from evals.helpers import ScriptedProvider, response, text_block, tool_block
-from pu.adapters.events import CallableEventPublisher, CompositeEventPublisher
 from pu.adapters import GraphWorkflowEngine
-from pu.runtime import DefaultAgentRuntime
-from pu.harness import DefaultToolHarness
+from pu.adapters.events import CallableEventPublisher, CompositeEventPublisher
 from pu.app import PU
 from pu.config import Settings
 from pu.core.container import create_application
@@ -21,11 +20,14 @@ from pu.core.interfaces import (
     LLMProvider,
     MemoryRepository,
     SecurityHarness,
-    ToolContext,
     ToolHarness,
     WorkflowEngine,
 )
 from pu.graph import END, START, Graph, Node
+from pu.harness import DefaultToolHarness
+from pu.identity.contract import AgentRequest, admit, tool_context_from_request
+from pu.identity.principal import Principal, PrincipalKind
+from pu.runtime import DefaultAgentRuntime
 from pu.tools.registry import Tool, ToolRegistry
 
 
@@ -87,11 +89,27 @@ def test_default_runtime_preserves_loop_behavior():
     ])
     harness = DefaultToolHarness(registry, __import__("pu.harness", fromlist=["DefaultSecurityHarness"]).DefaultSecurityHarness(), __import__("pu.harness", fromlist=["InMemoryToolAuditSink"]).InMemoryToolAuditSink())
     runtime = DefaultAgentRuntime(client, harness)
+    user_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    contract = admit(AgentRequest(
+        principal=Principal(PrincipalKind.USER, user_id, workspace_id),
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+        agent_scopes=frozenset(registry.scopes()),
+        tool_scopes=frozenset(registry.scopes()),
+    ))
     result = runtime.run(AgentRunRequest(
         model="test",
         system="test",
         messages=[{"role": "user", "content": "echo hello"}],
         tools=registry,
+        contract=contract,
+        tool_context=tool_context_from_request(
+            contract,
+            actor="agent",
+            scopes=registry.scopes(),
+            capabilities=registry.agent_capabilities(),
+        ),
     ))
     assert result.reply == "done"
     assert result.iterations == 2

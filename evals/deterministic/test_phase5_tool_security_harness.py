@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
-import pytest
-
 from evals.helpers import ScriptedProvider, response, text_block, tool_block
-from pu.runtime import DefaultAgentRuntime
 from pu.config import Settings
 from pu.core.container import create_application
 from pu.core.interfaces.agents import AgentRunRequest
@@ -20,6 +18,9 @@ from pu.harness import (
     InMemoryToolAuditSink,
     JsonlToolAuditSink,
 )
+from pu.identity.contract import AgentRequest, admit, tool_context_from_request
+from pu.identity.principal import Principal, PrincipalKind
+from pu.runtime import DefaultAgentRuntime
 from pu.tools.registry import Tool, ToolRegistry
 
 
@@ -277,12 +278,22 @@ def test_agent_loop_executes_tool_only_through_harness():
         response([text_block("done")]),
     ])
     runtime = DefaultAgentRuntime(client, harness)
+    user_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    contract = admit(AgentRequest(
+        principal=Principal(PrincipalKind.USER, user_id, workspace_id),
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+        agent_scopes=frozenset({"test:read"}),
+        tool_scopes=frozenset({"test:read"}),
+    ))
     result = runtime.run(AgentRunRequest(
         model="test",
         system="test",
         messages=[{"role": "user", "content": "echo hello"}],
         tools=registry,
-        tool_context=context(),
+        contract=contract,
+        tool_context=tool_context_from_request(contract, actor="agent", agent_id="test-agent"),
     ))
     assert result.reply == "done"
     assert seen == ["hello"]

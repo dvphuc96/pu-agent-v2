@@ -4,12 +4,42 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from urllib.parse import urlparse
 
 from pu.core.cancellation import RunCancelled
 from pu.core.interfaces.agents import AgentResult
 from pu.core.interfaces.orchestration import ResearchWorkflowRequest, ResearchWorkflowResult
+from pu.identity.contract import AgentRequest
+from pu.identity.principal import Principal, PrincipalKind
 from pu.reporting.calendar_slots import attach_free_slots
+
+
+def _agent_request(request: ResearchWorkflowRequest) -> AgentRequest | None:
+    """The admitted owner for a research stage, or None when the run has none.
+
+    ``workspace_id`` on the workflow request is a research workspace. The
+    personal workspace and principal kind travel on their own fields.
+    """
+    kind_name = (request.principal_kind or "").strip()
+    owner = (request.owner_user_id or "").strip()
+    workspace = (request.personal_workspace_id or "").strip()
+    if not kind_name or not owner or not workspace:
+        return None
+    try:
+        principal = Principal(PrincipalKind(kind_name), owner, workspace)
+    except (TypeError, ValueError):
+        return None
+    if request.principal and request.principal != principal.user_id:
+        return None
+    return AgentRequest(
+        principal=principal,
+        owner_user_id=owner,
+        workspace_id=workspace,
+        agent_scopes=frozenset(request.agent_scopes),
+        tool_scopes=frozenset(request.tool_scopes),
+        approval_status=request.approval_status or "not_required",
+    )
 
 
 class WorkflowExecutionError(RuntimeError):
@@ -63,10 +93,33 @@ class ResearchWorkflowOrchestrator:
     def descriptors(self) -> list[dict]:
         return [a.descriptor.__dict__.copy() for a in self.agents]
 
+    def _with_owner(self, request: ResearchWorkflowRequest) -> ResearchWorkflowRequest:
+        if (
+            request.principal
+            and request.owner_user_id
+            and request.principal_kind
+            and request.personal_workspace_id
+        ):
+            return request
+        from pu.identity.seam import attached_principal
+
+        attached = attached_principal()
+        if attached is None:
+            return request
+        return replace(
+            request,
+            principal=request.principal or attached.user_id,
+            owner_user_id=request.owner_user_id or attached.user_id,
+            principal_kind=request.principal_kind or attached.kind.value,
+            personal_workspace_id=request.personal_workspace_id or attached.workspace_id,
+        )
+
     def run(self, request: ResearchWorkflowRequest, observer=None) -> ResearchWorkflowResult:
-        workflow_id = f"research-{uuid.uuid4()}"
+        request = self._with_owner(request)
+        workflow_id = (request.workflow_id or "").strip() or f"research-{uuid.uuid4()}"
         if self.workflow_repository is not None:
-            self.workflow_repository.create(workflow_id, request)
+            # One state row per run. Opening an id that already exists does not insert.
+            self.workflow_repository.open_run(workflow_id, request)
         return self._execute(request, workflow_id, observer=observer, resumed=False)
 
     def resume(self, workflow_id: str, observer=None) -> ResearchWorkflowResult:
@@ -77,7 +130,7 @@ class ResearchWorkflowOrchestrator:
             raise KeyError("workflow not found")
         if run.status == "completed":
             raise ValueError("workflow is already completed")
-        request = self.workflow_repository.request(workflow_id)
+        request = self._with_owner(self.workflow_repository.request(workflow_id))
         self.workflow_repository.start_attempt(workflow_id)
         return self._execute(request, workflow_id, observer=observer, resumed=True)
 
@@ -172,6 +225,7 @@ class ResearchWorkflowOrchestrator:
                 observer=notify,
                 workflow_id=workflow_id,
                 principal=request.principal,
+                contract=_agent_request(request),
                 **({"evidence_only": True} if evidence_only else {}),
                 **({"max_tokens": max_tokens} if max_tokens else {}),
             )

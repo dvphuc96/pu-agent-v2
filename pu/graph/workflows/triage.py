@@ -25,6 +25,7 @@ from pathlib import Path
 from pu.core.interfaces.llm import LLMProvider, LLMRequest
 from pu.graph.engine import END, START, Graph, Node
 from pu.graph.nodes import key_router
+from pu.identity.contract import AgentRequest, admit
 
 TRIAGE_PROMPT = """\
 You are a triage gate for a personal assistant. Given the user's message,
@@ -50,9 +51,19 @@ Today's calendar: {calendar}
 User message: {message}"""
 
 
-def classify_message(provider: LLMProvider, small_model: str, message: str) -> tuple[str, str]:
+def classify_message(
+    provider: LLMProvider,
+    small_model: str,
+    message: str,
+    request: AgentRequest,
+) -> tuple[str, str]:
     """Returns (route, reason). Fails open to "full": a broken triage must
-    cost latency, never capability — mirror of retrieval_gate.should_retrieve."""
+    cost latency, never capability — mirror of retrieval_gate.should_retrieve.
+
+    Admission is outside that fail-open. A missing principal is not a broken
+    classifier, and it must not reach the provider.
+    """
+    admit(request)
     try:
         response = provider.complete(LLMRequest(
             model=small_model,

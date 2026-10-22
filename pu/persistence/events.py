@@ -15,7 +15,13 @@ class SQLiteAgentEventRepository:
     def __init__(self, database: SQLiteDatabase):
         self.database = database
 
+    def _guard(self) -> None:
+        from pu.identity.worker_job import owner_from_grant
+
+        owner_from_grant()
+
     def append(self, event: AgentEvent) -> None:
+        self._guard()
         with self.database.connection() as conn:
             conn.execute(
                 """INSERT INTO agent_events(
@@ -32,7 +38,12 @@ class SQLiteAgentEventRepository:
                 ),
             )
 
+    def for_run(self, workflow_run_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Events for one run, keyed by ``(workflow_run_id, owner_user_id)``."""
+        return self.list(limit=limit, workflow_id=workflow_run_id)
+
     def list(self, *, limit: int = 200, workflow_id: str | None = None) -> list[dict[str, Any]]:
+        self._guard()
         sql = "SELECT * FROM agent_events WHERE owner_user_id = pu_current_owner()"
         params: tuple[Any, ...] = ()
         if workflow_id:
@@ -50,6 +61,7 @@ class SQLiteAgentEventRepository:
         return items
 
     def aggregate(self, *, limit: int = 5000) -> dict[str, Any]:
+        self._guard()
         with self.database.connection() as conn:
             rows = conn.execute(
                 """SELECT kind, status, duration_ms, payload_json FROM agent_events

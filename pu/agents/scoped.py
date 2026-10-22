@@ -9,6 +9,7 @@ from typing import Any
 
 from pu.core.interfaces.agents import AgentResult, AgentRunRequest, AgentRuntime, BaseAgent
 from pu.core.interfaces.tools import ToolContext
+from pu.identity.contract import AgentRequest, tool_context_from_request
 from pu.tools.registry import ToolRegistry
 
 
@@ -84,7 +85,8 @@ class ScopedAgent(BaseAgent):
         *,
         observer=None,
         workflow_id: str | None = None,
-        principal: str = "local-user",
+        principal: str = "",
+        contract: AgentRequest | None = None,
         metadata: dict[str, Any] | None = None,
         stream: bool = False,
         max_tokens: int | None = None,
@@ -92,17 +94,31 @@ class ScopedAgent(BaseAgent):
     ) -> AgentResult:
         request_id = str(uuid.uuid4())
         active_tools = ToolRegistry() if evidence_only else self.tools
-        context = ToolContext(
-            observer=observer,
-            actor="agent",
-            principal=principal,
-            request_id=request_id,
-            workflow_id=workflow_id,
-            agent_id=self.agent_id,
-            scopes=active_tools.scopes(),
-            capabilities=active_tools.agent_capabilities(),
-            metadata={"source": "specialized_agent", "untrusted_input": True, **(metadata or {})},
-        )
+        extra = {"source": "specialized_agent", "untrusted_input": True, **(metadata or {})}
+        if contract is not None:
+            context = tool_context_from_request(
+                contract,
+                observer=observer,
+                actor="agent",
+                request_id=request_id,
+                workflow_id=workflow_id,
+                agent_id=self.agent_id,
+                scopes=active_tools.scopes(),
+                capabilities=active_tools.agent_capabilities(),
+                metadata=extra,
+            )
+        else:
+            context = ToolContext(
+                observer=observer,
+                actor="agent",
+                principal=principal,
+                request_id=request_id,
+                workflow_id=workflow_id,
+                agent_id=self.agent_id,
+                scopes=active_tools.scopes(),
+                capabilities=active_tools.agent_capabilities(),
+                metadata=extra,
+            )
         return self.runtime.run(
             AgentRunRequest(
                 model=self.model,
@@ -113,6 +129,7 @@ class ScopedAgent(BaseAgent):
                 max_tokens=max_tokens or self.max_tokens,
                 stream=stream,
                 tool_context=context,
+                contract=contract,
             ),
             observer=observer,
         )

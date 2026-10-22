@@ -32,6 +32,7 @@ class AgentRunRequest:
     max_tokens: int = 2048
     stream: bool = False
     tool_context: ToolContext | None = None
+    contract: Any = None
 
 
 @runtime_checkable

@@ -10,9 +10,12 @@ you, shifted one response later.
 from __future__ import annotations
 
 import json
+import uuid
 
 from evals.helpers import ScriptedProvider, make_pu, response, text_block, tool_block
 from pu.graph.workflows.triage import classify_message, todays_events
+from pu.identity.contract import AgentRequest, admit
+from pu.identity.principal import Principal, PrincipalKind
 
 
 def last_meta(app) -> dict:
@@ -33,9 +36,23 @@ class Boom(ScriptedProvider):
         raise RuntimeError("boom")
 
 
+def _admitted() -> AgentRequest:
+    user_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    return admit(AgentRequest(
+        principal=Principal(PrincipalKind.USER, user_id, workspace_id),
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+    ))
+
+
 def classify(reply_text: str):
-    return classify_message(ScriptedProvider([response([text_block(reply_text)])]),
-                            "small-model", "hello")
+    return classify_message(
+        ScriptedProvider([response([text_block(reply_text)])]),
+        "small-model",
+        "hello",
+        _admitted(),
+    )
 
 
 def test_classifier_parses_routes_and_fails_open_on_garbage():
@@ -45,7 +62,7 @@ def test_classifier_parses_routes_and_fails_open_on_garbage():
     # every malformed shape falls open to full — capability over latency
     assert classify("no json here at all")[0] == "full"
     assert classify('{"route": "sideways"}')[0] == "full"
-    assert classify_message(Boom(), "small-model", "hi")[0] == "full"
+    assert classify_message(Boom(), "small-model", "hi", _admitted())[0] == "full"
 
 
 def test_todays_events_reads_the_ics(tmp_path):

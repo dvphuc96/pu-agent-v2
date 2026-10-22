@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 
 from pu.core.interfaces.agents import AgentResult
 from pu.core.interfaces.llm import LLMRequest
-from pu.core.interfaces.tools import ToolContext
 from pu.evaluation.issues import report_issues
 from pu.harness.audit import redact
 from pu.ops.briefing import PERSONAL_DOMAINS
@@ -326,14 +325,30 @@ class InboxChatBriefing:
     def tool(self, name, notify, arguments=None):
         arguments = arguments or {}
         with self.measure("calendar" if name == "read_week_availability" else "inbox_scan"):
-            result = self.app.tool_harness.execute(
+            from pu.identity.contract import invoke_tool, request_for_connection
+
+            scopes = (
+                frozenset({"email:read", "calendar:read"})
+                if self.targeted
+                else self.app.tools.scopes()
+            )
+            capabilities = (
+                frozenset({"email:read", "calendar:read"})
+                if self.targeted
+                else self.app.tools.agent_capabilities()
+            )
+            contract = request_for_connection(self.app.conn, scopes=scopes)
+            result = invoke_tool(
+                self.app.tool_harness,
                 name,
                 arguments,
-                ToolContext(
-                    principal="local-user", actor="chat-inbox", agent_id="inbox-briefing-agent",
-                    request_id=str(uuid.uuid4()), scopes=frozenset({"email:read", "calendar:read"}) if self.targeted else self.app.tools.scopes(),
-                    capabilities=frozenset({"email:read", "calendar:read"}) if self.targeted else self.app.tools.agent_capabilities(), observer=notify,
-                ),
+                contract,
+                actor="chat-inbox",
+                agent_id="inbox-briefing-agent",
+                request_id=str(uuid.uuid4()),
+                scopes=scopes,
+                capabilities=capabilities,
+                observer=notify,
             )
         self.calls.append({"tool": name, "args": arguments, "output": result.output, "ok": result.ok})
         if not result.ok:

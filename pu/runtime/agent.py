@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from pu.core.interfaces.agents import AgentRunRequest, AgentRuntime, AgentResult
+from pu.core.interfaces.agents import AgentResult, AgentRunRequest, AgentRuntime
 from pu.core.interfaces.llm import LLMProvider
-from pu.core.interfaces.tools import ToolContext, ToolHarness
+from pu.core.interfaces.tools import ToolHarness
+from pu.identity.contract import admit_call, tool_context_from_request
 from pu.loop.agent import run_loop
 
 
@@ -19,11 +20,12 @@ class DefaultAgentRuntime(AgentRuntime):
 
     def run(self, request: AgentRunRequest, observer=None) -> AgentResult:
         context = request.tool_context
-        if context is None:
-            context = ToolContext(
+        contract = admit_call(contract=request.contract, context=context)
+        if context is None or not context.principal:
+            context = tool_context_from_request(
+                contract,
                 observer=observer,
                 actor="agent",
-                principal="local-user",
                 agent_id="pu-agent",
                 scopes=request.tools.scopes(),
                 capabilities=request.tools.agent_capabilities(),
