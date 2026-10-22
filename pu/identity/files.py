@@ -74,6 +74,45 @@ def write_owned_text(home: Path, relative: str, text: str) -> Path:
     return write_owned_bytes(home, relative, text.encode("utf-8"))
 
 
+def private_file(home: Path, relative: str) -> Path | None:
+    """Path the current owner may read.
+
+    A file claimed by someone else, or a legacy file when this user is not
+    the database-local owner, is not returned. Callers treat ``None`` as
+    "this user has no such file" and must not open the other copy.
+    """
+    legacy = Path(home) / relative
+    try:
+        owner = owner_for_home(home)
+    except sqlite3.Error:
+        owner = ""
+    if not owner:
+        return legacy if legacy.is_file() else None
+    owned = owner_root(home, owner) / relative
+    if owned.is_file():
+        return owned
+    if not legacy.is_file():
+        return None
+    sidecar = legacy.with_name(legacy.name + ".owner")
+    claimed = sidecar.read_text(encoding="utf-8").strip() if sidecar.is_file() else ""
+    local = _local_owner(home)
+    if claimed and claimed != owner:
+        return None
+    if not claimed and local and owner != local:
+        return None
+    return legacy
+
+
+def claim_private_file(home: Path, relative: str) -> None:
+    """Mark a legacy file as the current owner's and mirror it."""
+    owner = owner_for_home(home)
+    path = Path(home) / relative
+    if owner and path.is_file():
+        path.with_name(path.name + ".owner").write_text(owner, encoding="utf-8")
+    if path.is_file():
+        note_written(home, path)
+
+
 def read_owned_bytes(home: Path, relative: str) -> bytes:
     owner = owner_for_home(home)
     if not owner:

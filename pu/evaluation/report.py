@@ -642,6 +642,18 @@ class LLMReportJudge:
             + json.dumps(compact, ensure_ascii=False)
         )
         try:
+            from pu.identity.contract import AgentRequest, admit
+            from pu.identity.seam import attached_principal
+
+            attached = attached_principal()
+            if attached is not None:
+                admit(
+                    AgentRequest(
+                        principal=attached,
+                        owner_user_id=attached.user_id,
+                        workspace_id=attached.workspace_id,
+                    )
+                )
             response = self.provider.complete(LLMRequest(model=self.model, max_tokens=4000, messages=[{"role": "user", "content": prompt}]))
             from pu.reporting.evidence import StructuredReportBuilder
             data = StructuredReportBuilder._parse_json(response.text)

@@ -99,6 +99,9 @@ class GmailResearchReader:
     def thread(self, thread_id, max_messages=30):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", thread_id) or not 1 <= max_messages <= 100:
             raise ValueError("Thread ID hoặc giới hạn email không hợp lệ.")
+        from pu.agents.isolation import refuse_before_provider
+
+        refuse_before_provider(self.conn, thread_id=thread_id)
         raw = self.service().users().threads().get(userId="me", id=thread_id, format="full").execute()
         messages = sorted(raw.get("messages", []), key=lambda item: int(item.get("internalDate", 0)))
         rows = [self.normalize(item) for item in messages[-max_messages:]]

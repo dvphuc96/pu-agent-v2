@@ -29,6 +29,15 @@ from pu.orchestration.partner_validation import (
 from pu.reporting.identity import candidate_website, domain_of
 from pu.reporting.workspace import WorkspaceRepository, now
 
+
+def job_fingerprint(owner: str, email_ids) -> str:
+    """Hash a job so two owners can brief the same message ids separately."""
+    payload = json.dumps(
+        {"owner": owner, "ids": sorted(email_ids)}, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 PERSONAL_DOMAINS = {
     "gmail.com",
     "googlemail.com",
@@ -222,7 +231,9 @@ class BriefingService:
                             now(),
                         ),
                     )
-                fingerprint = hashlib.sha256(json.dumps(sorted(unseen)).encode()).hexdigest()
+                from pu.identity.scope import current_owner_user_id
+
+                fingerprint = job_fingerprint(current_owner_user_id(conn), unseen)
                 conn.execute(
                     "INSERT OR IGNORE INTO briefing_jobs(id,fingerprint,workspace_id,email_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",
                     (
@@ -313,8 +324,10 @@ class BriefingService:
                     (workspace["id"],),
                 ).fetchone():
                     continue
+                from pu.identity.scope import current_owner_user_id
+
                 fingerprint = hashlib.sha256(
-                    f"meeting:{workspace['id']}:{day}".encode()
+                    f"meeting:{current_owner_user_id(conn)}:{workspace['id']}:{day}".encode()
                 ).hexdigest()
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO briefing_jobs(id,fingerprint,workspace_id,email_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",
@@ -678,9 +691,23 @@ class BriefingService:
         return selected
 
     def _triage_batch(self, emails, app):
+        from pu.agents.isolation import refuse_before_provider
         from pu.core.interfaces.llm import LLMRequest
+        from pu.identity.contract import AgentRequestRejected, request_for_connection
         from pu.reporting.evidence import StructuredReportBuilder
 
+        conn = getattr(app, "conn", None)
+        if conn is None:
+            raise AgentRequestRejected("request is missing principal or owner")
+        request_for_connection(conn, scopes=())
+        refuse_before_provider(
+            conn,
+            thread_ids=[
+                str(email.get("thread_id"))
+                for email in emails
+                if isinstance(email, dict) and email.get("thread_id")
+            ],
+        )
         response = app.llm_provider.complete(
             LLMRequest(
                 model=app.settings.small_model or app.settings.model,

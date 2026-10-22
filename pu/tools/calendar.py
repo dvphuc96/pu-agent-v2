@@ -45,9 +45,9 @@ def _write_ics(home: Path, title: str, start: str, end: str, attendees: str) -> 
     else:
         body = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//pu-agent//EN\n"
     ics_path.write_text(body + event + "END:VCALENDAR\n", encoding="utf-8")
-    from pu.identity.files import note_written
+    from pu.identity.files import claim_private_file
 
-    note_written(home, ics_path)
+    claim_private_file(home, "calendar.ics")
 
 
 def _google_event_body(
@@ -416,6 +416,7 @@ def make_list_tool(conn: sqlite3.Connection, home: Path | None = None) -> Tool:
     def list_events(start: str = "", end: str = "", limit: int = 20) -> str:
         sections: list[str] = []
         checked: list[str] = []
+        unavailable: list[str] = []
 
         if home is not None:
             from pu.tools.google_calendar import is_connected, list_google_events
@@ -423,8 +424,11 @@ def make_list_tool(conn: sqlite3.Connection, home: Path | None = None) -> Tool:
             if is_connected(home):
                 checked.append("Google Calendar")
                 g = list_google_events(home, start, end, limit)
-                # A "no events" sentence is not a section; only real rows are.
-                if g and not g.startswith(("No Google", "Google Calendar unavailable")):
+                # A failed read is not an empty diary, even when another
+                # source still has events. "No Google" is an empty success.
+                if g and g.startswith("Google Calendar unavailable"):
+                    unavailable.append(g)
+                elif g and not g.startswith("No Google"):
                     sections.append("From Google Calendar:\n" + g)
 
         checked.append("pu's local calendar")
@@ -432,11 +436,17 @@ def make_list_tool(conn: sqlite3.Connection, home: Path | None = None) -> Tool:
         if local:
             sections.append("From pu's local calendar (events pu created):\n" + local)
 
+        parts: list[str] = []
+        if unavailable:
+            parts.extend(unavailable)
         if sections:
-            return "\n\n".join(sections)
+            parts.append("\n\n".join(sections))
+        if parts:
+            return "\n\n".join(parts)
         window = f" between {start} and {end}" if (start or end) else ""
         # Name every source that was actually consulted. "Your calendar is clear"
-        # is only honest if the user knows WHICH calendars that covers.
+        # is only honest if the user knows WHICH calendars that covers, and
+        # only when every consulted source succeeded.
         return f"No events found{window}. Checked: {', '.join(checked)}."
 
     return Tool(

@@ -372,6 +372,17 @@ class WorkspaceRepository:
                 (action_hash, workspace_id, report_id, destination, json.dumps(result), now()),
             )
 
+    def ensure_company(self, company: str, website: str = "", contact: str = "") -> dict:
+        """Return this owner's workspace for an exact company name, or create one.
+
+        The same company string for another owner is a different workspace.
+        Matching stays inside ``list()``, which only returns the current owner.
+        """
+        match = next((item for item in self.list() if item["company"] == company), None)
+        if match is not None:
+            return match
+        return self.create(company[:200], website, contact)
+
     def import_existing(self) -> None:
         """Expose existing report artifacts without requiring an LLM or rerunning research."""
         from pu.identity.files import owner_for_home, owner_root
@@ -402,9 +413,7 @@ class WorkspaceRepository:
                     or payload.get("title")
                     or "Nghiên cứu khách hàng"
                 )
-                workspace = next(
-                    (w for w in self.list() if w["company"] == company), None
-                ) or self.create(company[:200])
+                workspace = self.ensure_company(company)
                 self.attach_report(workspace["id"], payload)
             except (ValueError, KeyError, TypeError, OSError):
                 continue

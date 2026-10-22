@@ -175,12 +175,34 @@ def execute_worker_read(
 ) -> ToolResult:
     payload = dict(arguments or {})
     connection_id = str(payload.get("connection_id") or "")
+    thread_id = str(payload.get("thread_id") or "")
+    report_id = str(payload.get("report_id") or "")
+    named_workspace = str(payload.get("workspace_id") or "")
     if connection_id:
         from pu.identity.session import refuse_foreign_connection
 
         refusal = refuse_foreign_connection(home, connection_id, owner_user_id)
         if refusal is not None:
             return ToolResult(output="", ok=False, error=refusal)
+    if thread_id or report_id or named_workspace:
+        if home is None:
+            return ToolResult(output="", ok=False, error="foreign_resource")
+        from pu.agents.isolation import ForeignResource, refuse_before_provider
+        from pu.db import connect
+
+        conn = connect(home)
+        try:
+            refuse_before_provider(
+                conn,
+                thread_id=thread_id,
+                report_id=report_id,
+                workspace_id=named_workspace,
+                owner=owner_user_id,
+            )
+        except ForeignResource as exc:
+            return ToolResult(output="", ok=False, error=exc.code)
+        finally:
+            conn.close()
     context = worker_context(
         owner_user_id=owner_user_id,
         workspace_id=workspace_id,
@@ -248,9 +270,14 @@ def coerce_availability(result: ToolResult) -> dict:
 
 
 def read_calendar_ics(home: Path) -> str:
-    """Today's titles from calendar.ics. Called only from a harness ``execute``."""
-    ics = Path(home) / "calendar.ics"
-    if not ics.is_file():
+    """Today's titles from this owner's calendar.ics.
+
+    Called only from a harness ``execute``. Another user's file is not read.
+    """
+    from pu.identity.files import private_file
+
+    ics = private_file(home, "calendar.ics")
+    if ics is None:
         return "(no calendar)"
     today = datetime.now().strftime("%Y%m%d")
     lines: list[str] = []

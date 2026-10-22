@@ -92,6 +92,9 @@ class ScopedAgent(BaseAgent):
         max_tokens: int | None = None,
         evidence_only: bool = False,
     ) -> AgentResult:
+        from pu.agents.isolation import refuse_metadata
+
+        refuse_metadata((metadata or {}).get("home"), metadata)
         request_id = str(uuid.uuid4())
         active_tools = ToolRegistry() if evidence_only else self.tools
         extra = {"source": "specialized_agent", "untrusted_input": True, **(metadata or {})}
