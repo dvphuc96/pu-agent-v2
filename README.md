@@ -40,6 +40,8 @@ Giữ lại:
 
 ## Chạy local
 
+Nâng cấp bản một người dùng lên Phase 0–6 đa người dùng (biến môi trường, role PostgreSQL `pu_app`, migration 9005–9009, home `owners/<id>/`, đăng nhập và rollback): [docs/DEPLOY_MULTI_USER.md](docs/DEPLOY_MULTI_USER.md).
+
 ```bash
 python -m pu
 python -m pu dashboard
