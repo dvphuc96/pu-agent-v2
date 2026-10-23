@@ -2,6 +2,7 @@
 
 Tài liệu authoritative cho kiến trúc và migration là [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 
+- [`DEPLOY_MULTI_USER.md`](DEPLOY_MULTI_USER.md): nâng cấp và triển khai đa người dùng (Phase 0–6), đối chiếu từ mã đang chạy.
 - `phase1/`: evidence cho Identity Migration.
 - `phase2/`: evidence cho Scope Prune.
 - `phase3/`: evidence cho OOP Domain Contracts + Composition Root.

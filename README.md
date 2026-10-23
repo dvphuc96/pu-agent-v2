@@ -40,6 +40,8 @@ Giữ lại:
 
 ## Chạy local
 
+Nâng cấp bản một người dùng lên Phase 0–6 (runtime vẫn là SQLite; schema PostgreSQL `pu_app` chỉ là hợp đồng test): [docs/DEPLOY_MULTI_USER.md](docs/DEPLOY_MULTI_USER.md).
+
 ```bash
 python -m pu
 python -m pu dashboard
