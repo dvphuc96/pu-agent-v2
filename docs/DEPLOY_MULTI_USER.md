@@ -384,7 +384,7 @@ Không có cookie:
 - Host loopback: `evaluate` không reject và không gắn principal.
 - Host khác: reject lý do `loopback_host`.
 
-Có cookie: host không bị xét lại. Hàng `auth_sessions` còn sống thì principal là `owner_user_id` của hàng đó. Hàng mất hoặc đã `revoked_at` thì lý do `session_revoked`. `POST` khi đã có phiên còn đòi header `X-CSRF-Token` trùng `csrf_token` của hàng. Thiếu hoặc lệch thì lý do `csrf`.
+Có cookie: `evaluate_on_home` không xét lại host. Hàng `auth_sessions` còn sống thì principal là `owner_user_id` của hàng đó. Hàng mất hoặc đã `revoked_at` thì lý do `session_revoked`. Handler coi lý do đó như không có phiên ở `GET /api/auth/login`, `GET /api/auth/callback`, và ở shell (`/`, `/static`) — Host không loopback vẫn `403 loopback_host`. Phiên còn sống không bị xét lại host. `POST` khi đã có phiên còn đòi header `X-CSRF-Token` trùng `csrf_token` của hàng. Thiếu hoặc lệch thì lý do `csrf`.
 
 Mã HTTP từ `Handler`:
 
@@ -394,8 +394,11 @@ Mã HTTP từ `Handler`:
 | `GET` loopback, không cookie, path không phải `/api/` | `200`. Trang và file tĩnh vẫn ra. `/metrics` cũng vậy và còn gọi `connect()` |
 | `GET` `/api/...` loopback, không cookie, trừ ba path auth bên dưới | `401` `{"error":"no authenticated principal"}` |
 | `POST` `/api/...` loopback, không cookie | `401` cùng lỗi đó |
-| `GET /` hoặc `GET /static/...` khi cookie phiên đã thu hồi | `200` shell đăng nhập và file tĩnh. Không gắn principal. `/static/../` không thuộc shell |
-| `GET` khác khi cookie phiên đã thu hồi, gồm `/api/...` và `/metrics` | `401` `{"error":"session_revoked"}` |
+| `GET /` hoặc `GET /static/...` Host loopback, cookie phiên đã thu hồi | `200` shell đăng nhập và file tĩnh. Không gắn principal. `/static/../` không thuộc shell |
+| `GET /` hoặc `GET /static/...` Host không loopback, không có phiên sống | `403` `{"error":"loopback_host"}`. Không trả HTML đăng nhập |
+| `GET` khác khi cookie phiên đã thu hồi, gồm `/api/...` và `/metrics` | `401` `{"error":"session_revoked"}` và `Set-Cookie: pu_session` với `Max-Age=0`, HttpOnly, Secure, SameSite=Lax. Kể cả `GET /api/auth/csrf` |
+| `GET /api/auth/login` hoặc `GET /api/auth/callback` khi reject chỉ là `session_revoked` và Host loopback | Đi tiếp như không có phiên. Login `200` còn xóa cookie chết. Callback hợp lệ phát hành phiên mới (cookie mới thay cookie cũ, không thêm `Max-Age=0` trên cùng response) |
+| `GET /api/auth/login` hoặc `GET /api/auth/callback` Host không loopback, cookie đã thu hồi | `403` `{"error":"loopback_host"}`. Không tạo giao dịch OIDC và không phát hành phiên |
 | `POST` cookie không còn phiên | `403` `{"error":"session_revoked"}`. Nhánh `POST` luôn dùng 403 khi `evaluate` reject |
 | `POST` phiên sống, CSRF thiếu hoặc sai | `403` `{"error":"csrf"}` |
 | `GET /api/auth/login` khi thiếu OIDC | `400` JSON `oidc_not_configured`, kèm `required` và `missing` |
@@ -403,10 +406,10 @@ Mã HTTP từ `Handler`:
 | `GET /api/auth/callback` thành công | `302` `Location: /#overview`. `Set-Cookie` phiên và `pu_oidc` với `Max-Age=0`. Body rỗng. Không có `csrf_token` trong URL |
 | `GET /api/auth/callback` lỗi | `400` HTML tiếng Việt. Không `Set-Cookie: pu_session` |
 | `GET /api/auth/csrf` phiên sống | `200` `{"csrf_token","user_id"}` |
-| `GET /api/auth/csrf` khi không có phiên sống | `401` `{"error":"session_revoked"}` |
+| `GET /api/auth/csrf` khi không có phiên sống | `401` `{"error":"session_revoked"}` và `Set-Cookie: pu_session` với `Max-Age=0` |
 | `POST /api/auth/logout` đủ phiên và CSRF | `200` `{"ok": true}`, cookie phiên `Max-Age=0`, hàng ghi `revoked_at` |
 
-Ba path không đòi principal: `GET /api/auth/login`, `GET /api/auth/callback`, `GET /api/auth/csrf`. Chúng vẫn phải qua `evaluate` trước, nên Host không loopback mà không có cookie thì nhận `403 loopback_host` chứ không tới được bước login.
+Ba path không đòi principal: `GET /api/auth/login`, `GET /api/auth/callback`, `GET /api/auth/csrf`. Chúng vẫn phải qua `evaluate` trước. Host không loopback mà không có phiên sống (không cookie, hoặc cookie đã thu hồi) nhận `403 loopback_host` ở login, callback và shell. Trên loopback, cookie đã thu hồi không chặn login và callback. `GET /api/auth/csrf` không có phiên sống vẫn `401 session_revoked`.
 
 Màn hình đăng nhập nằm trong `pu/ops/static/index.html` (`body` có class `logged-out` cho tới khi phiên được xác nhận) và `pu/ops/static/js/auth.js`. CSS ẩn nav, nội dung và dock khi class đó còn. Trang tĩnh không nhúng dữ liệu user.
 

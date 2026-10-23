@@ -1507,18 +1507,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        from pu.identity.session import RequestDecision, attached_decision, evaluate_on_home
+        from pu.identity.session import (
+            RequestDecision,
+            attached_decision,
+            evaluate_on_home,
+            host_is_loopback,
+        )
 
         decision = evaluate_on_home(self.headers, mutate=False)
-        # A revoked cookie still 401s every API and /metrics. The login document
-        # and /static have no user data; without them a reload is a blank JSON page.
-        shell = _is_login_shell(self.path) and decision.reason == "session_revoked"
-        if decision.rejected and not shell:
-            status = 401 if decision.reason == "session_revoked" else 403
+        path = self.path.split("?", 1)[0]
+        dead = decision.reason == "session_revoked"
+        loopback = host_is_loopback(self.headers)
+        # A dead cookie is not a session. Login and callback continue, then
+        # the no-cookie loopback rule applies. A live session is unchanged.
+        retry_auth = dead and path in {"/api/auth/login", "/api/auth/callback"}
+        # Shell files have no user data. Only loopback may see them without a
+        # live session. A non-loopback host stays loopback_host.
+        shell = _is_login_shell(self.path) and dead and loopback
+        if not decision.authenticated and not loopback and (
+            _is_login_shell(self.path) or retry_auth
+        ):
+            self._reject(403, "loopback_host")
+            return
+        if decision.rejected and not shell and not (retry_auth and loopback):
+            status = 401 if dead else 403
             self._reject(status, decision.reason)
             return
         if decision.rejected:
             decision = RequestDecision(rejected=False)
+        self._drop_dead_session = bool(retry_auth and loopback)
         with attached_decision(decision):
             if self.path.startswith("/api/auth/"):
                 self._auth_get()
@@ -1528,9 +1545,13 @@ class Handler(BaseHTTPRequestHandler):
             self._get_routes()
 
     def _reject(self, status: int, reason: str) -> None:
+        from pu.identity.session import SESSION_COOKIE, format_set_cookie
+
         body = json.dumps({"error": reason}).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if status == 401 and reason == "session_revoked":
+            self.send_header("Set-Cookie", format_set_cookie(SESSION_COOKIE, "", max_age=0))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1565,6 +1586,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(400)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_drop_dead_session", False):
+            from pu.identity.session import SESSION_COOKIE, format_set_cookie
+
+            self.send_header("Set-Cookie", format_set_cookie(SESSION_COOKIE, "", max_age=0))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1596,10 +1621,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, _oidc_not_configured_payload())
                 return
             started = store.begin_oidc(provider)
+            cookies = []
+            if getattr(self, "_drop_dead_session", False):
+                from pu.identity.session import format_set_cookie
+
+                cookies.append(("Set-Cookie", format_set_cookie(SESSION_COOKIE, "", max_age=0)))
+            cookies.append(("Set-Cookie", started.set_cookie))
             self._send_json(
                 200,
                 {"authorization_url": started.authorization_url},
-                extra=(("Set-Cookie", started.set_cookie),),
+                extra=tuple(cookies),
             )
             return
         if path == "/api/auth/callback":

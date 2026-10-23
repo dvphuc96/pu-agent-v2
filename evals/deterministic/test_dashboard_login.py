@@ -448,6 +448,146 @@ def test_lg06_missing_oidc_config_lists_variables_without_crashing(tmp_path, mon
     assert partial["missing"] == ["PU_OIDC_ISSUER"]
 
 
+def _cookie_headers(sent: list[tuple[str, str]], name: str) -> list[str]:
+    return [
+        value
+        for key, value in sent
+        if key == "Set-Cookie" and value.startswith(name + "=")
+    ]
+
+
+def test_dead_cookie_lets_login_and_callback_issue_a_fresh_session(tmp_path, monkeypatch):
+    home, other = _open(tmp_path)
+    _bind(monkeypatch, home)
+    _fact(home, other, A_MARK)
+    dead = AuthStore(home).issue_session(other)
+    AuthStore(home).revoke_session(dead.session_id)
+    dead_cookie = f"{SESSION_COOKIE}={dead.session_id}"
+
+    csrf = _Handler("GET", "/api/auth/csrf", {"Cookie": dead_cookie})
+    assert csrf.statuses == [401]
+    assert json.loads(csrf.body)["error"] == "session_revoked"
+    assert A_MARK.encode() not in csrf.body
+    cleared = _cookie_headers(csrf.sent, SESSION_COOKIE)
+    assert len(cleared) == 1
+    assert "Max-Age=0" in cleared[0]
+    assert "HttpOnly" in cleared[0] and "Secure" in cleared[0] and "SameSite=Lax" in cleared[0]
+    api = _Handler("GET", "/api/data", {"Cookie": dead_cookie})
+    assert api.statuses == [401]
+    assert "Max-Age=0" in _cookie_headers(api.sent, SESSION_COOKIE)[0]
+    assert A_MARK.encode() not in api.body
+
+    seen: dict = {}
+
+    def http_post(_url, form):
+        seen["form"] = dict(form)
+        token = sign_hs256(
+            {
+                "sub": "subject-dead-cookie",
+                "iss": "https://idp.test",
+                "aud": "pu-test",
+                "exp": int(time.time()) + 600,
+                "nonce": seen["nonce"],
+            },
+            CLIENT_SECRET,
+        )
+        return {"id_token": token}
+
+    monkeypatch.setattr("pu.ops.dashboard._oidc_provider_from_env", lambda: _provider(http_post))
+    off_host = {"Host": "rebind.example", "Cookie": dead_cookie}
+    before_tx = _count(home, "SELECT COUNT(*) FROM oidc_transactions")
+    blocked_login = _Handler("GET", "/api/auth/login", off_host)
+    assert blocked_login.statuses == [403]
+    assert json.loads(blocked_login.body)["error"] == "loopback_host"
+    assert _cookie_headers(blocked_login.sent, "pu_oidc") == []
+    assert _count(home, "SELECT COUNT(*) FROM oidc_transactions") == before_tx
+
+    login = _Handler("GET", "/api/auth/login", {"Cookie": dead_cookie})
+    assert login.statuses == [200]
+    assert "authorization_url" in json.loads(login.body)
+    login_clear = _cookie_headers(login.sent, SESSION_COOKIE)
+    assert len(login_clear) == 1 and "Max-Age=0" in login_clear[0]
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(json.loads(login.body)["authorization_url"]).query
+    )
+    seen["nonce"] = query["nonce"][0]
+    transaction = _cookie_value(_set_cookie(login.sent, "pu_oidc"))
+    callback_path = "/api/auth/callback?code=dead-cookie-code&state=" + query["state"][0]
+    both = {"Cookie": f"{dead_cookie}; pu_oidc={transaction}"}
+    before_sessions = _count(home, "SELECT COUNT(*) FROM auth_sessions")
+    blocked_callback = _Handler("GET", callback_path, {**both, "Host": "rebind.example"})
+    assert blocked_callback.statuses == [403]
+    assert json.loads(blocked_callback.body)["error"] == "loopback_host"
+    assert _count(home, "SELECT COUNT(*) FROM auth_sessions") == before_sessions
+    assert _count(home, "SELECT COUNT(*) FROM oidc_transactions") == 1
+    assert "called" not in seen and "form" not in seen
+
+    callback = _Handler("GET", callback_path, both)
+    assert callback.statuses == [302]
+    assert [value for key, value in callback.sent if key == "Location"] == ["/#overview"]
+    assert callback.body == b""
+    session_headers = _cookie_headers(callback.sent, SESSION_COOKIE)
+    assert len(session_headers) == 1
+    assert "Max-Age=0" not in session_headers[0]
+    assert "Max-Age=43200" in session_headers[0]
+    assert "HttpOnly" in session_headers[0] and "Secure" in session_headers[0]
+    fresh_id = _cookie_value(session_headers[0])
+    assert fresh_id and fresh_id != dead.session_id
+    still_dead = sqlite3.connect(home / "state.db").execute(
+        "SELECT revoked_at FROM auth_sessions WHERE id=?", (dead.session_id,)
+    ).fetchone()
+    assert still_dead[0]
+    fresh = sqlite3.connect(home / "state.db").execute(
+        "SELECT revoked_at, csrf_token, owner_user_id FROM auth_sessions WHERE id=?",
+        (fresh_id,),
+    ).fetchone()
+    assert fresh[0] is None
+    again = _Handler("GET", "/api/auth/csrf", {"Cookie": f"{SESSION_COOKIE}={fresh_id}"})
+    assert again.statuses == [200]
+    assert json.loads(again.body)["csrf_token"] == fresh[1]
+    assert json.loads(again.body)["user_id"] == fresh[2]
+    old = _Handler("GET", "/api/auth/csrf", {"Cookie": dead_cookie})
+    assert old.statuses == [401]
+    assert json.loads(old.body)["error"] == "session_revoked"
+
+
+def test_revoked_cookie_off_loopback_does_not_serve_the_shell(tmp_path, monkeypatch):
+    home, other = _open(tmp_path)
+    _bind(monkeypatch, home)
+    _fact(home, other, A_MARK)
+    dead = AuthStore(home).issue_session(other)
+    AuthStore(home).revoke_session(dead.session_id)
+    revoked = {"Host": "rebind.example", "Cookie": f"{SESSION_COOKIE}={dead.session_id}"}
+    page = _Handler("GET", "/", revoked)
+    assert page.statuses == [403]
+    assert json.loads(page.body)["error"] == "loopback_host"
+    assert "Đăng nhập với Google".encode() not in page.body
+    assert A_MARK.encode() not in page.body
+    script = _Handler("GET", "/static/js/auth.js", revoked)
+    assert script.statuses == [403]
+    assert json.loads(script.body)["error"] == "loopback_host"
+    assert b"bootDashboard" not in script.body
+    assert A_MARK.encode() not in script.body
+    metrics = _Handler("GET", "/metrics", revoked)
+    assert metrics.statuses == [401]
+    assert json.loads(metrics.body)["error"] == "session_revoked"
+    loopback_shell = _Handler("GET", "/", {"Cookie": f"{SESSION_COOKIE}={dead.session_id}"})
+    assert loopback_shell.statuses == [200]
+    assert "Đăng nhập với Google" in loopback_shell.body.decode()
+    assert A_MARK.encode() not in loopback_shell.body
+
+    live = AuthStore(home).issue_session(other)
+    remote = {"Host": "rebind.example", "Cookie": f"{SESSION_COOKIE}={live.session_id}"}
+    home_page = _Handler("GET", "/", remote)
+    assert home_page.statuses == [200]
+    asset = _Handler("GET", "/static/js/auth.js", remote)
+    assert asset.statuses == [200]
+    assert any(key == "Content-Type" and "javascript" in value for key, value in asset.sent)
+    csrf = _Handler("GET", "/api/auth/csrf", remote)
+    assert csrf.statuses == [200]
+    assert json.loads(csrf.body)["user_id"] == other.user_id
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_lg_login_screen_runtime():
     result = subprocess.run(
