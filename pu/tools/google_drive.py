@@ -2,8 +2,10 @@
 
 Third member of the Google Desktop-OAuth family (calendar, gmail), same rules:
   bundled client by default, `.pu/credentials.json` overrides;
-  own token file (`.pu/drive-token.json`) with the `drive.readonly` scope,
-  so connecting Drive touches neither calendar nor Gmail tokens;
+  a per-owner token (``owners/<id>/drive-token.json``) with the
+  ``drive.readonly`` scope, so connecting Drive touches neither calendar
+  nor Gmail tokens. A legacy ``home/drive-token.json`` is readable only by
+  the database-local owner;
   connect() is the ONE place a browser may appear — the CLI/CRM tab, never
   mid-turn.
 
@@ -39,7 +41,14 @@ _SETUP_HINT = (
 
 
 def _token_path(home: Path) -> Path:
-    return home / _TOKEN_FILE
+    """Token path for the current owner. An empty owner raises.
+
+    The legacy ``home/drive-token.json`` file is readable only by the
+    database-local owner. A cookieless request does not receive that path.
+    """
+    from pu.identity.files import owned_token_path
+
+    return owned_token_path(home, _TOKEN_FILE)
 
 
 def _load_credentials(home: Path):
@@ -76,6 +85,7 @@ def connect(home: Path) -> str:
     except ImportError:
         return _INSTALL_HINT
 
+    path = _token_path(home)
     own = home / "credentials.json"
     try:
         if own.exists():
@@ -95,7 +105,6 @@ def connect(home: Path) -> str:
     except Exception as exc:
         return f"Google sign-in failed or was cancelled ({type(exc).__name__}). Nothing was saved."
 
-    path = _token_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(creds.to_json(), encoding="utf-8")
     from pu.identity.files import note_written

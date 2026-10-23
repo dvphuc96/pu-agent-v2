@@ -31,8 +31,9 @@ def active_chat(request_id, owner_user_id: str):
 def stop_chat(request_id, owner_user_id: str):
     """Stop a run only when ``owner_user_id`` started it.
 
-    A missing owner raises. A run owned by someone else raises. An unknown
-    id returns False so a finished run is not reported as another user's.
+    A missing owner raises. An unknown id and a run owned by someone else
+    both return False, so the response is not an id-liveness oracle. Neither
+    case cancels the run.
     """
     if not owner_user_id:
         raise PermissionError("no authenticated principal")
@@ -42,7 +43,7 @@ def stop_chat(request_id, owner_user_id: str):
             return False
         event, owner = record
         if owner != owner_user_id:
-            raise PermissionError("chat run is not owned by this session")
+            return False
         event.set()
         return True
 

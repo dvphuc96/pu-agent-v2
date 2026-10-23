@@ -70,6 +70,25 @@ def owner_root(home: Path, owner_user_id: str) -> Path:
     return Path(home) / "owners" / owner_user_id
 
 
+def owned_token_path(home: Path, relative: str) -> Path:
+    """Path this owner may read or write for one OAuth token.
+
+    A bound request with no principal raises before any path is returned.
+    An existing copy under ``owners/<id>/`` wins. The legacy ``home/<relative>``
+    file is returned only for the database-local owner, which is how a
+    single-user token stays readable after the identity database appears.
+    Every other owner gets ``owners/<id>/<relative>`` and does not receive
+    the shared file.
+    """
+    owner = owner_for_home(home)
+    found = private_file(home, relative)
+    if found is not None:
+        return found
+    if owner == database_local_owner(home):
+        return Path(home) / relative
+    return owner_root(home, owner) / relative
+
+
 def write_owned_bytes(home: Path, relative: str, data: bytes) -> Path:
     """Write ``relative`` under the current owner root only."""
     owner = owner_for_home(home)

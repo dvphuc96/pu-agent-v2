@@ -265,6 +265,16 @@ def _tool_status(output: str) -> str:
     return "ok"
 
 
+def _owner_has_token(home: Path, name: str) -> bool:
+    """True when this principal has that token. A shared home file does not count."""
+    from pu.identity.files import owned_token_path
+
+    try:
+        return owned_token_path(home, name).is_file()
+    except PermissionError:
+        return False
+
+
 def collect() -> dict:
     """Everything the page shows, in one JSON blob."""
     settings = load_settings()
@@ -498,13 +508,13 @@ def collect() -> dict:
                ORDER BY internal_date DESC LIMIT 100"""
         ),
         "gmail_enabled": settings.gmail,
-        "gmail_connected": (home / "gmail-token.json").exists(),
+        "gmail_connected": _owner_has_token(home, "gmail-token.json"),
         "knowledge_sources": [dict(r) for r in conn.execute(
             """SELECT id, title, "group", origin, path, enabled, chars, added_at
                FROM knowledge_sources
                WHERE owner_user_id = pu_current_owner()
                ORDER BY "group", title""")],
-        "drive_connected": (home / "drive-token.json").exists(),
+        "drive_connected": _owner_has_token(home, "drive-token.json"),
         "outbox": outbox,
         "skills": skills,
         "eval_report": eval_report,
@@ -976,10 +986,18 @@ def drive_action(payload: dict) -> dict:
     """POST /api/drive — connect / list / import for the Knowledge dialog.
 
     connect() may open the consent browser: an allowed entry point (like the
-    Gmail card), because the user clicked it on purpose."""
+    Gmail card), because the user clicked it on purpose. The token is the
+    caller's; a request with no principal raises before any token file opens.
+    """
+    from pu.identity.directory import current_principal
     from pu.tools import google_drive
 
     home = load_settings().ensure_home()
+    conn = connect(home)
+    try:
+        current_principal(conn)
+    finally:
+        conn.close()
     op = payload.get("op", "")
     if op == "connect":
         return {"message": google_drive.connect(home)}
@@ -1670,7 +1688,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 accepted = stop_chat(payload.get("request_id"), owner)
             except PermissionError:
-                self._reject(403, "chat run is not owned by this session")
+                self._reject(401, "no authenticated principal")
                 return
             self._send(json.dumps({"accepted": accepted}).encode(), "application/json")
             return

@@ -63,15 +63,9 @@ def _token_path(home: Path) -> Path:
     The legacy ``home/gmail-token.json`` file is readable only by the
     database-local owner. A cookieless request does not receive that path.
     """
-    from pu.identity.files import database_local_owner, owner_for_home, owner_root, private_file
+    from pu.identity.files import owned_token_path
 
-    owner = owner_for_home(home)
-    found = private_file(home, _TOKEN_FILE)
-    if found is not None:
-        return found
-    if owner == database_local_owner(home):
-        return home / _TOKEN_FILE
-    return owner_root(home, owner) / _TOKEN_FILE
+    return owned_token_path(home, _TOKEN_FILE)
 
 
 def _load_credentials(home: Path):
@@ -111,6 +105,7 @@ def connect(home: Path) -> str:
     except ImportError:
         return _INSTALL_HINT
 
+    path = _token_path(home)
     own = home / "credentials.json"
     try:
         if own.exists():
@@ -130,7 +125,6 @@ def connect(home: Path) -> str:
     except Exception as exc:
         return f"Google sign-in failed or was cancelled ({type(exc).__name__}). Nothing was saved."
 
-    path = _token_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(creds.to_json(), encoding="utf-8")
     from pu.identity.files import note_written

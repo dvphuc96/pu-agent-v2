@@ -783,9 +783,10 @@ def test_release_cookieless_probes_do_not_touch_legacy_private_data(tmp_path, mo
         cookieless = post("/api/chat/stop", {"request_id": "run-a"})
         assert cookieless.statuses == [401]
         issued_b = AuthStore(home).issue_session(user_b)
+        unknown = post("/api/chat/stop", {"request_id": "run-missing"}, issued_b)
         cross = post("/api/chat/stop", {"request_id": "run-a"}, issued_b)
-        assert cross.statuses == [403]
-        assert json.loads(cross.body)["error"] == "chat run is not owned by this session"
+        assert cross.statuses == unknown.statuses == [200]
+        assert json.loads(cross.body) == json.loads(unknown.body) == {"accepted": False}
         assert event.is_set() is False
         issued_a = AuthStore(home).issue_session(user_a)
         owned = post("/api/chat/stop", {"request_id": "run-a"}, issued_a)
@@ -812,6 +813,218 @@ def test_release_automatic_briefing_records_the_worker_owner(tmp_path):
         job.close()
     assert rejected.decided_by == user_b.user_id
     assert is_backend_user_id(rejected.decided_by)
+
+
+def test_release_google_tokens_stay_with_their_owner(tmp_path, monkeypatch):
+    """Drive and Calendar tokens are per owner, like Gmail.
+
+    User A and user B each connect and each read only their own file.
+    Neither opens the legacy home token. A cookieless request is 401.
+    The database-local owner is the only principal that still sees the
+    legacy home file.
+    """
+    import sys
+    from types import ModuleType
+
+    from pu.identity.files import database_local_owner, owner_root
+    from pu.tools import google_calendar, google_drive
+
+    home, user_a, user_b = _open(tmp_path)
+    _bind_home(monkeypatch, home)
+    canary = "phase6-shared-google-token"
+    (home / "drive-token.json").write_text(canary, encoding="utf-8")
+    (home / "google-token.json").write_text(canary, encoding="utf-8")
+    shared_reads: list[str] = []
+    loaded: list[str] = []
+    holder = {"token": ""}
+    original_read_text = Path.read_text
+    original_read_bytes = Path.read_bytes
+    original_open = Path.open
+
+    def _shared(path: Path) -> bool:
+        return path.name in {"drive-token.json", "google-token.json"} and path.parent == home
+
+    def tracking_read_text(self, *args, **kwargs):
+        if _shared(self):
+            shared_reads.append(str(self))
+        return original_read_text(self, *args, **kwargs)
+
+    def tracking_read_bytes(self, *args, **kwargs):
+        if _shared(self):
+            shared_reads.append(str(self))
+        return original_read_bytes(self, *args, **kwargs)
+
+    def tracking_open(self, *args, **kwargs):
+        if _shared(self):
+            shared_reads.append(str(self))
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracking_read_text)
+    monkeypatch.setattr(Path, "read_bytes", tracking_read_bytes)
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    class FakeCredentials:
+        def __init__(self, token: str = ""):
+            self.valid = True
+            self.expired = False
+            self.refresh_token = None
+            self.token = token
+
+        @classmethod
+        def from_authorized_user_file(cls, path, scopes=None):
+            loaded.append(str(path))
+            return cls(Path(path).read_text(encoding="utf-8"))
+
+        def to_json(self):
+            return json.dumps({"token": self.token})
+
+    class FakeFlow:
+        @classmethod
+        def from_client_secrets_file(cls, path, scopes=None):
+            return cls()
+
+        @classmethod
+        def from_client_config(cls, config, scopes=None):
+            return cls()
+
+        def run_local_server(self, port=0):
+            return FakeCredentials(holder["token"])
+
+    class _Files:
+        def list(self, **_kwargs):
+            return self
+
+        def execute(self):
+            return {"files": []}
+
+    class _Service:
+        def files(self):
+            return _Files()
+
+    google = ModuleType("google")
+    google_auth = ModuleType("google.auth")
+    transport = ModuleType("google.auth.transport")
+    requests_mod = ModuleType("google.auth.transport.requests")
+    requests_mod.Request = object
+    transport.requests = requests_mod
+    google_auth.transport = transport
+    google.auth = google_auth
+    oauth2 = ModuleType("google.oauth2")
+    credentials_mod = ModuleType("google.oauth2.credentials")
+    credentials_mod.Credentials = FakeCredentials
+    oauth2.credentials = credentials_mod
+    google.oauth2 = oauth2
+    flow_pkg = ModuleType("google_auth_oauthlib")
+    flow_mod = ModuleType("google_auth_oauthlib.flow")
+    flow_mod.InstalledAppFlow = FakeFlow
+    flow_pkg.flow = flow_mod
+    discovery = ModuleType("googleapiclient.discovery")
+    discovery.build = lambda *_args, **_kwargs: _Service()
+    apiclient = ModuleType("googleapiclient")
+    apiclient.discovery = discovery
+    for name, module in {
+        "google": google,
+        "google.auth": google_auth,
+        "google.auth.transport": transport,
+        "google.auth.transport.requests": requests_mod,
+        "google.oauth2": oauth2,
+        "google.oauth2.credentials": credentials_mod,
+        "google_auth_oauthlib": flow_pkg,
+        "google_auth_oauthlib.flow": flow_mod,
+        "googleapiclient": apiclient,
+        "googleapiclient.discovery": discovery,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    bundled = {"installed": {"client_id": "fixture-client", "client_secret": "fixture-secret"}}
+    monkeypatch.setattr(google_calendar, "BUNDLED_CLIENT_CONFIG", bundled)
+
+    def connect_both(token: str):
+        holder["token"] = token
+        google_drive.connect(home)
+        google_calendar.connect(home)
+
+    with act_as(home, user_a):
+        connect_both("token-user-a")
+    with act_as(home, user_b):
+        connect_both("token-user-b")
+
+    def owned(user, name: str) -> str:
+        with original_open(owner_root(home, user.user_id) / name, encoding="utf-8") as handle:
+            return handle.read()
+
+    def legacy(name: str) -> str:
+        with original_open(home / name, encoding="utf-8") as handle:
+            return handle.read()
+
+    assert "token-user-a" in owned(user_a, "drive-token.json")
+    assert "token-user-a" in owned(user_a, "google-token.json")
+    assert "token-user-b" in owned(user_b, "drive-token.json")
+    assert "token-user-b" in owned(user_b, "google-token.json")
+    assert "token-user-b" not in owned(user_a, "drive-token.json")
+    assert "token-user-a" not in owned(user_b, "google-token.json")
+    assert shared_reads == []
+    assert legacy("drive-token.json") == canary
+    assert legacy("google-token.json") == canary
+
+    def read_both():
+        google_drive._load_credentials(home)
+        google_calendar._load_credentials(home, google_calendar.DEFAULT_SCOPES)
+        google_drive.list_files(home)
+
+    with act_as(home, user_a):
+        read_both()
+    assert loaded == [
+        str(owner_root(home, user_a.user_id) / "drive-token.json"),
+        str(owner_root(home, user_a.user_id) / "google-token.json"),
+        str(owner_root(home, user_a.user_id) / "drive-token.json"),
+    ]
+    assert shared_reads == []
+    loaded.clear()
+    with act_as(home, user_b):
+        read_both()
+    assert all(user_b.user_id in path for path in loaded)
+    assert shared_reads == []
+    assert canary not in "".join(loaded)
+
+    local_id = database_local_owner(home)
+    conn = connect(home)
+    workspace_id = conn.execute(
+        "SELECT workspace_id FROM identity_local WHERE user_id = ?",
+        (local_id,),
+    ).fetchone()[0]
+    conn.close()
+    with act_as(home, Principal(PrincipalKind.USER, local_id, workspace_id)):
+        assert google_drive._token_path(home) == home / "drive-token.json"
+        assert google_calendar._token_path(home) == home / "google-token.json"
+        google_drive._load_credentials(home)
+    assert str(home / "drive-token.json") in shared_reads
+    assert canary in legacy("drive-token.json")
+
+    shared_reads.clear()
+    loaded.clear()
+
+    def post(path: str, payload: dict, issued=None):
+        body = json.dumps(payload).encode()
+        headers = {"Content-Length": str(len(body)), "Content-Type": "application/json"}
+        if issued is not None:
+            headers["Cookie"] = f"{SESSION_COOKIE}={issued.session_id}"
+            headers["X-CSRF-Token"] = issued.csrf_token
+        return _Handler("POST", path, headers, body)
+
+    listed = post("/api/drive", {"op": "list"})
+    calendar = post("/api/workspace", {"op": "connect_calendar"})
+    assert listed.statuses == [401]
+    assert calendar.statuses == [401]
+    assert json.loads(listed.body)["error"] == "no authenticated principal"
+    assert canary not in listed.body.decode() + calendar.body.decode()
+    anonymous = AuthStore(home).evaluate({"Host": "127.0.0.1"}, mutate=False)
+    with attached_decision(anonymous):
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            google_drive._token_path(home)
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            google_calendar._token_path(home)
+    assert shared_reads == []
+    assert loaded == []
 
 
 def test_release_postgres_check_rejects_empty_owner():
