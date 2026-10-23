@@ -204,12 +204,22 @@ def test_mu11_oidc_pkce_sets_lax_cookie_and_checks_state(tmp_path, monkeypatch):
         "/api/auth/callback?code=auth-code&state=" + query["state"][0],
         {"Cookie": f"pu_oidc={transaction}"},
     )
-    assert callback.statuses == [200]
-    issued = json.loads(callback.body)
-    assert issued["csrf_token"]
+    assert callback.statuses == [302]
+    locations = [value for key, value in callback.sent if key == "Location"]
+    assert locations == ["/#overview"]
+    assert callback.body == b""
     session_cookie = _cookie(callback.sent, SESSION_COOKIE)
     assert "HttpOnly" in session_cookie and "Secure" in session_cookie
     assert "SameSite=Lax" in session_cookie
+    session_id = session_cookie.split(";", 1)[0].split("=", 1)[1]
+    assert session_id not in locations[0]
+    csrf_response = _Handler(
+        "GET", "/api/auth/csrf", {"Cookie": f"{SESSION_COOKIE}={session_id}"}
+    )
+    issued = json.loads(csrf_response.body)
+    assert issued["csrf_token"]
+    assert issued["csrf_token"].encode() not in callback.body
+    assert issued["csrf_token"] not in locations[0]
     assert seen["form"]["code_verifier"]
     assert seen["form"]["code_verifier"] not in payload["authorization_url"]
     assert seen["form"]["grant_type"] == "authorization_code"

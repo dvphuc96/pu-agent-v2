@@ -123,6 +123,10 @@ const reveal = (path, label) => `<a class="reveal" onclick="revealFile('${path}'
 // in-progress edit isn't wiped (same idea as the animation guard).
 let editing = false;
 let puCsrf = "";
+function puUiClosed(){
+  const body = typeof document !== "undefined" ? document.body : null;
+  return !!(body && body.classList && body.classList.contains("logged-out"));
+}
 function puMutateHeaders(extra){
   const headers = Object.assign({"Content-Type":"application/json"}, extra || {});
   if (puCsrf) headers["X-CSRF-Token"] = puCsrf;

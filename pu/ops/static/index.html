@@ -3,7 +3,16 @@
 <title>PU Agent</title>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="stylesheet" href="/static/notebook.css">
-<link rel="stylesheet" href="/static/chat.css"></head><body>
+<link rel="stylesheet" href="/static/chat.css"></head><body class="logged-out">
+<div id="login-screen">
+  <div class="login-card">
+    <h1>PU Agent</h1>
+    <p>Đăng nhập để mở dashboard. Cookie phiên là HttpOnly; trang không lưu token đăng nhập.</p>
+    <button type="button" id="login-google">Đăng nhập với Google</button>
+    <div id="login-config" hidden></div>
+    <p id="login-error" hidden></p>
+  </div>
+</div>
 <nav id="nav">
   <div class="brand">PU Agent<small id="model" style="cursor:pointer" title="click to change the model" onclick="location.hash='#models'"></small>
     <button id="nav-toggle" title="Hide sidebar">&#10094;</button></div>
@@ -39,7 +48,14 @@
 <div class="resizer" id="nav-resizer" title="Drag to resize sidebar"></div>
 <main>
   <header class="pagehead">
-    <h1 id="title">Hôm nay</h1>
+    <div class="pagehead-row">
+      <h1 id="title">Hôm nay</h1>
+      <div id="session-bar">
+        <span id="session-user"></span>
+        <span id="logout-error"></span>
+        <button type="button" id="logout-btn">Đăng xuất</button>
+      </div>
+    </div>
     <div class="sub" id="sub"></div>
   </header>
   <div id="view"></div>
@@ -79,4 +95,5 @@
 <script src="/static/js/dock.js"></script>
 <script src="/static/js/briefing.js"></script>
 <script src="/static/js/inbox-chat.js"></script>
+<script src="/static/js/auth.js"></script>
 <script src="/static/js/main.js"></script></body></html>

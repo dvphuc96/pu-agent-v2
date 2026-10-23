@@ -32,6 +32,7 @@ async function nbAPI(payload){
   return result;
 }
 function nbPaint(){
+  if (typeof puUiClosed === "function" && puUiClosed()) return;
   const [view,id]=(location.hash||"").slice(1).split("/");
   if(!["research","reports"].includes(view)) return;
   const scrolls={};

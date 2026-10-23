@@ -20,6 +20,7 @@ const TITLES = {today:"Hôm nay", review:"Chờ phê duyệt", chat:"Trò chuy�
                 approvals:"Approvals — human review before side effects",
                 security:"Security — enforced tool boundary"};
 function render(){
+  if (puUiClosed()) return;
   if (!D) return;
   const [v, subRaw] = (location.hash||"#chat").slice(1).split("/");
   const sub = subRaw || null;
@@ -90,8 +91,12 @@ async function restoreDock(){
   await loadThreadInto(sid, {setSession: true});
 }
 async function refresh(){
+  if (puUiClosed()) return;
   try {
-    const next = await (await fetch("/api/data")).json();
+    const res = await fetch("/api/data");
+    if (!res.ok || puUiClosed()) return;
+    const next = await res.json();
+    if (!next || typeof next !== "object" || next.error) return;
     if(D && (D.data_epoch||'')!==(next.data_epoch||'')){
       CHAT.length=0;
       Object.assign(NB,{items:null,detail:null,requested:null,source:null,availability:null,loadedId:null});
@@ -142,11 +147,23 @@ function wireChrome(){
   setNav(localStorage.getItem("navHidden") === "1" || (!localStorage.getItem("navHidden") && window.innerWidth < 900));
 }
 
-fetch("/api/auth/csrf").then(r => r.ok ? r.json() : null).then(body => {
-  if (body && body.csrf_token) puCsrf = body.csrf_token;
-}).catch(() => {});
+function startDashboardLoops(){
+  if (window.__puLoops) return;
+  window.__puLoops = true;
+  refresh();
+  window.__puLoopTimers = [
+    setInterval(refresh, 5000),
+    setInterval(tickLive, 1000),
+    setInterval(pollEvents, 450),
+  ];
+  pollEvents();
+}
+function stopDashboardLoops(){
+  (window.__puLoopTimers || []).forEach(id => clearInterval(id));
+  window.__puLoopTimers = [];
+  window.__puLoops = false;
+}
 window.addEventListener("hashchange", render);
 window.__hold = (v)=>{ animating = v; };   // test hook: freeze the diagram
 wireDock(); wireChrome();
-refresh(); setInterval(refresh, 5000); setInterval(tickLive, 1000);
-pollEvents(); setInterval(pollEvents, 450);   // live harness animation
+bootDashboard();

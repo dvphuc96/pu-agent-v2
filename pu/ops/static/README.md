@@ -20,6 +20,7 @@ There is no framework, bundler or build step.
 | `js/graph.js` | triage graph visualization |
 | `js/views.js` | workspace, agents, research, reports, approvals and Connections views |
 | `js/dock.js` | chat sessions/history/model chip |
+| `js/auth.js` | login screen, CSRF bootstrap, logout, and 401 handling. Loads immediately before `main.js` |
 | `js/main.js` | refresh/render loop, resizers and bootstrap |
 
 The visual layout follows the Archive UI reference while the data and actions are
@@ -54,8 +55,10 @@ The report editor creates an immutable new version, reevaluates edited factual t
 and cancels unexecuted proposals for the previous version. Markdown, JSON and DOCX exports
 come directly from the stored snapshot; HTML/PDF are offered when artifacts are available.
 
-The dashboard retains its single-user, loopback deployment model. Mutation requests reject
-cross-origin browser calls; this does not introduce a multi-user login system.
+The dashboard still binds the loopback host. Mutation requests reject cross-origin browser
+calls. Sign-in uses the OIDC session from `docs/DEPLOY_MULTI_USER.md`: HttpOnly cookie, CSRF
+on every POST, and a login screen when the API returns 401 or `session_revoked`. The page
+does not read the session cookie and does not store an id token.
 
 Tests: `pytest evals/deterministic/test_research_workspace.py` and
 `node --test evals/deterministic/test_notebook_runtime.cjs`.

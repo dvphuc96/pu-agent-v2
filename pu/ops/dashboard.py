@@ -1355,6 +1355,92 @@ def events_since(cursor):
     return {"events": out, "cursor": len(lines)}
 
 
+# Login stays off until every one of these is non-empty. JWKS and the client
+# secret stay optional: RS256 needs the URI, HS256 needs the secret.
+OIDC_REQUIRED_ENV = (
+    "PU_OIDC_AUTHORIZATION_ENDPOINT",
+    "PU_OIDC_TOKEN_ENDPOINT",
+    "PU_OIDC_CLIENT_ID",
+    "PU_OIDC_REDIRECT_URI",
+    "PU_OIDC_ISSUER",
+)
+
+_LOGIN_ERRORS = {
+    "state": (
+        "State không khớp. Lượt đăng nhập này không còn hợp lệ. "
+        "Không có phiên nào được tạo."
+    ),
+    "nonce": (
+        "Nonce không khớp. Token không thuộc đúng lượt đăng nhập. "
+        "Không có phiên nào được tạo."
+    ),
+    "exp": "Token đăng nhập đã hết hạn. Không có phiên nào được tạo.",
+    "oidc_cookie": (
+        "Thiếu cookie giao dịch đăng nhập. Hãy bấm Đăng nhập với Google lại từ đầu. "
+        "Không có phiên nào được tạo."
+    ),
+    "id_token": "Token danh tính không hợp lệ. Không có phiên nào được tạo.",
+    "iss": "Nhà phát hành token không khớp cấu hình. Không có phiên nào được tạo.",
+    "aud": "Đối tượng của token không khớp ứng dụng. Không có phiên nào được tạo.",
+    "azp": "Bên được ủy quyền của token không khớp. Không có phiên nào được tạo.",
+    "missing_sub": "Token không có định danh người dùng. Không có phiên nào được tạo.",
+    "jwks": "Không kiểm tra được chữ ký token. Không có phiên nào được tạo.",
+    "idp_transport": (
+        "Không liên hệ được nhà cung cấp danh tính. Không có phiên nào được tạo."
+    ),
+}
+
+
+def _oidc_not_configured_payload() -> dict:
+    """Names only. Values stay in the environment and never go to the browser."""
+    missing = [
+        name for name in OIDC_REQUIRED_ENV if not os.environ.get(name, "").strip()
+    ]
+    if not missing:
+        missing = list(OIDC_REQUIRED_ENV)
+    return {
+        "error": "oidc_not_configured",
+        "required": list(OIDC_REQUIRED_ENV),
+        "missing": missing,
+    }
+
+
+def _login_error_message(code: str) -> str:
+    if code == "oidc_not_configured":
+        names = ", ".join(OIDC_REQUIRED_ENV)
+        return (
+            "Chưa cấu hình OIDC. Cần đặt các biến: "
+            + names
+            + ". Không có phiên nào được tạo."
+        )
+    return _LOGIN_ERRORS.get(
+        code, "Đăng nhập không thành công. Không có phiên nào được tạo."
+    )
+
+
+def _auth_error_code(exc: Exception) -> str:
+    import re
+
+    code = getattr(exc, "code", "oidc")
+    if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,32}", code):
+        return code
+    return "oidc"
+
+
+def _is_login_shell(path: str) -> bool:
+    """The login document and its static assets. Nothing under /api or /metrics."""
+    clean = path.split("?", 1)[0]
+    if clean in {"/", "/index.html"}:
+        return True
+    prefix = "/static/"
+    if not clean.startswith(prefix):
+        return False
+    rest = clean[len(prefix):]
+    if not rest or "\\" in rest:
+        return False
+    return ".." not in rest.split("/")
+
+
 def _oidc_provider_from_env():
     """OIDC client from the environment. Login stays off until every endpoint is set."""
     import urllib.parse
@@ -1362,13 +1448,14 @@ def _oidc_provider_from_env():
 
     from pu.identity.oidc import OidcProvider
 
-    authorization = os.environ.get("PU_OIDC_AUTHORIZATION_ENDPOINT", "").strip()
-    token_endpoint = os.environ.get("PU_OIDC_TOKEN_ENDPOINT", "").strip()
-    client_id = os.environ.get("PU_OIDC_CLIENT_ID", "").strip()
-    redirect_uri = os.environ.get("PU_OIDC_REDIRECT_URI", "").strip()
-    issuer = os.environ.get("PU_OIDC_ISSUER", "").strip()
+    values = {name: os.environ.get(name, "").strip() for name in OIDC_REQUIRED_ENV}
+    authorization = values["PU_OIDC_AUTHORIZATION_ENDPOINT"]
+    token_endpoint = values["PU_OIDC_TOKEN_ENDPOINT"]
+    client_id = values["PU_OIDC_CLIENT_ID"]
+    redirect_uri = values["PU_OIDC_REDIRECT_URI"]
+    issuer = values["PU_OIDC_ISSUER"]
     jwks_uri = os.environ.get("PU_OIDC_JWKS_URI", "").strip()
-    if not (authorization and token_endpoint and client_id and redirect_uri and issuer):
+    if not all(values.values()):
         return None
     secret = os.environ.get("PU_OIDC_CLIENT_SECRET", "")
 
@@ -1420,12 +1507,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        from pu.identity.session import attached_decision, evaluate_on_home
+        from pu.identity.session import RequestDecision, attached_decision, evaluate_on_home
 
         decision = evaluate_on_home(self.headers, mutate=False)
-        if decision.rejected:
-            self._reject(401 if decision.reason == "session_revoked" else 403, decision.reason)
+        # A revoked cookie still 401s every API and /metrics. The login document
+        # and /static have no user data; without them a reload is a blank JSON page.
+        shell = _is_login_shell(self.path) and decision.reason == "session_revoked"
+        if decision.rejected and not shell:
+            status = 401 if decision.reason == "session_revoked" else 403
+            self._reject(status, decision.reason)
             return
+        if decision.rejected:
+            decision = RequestDecision(rejected=False)
         with attached_decision(decision):
             if self.path.startswith("/api/auth/"):
                 self._auth_get()
@@ -1442,6 +1535,40 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, status: int, payload: dict, extra: tuple = ()) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        for key, value in extra:
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_login_error(self, code: str) -> None:
+        """Readable failure page. No session cookie and no token material."""
+        from html import escape
+
+        message = escape(_login_error_message(code))
+        safe_code = escape(code)
+        page = (
+            "<!doctype html><html lang=\"vi\"><head><meta charset=\"utf-8\">"
+            "<title>Đăng nhập thất bại</title></head><body>"
+            "<h1>Không đăng nhập được</h1>"
+            f"<p>{message}</p>"
+            f"<p>Mã lỗi: {safe_code}</p>"
+            "<p><a href=\"/\">Về màn hình đăng nhập</a></p>"
+            "</body></html>"
+        )
+        body = page.encode("utf-8")
+        self.send_response(400)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _auth_get(self) -> None:
         from urllib.parse import parse_qs, urlparse
 
@@ -1453,31 +1580,33 @@ class Handler(BaseHTTPRequestHandler):
         store = AuthStore(home)
         path = self.path.split("?", 1)[0]
         if path == "/api/auth/csrf":
+            from pu.identity.session import session_principal
+
             token = store.csrf_token(cookie_value(self.headers, SESSION_COOKIE))
             if not token:
                 self._reject(401, "session_revoked")
                 return
-            self._send(json.dumps({"csrf_token": token}).encode(), "application/json", no_cache=True)
+            principal = session_principal()
+            user_id = principal.user_id if principal is not None else ""
+            self._send_json(200, {"csrf_token": token, "user_id": user_id})
             return
         if path == "/api/auth/login":
             provider = _oidc_provider_from_env()
             if provider is None:
-                self._reject(400, "oidc_not_configured")
+                self._send_json(400, _oidc_not_configured_payload())
                 return
             started = store.begin_oidc(provider)
-            body = json.dumps({"authorization_url": started.authorization_url}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", started.set_cookie)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(
+                200,
+                {"authorization_url": started.authorization_url},
+                extra=(("Set-Cookie", started.set_cookie),),
+            )
             return
         if path == "/api/auth/callback":
             provider = _oidc_provider_from_env()
             params = parse_qs(urlparse(self.path).query)
             if provider is None:
-                self._reject(400, "oidc_not_configured")
+                self._send_login_error("oidc_not_configured")
                 return
             try:
                 issued = store.complete_oidc(
@@ -1487,17 +1616,17 @@ class Handler(BaseHTTPRequestHandler):
                     transaction_cookie=cookie_value(self.headers, "pu_oidc"),
                 )
             except Exception as exc:
-                code = getattr(exc, "code", "oidc")
-                self._reject(400, str(code))
+                self._send_login_error(_auth_error_code(exc))
                 return
-            body = json.dumps({"csrf_token": issued.csrf_token, "ok": True}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            # The session id stays in the HttpOnly cookie. CSRF is read later
+            # from /api/auth/csrf. Neither value is placed in the URL or body.
+            self.send_response(302)
+            self.send_header("Location", "/#overview")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Set-Cookie", issued.set_cookie)
             self.send_header("Set-Cookie", issued.clear_oidc_cookie)
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(body)
             return
         self._reject(404, "not_found")
 
@@ -1562,7 +1691,11 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/static/"):
             self._serve_static(self.path)
         else:
-            self._send((STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
+            self._send(
+                (STATIC / "index.html").read_bytes(),
+                "text/html; charset=utf-8",
+                no_cache=True,
+            )
 
     def _serve_static(self, path: str) -> None:  # the frontend files
         name = path.split("/static/", 1)[1].split("?")[0]

@@ -66,7 +66,7 @@ Không có biến nào bắt buộc để process dashboard lắng nghe. Chat c�
 | `PU_DASHBOARD_PORT` | Không | `pu/ops/dashboard.py` `main` | Cổng bắt đầu. Sau đó tới `PORT`, rồi hằng số `9000` |
 | `PORT` | Không | cùng chỗ, chỉ khi `PU_DASHBOARD_PORT` trống | Cổng dự phòng |
 
-Thiếu một trong năm biến OIDC bắt buộc thì `GET /api/auth/login` và `GET /api/auth/callback` trả `400` với `{"error":"oidc_not_configured"}`.
+Thiếu một trong năm biến OIDC bắt buộc thì `GET /api/auth/login` trả `400` JSON `{"error":"oidc_not_configured","required":[...],"missing":[...]}`. `required` và `missing` chỉ là tên biến, không có giá trị. `GET /api/auth/callback` trong trường hợp đó trả `400` HTML, không tạo phiên.
 
 Sinh khóa token bên ngoài repo và đưa vào môi trường. Đừng ghi giá trị vào file được commit. Test `test_release_no_xfail_and_token_key_is_not_committed` quét file theo dõi và fail nếu thấy gán `PU_TOKEN_KEY` bằng một giá trị dài từ 16 ký tự trở lên mà không phải biến shell.
 
@@ -394,24 +394,42 @@ Mã HTTP từ `Handler`:
 | `GET` loopback, không cookie, path không phải `/api/` | `200`. Trang và file tĩnh vẫn ra. `/metrics` cũng vậy và còn gọi `connect()` |
 | `GET` `/api/...` loopback, không cookie, trừ ba path auth bên dưới | `401` `{"error":"no authenticated principal"}` |
 | `POST` `/api/...` loopback, không cookie | `401` cùng lỗi đó |
-| `GET` cookie không còn phiên | `401` `{"error":"session_revoked"}` |
+| `GET /` hoặc `GET /static/...` khi cookie phiên đã thu hồi | `200` shell đăng nhập và file tĩnh. Không gắn principal. `/static/../` không thuộc shell |
+| `GET` khác khi cookie phiên đã thu hồi, gồm `/api/...` và `/metrics` | `401` `{"error":"session_revoked"}` |
 | `POST` cookie không còn phiên | `403` `{"error":"session_revoked"}`. Nhánh `POST` luôn dùng 403 khi `evaluate` reject |
 | `POST` phiên sống, CSRF thiếu hoặc sai | `403` `{"error":"csrf"}` |
-| `GET /api/auth/login` khi thiếu OIDC | `400` `{"error":"oidc_not_configured"}` |
+| `GET /api/auth/login` khi thiếu OIDC | `400` JSON `oidc_not_configured`, kèm `required` và `missing` |
+| `GET /api/auth/login` khi đủ OIDC | `200` `{"authorization_url": ...}` và `Set-Cookie: pu_oidc` |
+| `GET /api/auth/callback` thành công | `302` `Location: /#overview`. `Set-Cookie` phiên và `pu_oidc` với `Max-Age=0`. Body rỗng. Không có `csrf_token` trong URL |
+| `GET /api/auth/callback` lỗi | `400` HTML tiếng Việt. Không `Set-Cookie: pu_session` |
+| `GET /api/auth/csrf` phiên sống | `200` `{"csrf_token","user_id"}` |
 | `GET /api/auth/csrf` khi không có phiên sống | `401` `{"error":"session_revoked"}` |
+| `POST /api/auth/logout` đủ phiên và CSRF | `200` `{"ok": true}`, cookie phiên `Max-Age=0`, hàng ghi `revoked_at` |
 
 Ba path không đòi principal: `GET /api/auth/login`, `GET /api/auth/callback`, `GET /api/auth/csrf`. Chúng vẫn phải qua `evaluate` trước, nên Host không loopback mà không có cookie thì nhận `403 loopback_host` chứ không tới được bước login.
 
-Luồng đăng nhập:
+Màn hình đăng nhập nằm trong `pu/ops/static/index.html` (`body` có class `logged-out` cho tới khi phiên được xác nhận) và `pu/ops/static/js/auth.js`. CSS ẩn nav, nội dung và dock khi class đó còn. Trang tĩnh không nhúng dữ liệu user.
+
+Luồng trên giao diện:
+
+1. Mở `/` khi chưa có cookie: HTML hiện nút `Đăng nhập với Google`. Chưa có dữ liệu user.
+2. Nút gọi `GET /api/auth/login`. Nếu `oidc_not_configured`, màn hình liệt kê `required` (năm biến `PU_OIDC_AUTHORIZATION_ENDPOINT`, `PU_OIDC_TOKEN_ENDPOINT`, `PU_OIDC_CLIENT_ID`, `PU_OIDC_REDIRECT_URI`, `PU_OIDC_ISSUER`). Nếu có `authorization_url` dạng `http` hoặc `https`, trình duyệt chuyển tới URL đó. `fetch` nhận `Set-Cookie: pu_oidc` trước khi rời trang.
+3. Nhà cung cấp chuyển về callback. Thành công thì trình duyệt theo `302` tới `/#overview`. JS gọi `GET /api/auth/csrf`, giữ `csrf_token` trong bộ nhớ trang, hiện `user_id` và nút `Đăng xuất`.
+4. Mọi `POST` từ giao diện đi qua `puMutateHeaders`, nên có `X-CSRF-Token`. Cookie `pu_session` là HttpOnly: JS không đọc `document.cookie` cho phiên và không ghi id token vào `localStorage`.
+5. `401`, hoặc body `session_revoked` (kể cả `POST` trả `403`), xóa dữ liệu đang vẽ và hiện lại màn hình đăng nhập.
+6. `Đăng xuất` là `POST /api/auth/logout` kèm CSRF. Phiên bị thu hồi. Lần gọi API sau thấy lại màn hình đăng nhập.
+
+Luồng máy chủ:
 
 1. `GET /api/auth/login` tạo hàng `oidc_transactions` (state, PKCE S256, nonce), trả `{"authorization_url": ...}` và `Set-Cookie: pu_oidc=...`.
 2. URL ủy quyền có `response_type=code`, `scope=openid`, `code_challenge_method=S256`.
 3. Nhà cung cấp chuyển về `GET /api/auth/callback?code&state` kèm cookie `pu_oidc`.
 4. `complete_oidc` xóa giao dịch, đổi code, kiểm tra id token (`iss`, `aud`, `azp` khi có nhiều audience hoặc khi `azp` lệch client, `exp` với lệch 60 giây, `nbf`, `nonce`, `sub`). HS256 dùng client secret. RS256 dùng JWKS.
 5. `sub` cũ lấy user đã lưu. `sub` mới được cấp user và workspace mới.
-6. Response `200` có `{"csrf_token": ..., "ok": true}`, `Set-Cookie` phiên, và cookie `pu_oidc` với `Max-Age=0`.
-7. Mọi `POST` đổi trạng thái gửi `X-CSRF-Token` và cookie `pu_session`.
-8. `POST /api/auth/logout` cần phiên và CSRF. Hàng bị ghi `revoked_at`. Cookie phiên bị xóa. Lần sau là `session_revoked`.
+6. Response `302` tới `/#overview`, `Set-Cookie` phiên, và cookie `pu_oidc` với `Max-Age=0`. Body không chứa `csrf_token`. CSRF lấy bằng `GET /api/auth/csrf` sau khi trang tải lại.
+7. Callback lỗi (`state`, `nonce`, `exp`, và các mã khác của `AuthError`) trả HTML, không phát hành `pu_session`.
+8. Mọi `POST` đổi trạng thái gửi `X-CSRF-Token` và cookie `pu_session`.
+9. `POST /api/auth/logout` cần phiên và CSRF. Hàng bị ghi `revoked_at`. Cookie phiên bị xóa. Lần sau là `session_revoked`.
 
 `POST` còn trả `403` body rỗng khi có `Origin` mà netloc khác `Host` hoặc scheme khác đúng chuỗi `http`, hoặc khi `Sec-Fetch-Site` là `cross-site`. Scheme `https` không được chấp nhận ở chỗ này. Server không có nhánh TLS.
 

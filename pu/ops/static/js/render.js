@@ -203,6 +203,7 @@ function renderChatLog(){
 }
 
 function syncChatLogs(forceBottom=false){
+  if (typeof puUiClosed === "function" && puUiClosed()) return;
   // one conversation, two surfaces: the Chat & watch tab and the side dock
   document.querySelectorAll(".chatlog").forEach(el => {
     const follow=forceBottom||el.scrollHeight-el.scrollTop-el.clientHeight<96;
