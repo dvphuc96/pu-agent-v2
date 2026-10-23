@@ -6,7 +6,7 @@ One stdlib HTTP server reading the files PU already writes:
   loop + harness   traces/*.jsonl   (turns, gate decisions, tool calls, tokens)
   memory           state.db         (facts, episodes, chat log, consolidation)
   tools            state.db + calendar.ics + outbox/
-  eval             eval_report.json (written by `make gate`)
+  eval             eval-homes/release-gate/eval_report.json (written by `make gate`)
 
 The overview mirrors the architecture diagram — every box is clickable and
 opens that section's live data. The chat dock is a real gateway: type (or speak)
@@ -47,7 +47,13 @@ from pu.ops.browser_agent import agent_lock, dash_session, get_agent, maybe_rota
 from pu.ops.catalog import list_models
 from pu.ops.pricing import price_for, usage_summary
 from pu.ops.settings_api import apply_settings, pin_action, settings_info
-from pu.ops.tracing import TraceEncodingError, iter_trace_lines
+from pu.ops.tracing import (
+    TraceEncodingError,
+    _event_visible,
+    iter_trace_lines,
+    load_trace_events,
+    today_trace_path,
+)
 from pu.persistence import (
     SQLiteAgentEventRepository,
     SQLiteDatabase,
@@ -283,20 +289,11 @@ def collect() -> dict:
     episodes_data = episodes_payload()
 
     # --- traces → turns (group events between turn_start and turn_end)
-    events = []
-    trace_errors = []
-    trace_files = sorted((home / "traces").glob("*.jsonl"))
-    for path in trace_files:
-        try:
-            lines = list(iter_trace_lines(path))
-        except TraceEncodingError as exc:
-            trace_errors.append({"file": path.name, "error": str(exc)})
-            continue
-        for line in lines:
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    # Only the current owner's files. Another owner's JSONL is not opened.
+    events, trace_errors = load_trace_events(home)
+    from pu.ops.telemetry import readable_trace_files
+
+    trace_files = readable_trace_files(home)
     turns, current = [], None
     for ev in events:
         kind = ev.get("type")
@@ -361,12 +358,12 @@ def collect() -> dict:
               for s in SkillLoader([*bundled_skill_dirs(), home / "skills"]).skills]
 
     eval_report = None
-    report_path = home / "eval_report.json"
-    if report_path.exists():
+    report_path = _gate_artifact(home, "eval_report.json")
+    if report_path.is_file():
         eval_report = json.loads(report_path.read_text(encoding="utf-8"))
 
     eval_history = []
-    hist_path = home / "eval_runs.jsonl"
+    hist_path = _gate_artifact(home, "eval_runs.jsonl")
     if hist_path.exists():
         for line in hist_path.read_text(encoding="utf-8").splitlines()[-20:]:
             try:
@@ -1086,26 +1083,22 @@ def _thread_history(conn, sid: str) -> list[dict]:
     # counts from traces by matching each completed turn's user message.
     traced = {}
     current = None
-    for path in sorted((load_settings().home / "traces").glob("*.jsonl")):
-        try:
-            events = (json.loads(line) for line in iter_trace_lines(path))
-            for event in events:
-                if event.get("type") == "turn_start":
-                    current = {"message": event.get("user_message"),
-                               "provider": None, "model": None,
-                               "usage": {"in": 0, "out": 0, "calls": 0}}
-                elif current is not None and event.get("type") == "llm":
-                    usage = event.get("usage") or {}
-                    current["provider"] = event.get("provider") or current["provider"]
-                    current["model"] = event.get("model") or current["model"]
-                    current["usage"]["in"] += int(usage.get("in", 0) or 0)
-                    current["usage"]["out"] += int(usage.get("out", 0) or 0)
-                    current["usage"]["calls"] += 1
-                elif current is not None and event.get("type") == "turn_end":
-                    traced.setdefault(current["message"], []).append(current)
-                    current = None
-        except TraceEncodingError:
-            continue
+    history_events, _history_errors = load_trace_events(load_settings().home)
+    for event in history_events:
+        if event.get("type") == "turn_start":
+            current = {"message": event.get("user_message"),
+                       "provider": None, "model": None,
+                       "usage": {"in": 0, "out": 0, "calls": 0}}
+        elif current is not None and event.get("type") == "llm":
+            usage = event.get("usage") or {}
+            current["provider"] = event.get("provider") or current["provider"]
+            current["model"] = event.get("model") or current["model"]
+            current["usage"]["in"] += int(usage.get("in", 0) or 0)
+            current["usage"]["out"] += int(usage.get("out", 0) or 0)
+            current["usage"]["calls"] += 1
+        elif current is not None and event.get("type") == "turn_end":
+            traced.setdefault(current["message"], []).append(current)
+            current = None
 
     out, pending_user = [], None
     for row in rows:
@@ -1289,14 +1282,29 @@ def memory_action(payload: dict) -> dict:
 
 
 
+def _gate_artifact(home: Path, name: str) -> Path:
+    """Gate report under the eval home, with a legacy process-home fallback."""
+    from pu.evaluation.homes import RELEASE_GATE_OWNER
+
+    scoped = Path(home) / "eval-homes" / RELEASE_GATE_OWNER / name
+    if scoped.is_file():
+        return scoped
+    return Path(home) / name
+
+
 def events_since(cursor):
     """New trace events past `cursor` (a line count in today's trace file).
     Both supported interactive surfaces — browser and CLI — append to this same file,
     so the live diagram lights up for all of them. cursor=None returns just
     the current tail so the browser starts fresh instead of replaying history."""
+    from pu.ops.telemetry import telemetry_scope
+
     settings = load_settings()
     settings.ensure_home()
-    path = settings.home / "traces" / (datetime.now().strftime("%Y-%m-%d") + ".jsonl")
+    scope = telemetry_scope(settings.home)
+    if scope.admin or scope.denied:
+        return {"events": [], "cursor": 0}
+    path = today_trace_path(settings.home)
     if not path.exists():
         return {"events": [], "cursor": 0}
     try:
@@ -1308,9 +1316,11 @@ def events_since(cursor):
     out = []
     for ln in lines[cursor:]:
         try:
-            out.append(json.loads(ln))
+            event = json.loads(ln)
         except json.JSONDecodeError:
-            pass
+            continue
+        if isinstance(event, dict) and _event_visible(event, scope):
+            out.append(event)
     return {"events": out, "cursor": len(lines)}
 
 

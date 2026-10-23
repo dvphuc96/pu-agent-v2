@@ -155,7 +155,9 @@ def main() -> None:
             parser.error("--days must be at least 1")
         if args.traces:
             parser.error("--days cannot be combined with trace paths")
-        render_recent_days(load_settings().home / "traces", args.days, console=console)
+        from pu.ops.telemetry import trace_dir_for
+
+        render_recent_days(trace_dir_for(load_settings().home), args.days, console=console)
         return
 
     if args.traces:
@@ -165,7 +167,9 @@ def main() -> None:
         render_traces(args.traces, console)
         return
 
-    traces = load_settings().home / "traces"
+    from pu.ops.telemetry import trace_dir_for
+
+    traces = trace_dir_for(load_settings().home)
     path = latest_trace(traces)
     if path is None:
         console.print(f"[dim]No traces found in {traces}.[/dim]")

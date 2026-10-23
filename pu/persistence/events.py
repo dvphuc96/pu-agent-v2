@@ -44,6 +44,8 @@ class SQLiteAgentEventRepository:
 
     def list(self, *, limit: int = 200, workflow_id: str | None = None) -> list[dict[str, Any]]:
         self._guard()
+        if _caller_is_admin():
+            return []
         sql = "SELECT * FROM agent_events WHERE owner_user_id = pu_current_owner()"
         params: tuple[Any, ...] = ()
         if workflow_id:
@@ -62,6 +64,8 @@ class SQLiteAgentEventRepository:
 
     def aggregate(self, *, limit: int = 5000) -> dict[str, Any]:
         self._guard()
+        if _caller_is_admin():
+            return self.platform_aggregate(limit=limit)
         with self.database.connection() as conn:
             rows = conn.execute(
                 """SELECT kind, status, duration_ms, payload_json FROM agent_events
@@ -115,6 +119,91 @@ class SQLiteAgentEventRepository:
             "approval_failure_rate": approval_fail / approval_total if approval_total else 0.0,
             "security_blocks": security_blocks,
         }
+
+    def platform_aggregate(self, *, limit: int = 5000) -> dict[str, Any]:
+        """Numeric totals across owners. Payload text is not selected.
+
+        Only a platform admin may call this. The query reads kind, status,
+        duration, and two scalar JSON flags. It does not return prompts,
+        mail, or report bodies.
+        """
+        if not _caller_is_admin():
+            raise PermissionError("platform metrics require a platform admin principal")
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """SELECT kind, status, duration_ms,
+                          json_extract(payload_json, '$.ok') AS ok,
+                          json_extract(payload_json, '$.allowed') AS allowed
+                   FROM agent_events
+                   ORDER BY occurred_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        llm_latencies: list[int] = []
+        tool_total = tool_errors = 0
+        wf_ok = wf_fail = 0
+        approval_total = approval_fail = 0
+        security_blocks = 0
+        for row in rows:
+            kind = row["kind"] if _safe_kind(row["kind"]) else "other"
+            duration = row["duration_ms"]
+            ok = _json_bool(row["ok"])
+            allowed = _json_bool(row["allowed"])
+            if kind == "llm" and duration is not None:
+                llm_latencies.append(int(duration))
+            if kind == "tool_complete":
+                tool_total += 1
+                if ok is False:
+                    tool_errors += 1
+            if kind == "workflow_completed":
+                wf_ok += 1
+            if kind == "workflow_failed":
+                wf_fail += 1
+            if kind in {
+                "approval_execution_completed",
+                "approval_execution_failed",
+                "approval_recovery_failed_closed",
+            }:
+                approval_total += 1
+                if kind != "approval_execution_completed" or ok is False:
+                    approval_fail += 1
+            if kind in {"tool_blocked", "security"} and (
+                kind == "tool_blocked" or allowed is False
+            ):
+                security_blocks += 1
+        llm_latencies.sort()
+        p95 = 0
+        if llm_latencies:
+            p95 = llm_latencies[max(0, math.ceil(len(llm_latencies) * 0.95) - 1)]
+        return {
+            "events": len(rows),
+            "llm_p95_ms": p95,
+            "tool_error_rate": tool_errors / tool_total if tool_total else 0.0,
+            "workflow_success_rate": wf_ok / (wf_ok + wf_fail) if (wf_ok + wf_fail) else 1.0,
+            "approval_failure_rate": approval_fail / approval_total if approval_total else 0.0,
+            "security_blocks": security_blocks,
+        }
+
+
+def _caller_is_admin() -> bool:
+    from pu.identity.principal import PrincipalKind
+    from pu.identity.seam import attached_principal
+
+    attached = attached_principal()
+    return attached is not None and attached.kind is PrincipalKind.PLATFORM_ADMIN
+
+
+def _safe_kind(kind: object) -> bool:
+    if not isinstance(kind, str) or not kind or len(kind) > 64:
+        return False
+    return all(char.isalnum() or char in {"_", ".", ":"} for char in kind)
+
+
+def _json_bool(value: object) -> bool | None:
+    if value is True or value == 1:
+        return True
+    if value is False or value == 0:
+        return False
+    return None
 
 
 class SQLiteToolAuditSink(ToolAuditSink):

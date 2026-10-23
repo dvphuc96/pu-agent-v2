@@ -35,6 +35,11 @@ class OwnershipDenied(PermissionError):
     """The current principal does not own the requested private file."""
 
 
+def database_local_owner(home: Path) -> str:
+    """The single dev/test owner stored in this database, ignoring the seam."""
+    return _local_owner(Path(home))
+
+
 def owner_for_home(home: Path) -> str:
     attached = attached_principal()
     if attached is not None:

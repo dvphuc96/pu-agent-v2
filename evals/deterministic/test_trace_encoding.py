@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from pu.config import Settings
+from pu.db import connect
+from pu.identity.files import database_local_owner
 from pu.ops.dashboard import collect, events_since
 from pu.ops.tracing import TraceEncodingError, Tracer
 
@@ -43,10 +45,16 @@ def test_tracer_writes_utf8_when_platform_default_cannot(tmp_path, monkeypatch):
 def test_dashboard_reads_utf8_without_platform_default(tmp_path, monkeypatch):
     """The live Dashboard endpoint must explicitly decode a UTF-8 trace."""
     home = tmp_path / "home"
+    home.mkdir()
+    connect(home).close()
+    owner = database_local_owner(home)
     trace = _today_trace(home)
     trace.parent.mkdir(parents=True)
     trace.write_text(
-        json.dumps({"type": "turn_start", "user_message": MESSAGE}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"type": "turn_start", "user_message": MESSAGE, "owner_user_id": owner},
+            ensure_ascii=False,
+        ) + "\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("PU_HOME", str(home))
