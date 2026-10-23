@@ -30,12 +30,13 @@ from pu.identity.directory import provision_user
 from pu.identity.files import OwnershipDenied, read_owned_bytes, write_owned_text
 from pu.identity.oidc import AuthError, OidcProvider, sign_hs256
 from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam, attached_principal
 from pu.identity.session import (
     SESSION_COOKIE,
     AuthStore,
+    act_as,
     evaluate_on_home,
     format_set_cookie,
+    session_principal,
 )
 from pu.identity.threads import spawn_inheriting
 from pu.ops.agentops import AgentOpsHarness
@@ -52,12 +53,9 @@ CLIENT_SECRET = "test-client-secret"
 
 
 @contextmanager
-def _as(seam: InternalPrincipalSeam, principal: Principal):
-    token = seam.attach(principal)
-    try:
+def _as(home, principal: Principal):
+    with act_as(home, principal):
         yield
-    finally:
-        seam.detach(token)
 
 
 def _open(tmp_path):
@@ -68,7 +66,7 @@ def _open(tmp_path):
     user_b = provision_user(conn)
     conn.commit()
     conn.close()
-    return home, InternalPrincipalSeam(), user_a, user_b
+    return home, home, user_a, user_b
 
 
 def _settings(home):
@@ -233,6 +231,7 @@ def test_mu11_oidc_pkce_sets_lax_cookie_and_checks_state(tmp_path, monkeypatch):
 def test_mu11_csrf_rejects_state_change_and_legacy_loopback_still_runs(tmp_path, monkeypatch):
     home, _seam, user_a, _user_b = _open(tmp_path)
     monkeypatch.setattr("pu.config.load_settings", lambda: _settings(home))
+    monkeypatch.setattr("pu.ops.dashboard.load_settings", lambda: _settings(home))
     issued = AuthStore(home).issue_session(user_a)
     assert "HttpOnly" in issued.set_cookie
     assert "Secure" in issued.set_cookie
@@ -250,8 +249,8 @@ def test_mu11_csrf_rejects_state_change_and_legacy_loopback_still_runs(tmp_path,
     assert allowed.statuses == [200]
     assert "accepted" in json.loads(allowed.body)
     legacy = _Handler("POST", "/api/chat/stop", {"Content-Length": "2"}, b"{}")
-    assert legacy.statuses == [200]
-    assert "accepted" in json.loads(legacy.body)
+    assert legacy.statuses == [401]
+    assert json.loads(legacy.body)["error"] == "no authenticated principal"
     assert evaluate_on_home({"Host": "127.0.0.1:8765"}, mutate=True).rejected is False
     assert evaluate_on_home({"Host": "localhost"}, mutate=True).rejected is False
     rebound = evaluate_on_home({"Host": "rebind.example"}, mutate=True)
@@ -347,7 +346,7 @@ def test_mu05_concurrent_worker_threads_do_not_mix_rows(tmp_path):
     def job(owner_id: str, mark: str, website: str) -> None:
         try:
             barrier.wait(timeout=5)
-            assert attached_principal().user_id == owner_id
+            assert session_principal().user_id == owner_id
             repo = WorkspaceRepository(home)
             workspace = repo.create(mark, website)
             repo.add_source(workspace["id"], title=mark, content=mark, source_type="document")
@@ -412,7 +411,7 @@ def test_background_thread_inherits_principal_context(tmp_path):
     seen: dict[str, str] = {}
 
     def sample() -> None:
-        current = attached_principal()
+        current = session_principal()
         seen["id"] = current.user_id if current else ""
 
     with _as(seam, user_a):

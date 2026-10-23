@@ -23,7 +23,7 @@ from pu.identity.files import write_owned_text
 from pu.identity.legacy_import import import_legacy_rows
 from pu.identity.principal import Principal, PrincipalKind
 from pu.identity.requests import coerce_workspace_id, discard_client_owner
-from pu.identity.seam import InternalPrincipalSeam, attached_principal
+from pu.identity.session import act_as
 from pu.ops.briefing import BriefingService
 from pu.persistence import SQLiteDatabase
 from pu.persistence.ownership import OWNED_TABLES
@@ -35,12 +35,9 @@ B_MARK = "review-b-marker"
 
 
 @contextmanager
-def _as(seam: InternalPrincipalSeam, principal: Principal):
-    token = seam.attach(principal)
-    try:
+def _as(home, principal: Principal):
+    with act_as(home, principal):
         yield
-    finally:
-        seam.detach(token)
 
 
 def _open(tmp_path):
@@ -50,7 +47,7 @@ def _open(tmp_path):
     user_a = provision_user(conn)
     user_b = provision_user(conn)
     conn.commit()
-    return home, conn, InternalPrincipalSeam(), user_a, user_b
+    return home, conn, home, user_a, user_b
 
 
 def _action(action_id: str, principal: str) -> ProposedAction:
@@ -184,6 +181,7 @@ def test_dashboard_snapshot_sql_and_reveal_hide_the_other_owner(tmp_path, monkey
     home, conn, seam, user_a, user_b = _open(tmp_path)
     with _as(seam, user_a):
         conn.execute("INSERT INTO facts(subject, content) VALUES('a', ?)", (A_MARK,))
+    conn.commit()
     with _as(seam, user_b):
         conn.execute("INSERT INTO facts(subject, content) VALUES('b', ?)", (B_MARK,))
         conn.execute(
@@ -284,6 +282,7 @@ def test_briefing_snapshot_retry_and_enqueue_follow_the_principal(tmp_path):
                ) VALUES('job-b', 'fp-b', ?, '[]', 'failed', 't', 't')""",
             (user_b.workspace_id,),
         )
+    conn.commit()
     with _as(seam, user_a):
         conn.execute(
             """INSERT INTO research_workspaces(
@@ -312,9 +311,11 @@ def test_briefing_snapshot_retry_and_enqueue_follow_the_principal(tmp_path):
         seen = {}
 
         def remember():
-            current = attached_principal()
-            seen["user"] = current.user_id if current else ""
-            seen["kind"] = current.kind if current else None
+            from pu.identity.directory import current_principal
+
+            current = current_principal(conn)
+            seen["user"] = current.user_id
+            seen["kind"] = current.kind
 
         service._run_as_owner(user_b.user_id, remember)
         with service.repo.database.connection() as owned:
@@ -382,6 +383,7 @@ def test_sqlite_trigger_rejects_a_workflow_id_postgres_would_reject(tmp_path):
                ) VALUES('ex', 'agent', 'lookup', 'web:read', 'web:read', 0, 0,
                         'h', 'ok', 't', '{}', NULL)"""
         )
+    conn.commit()
     with _as(seam, user_b), pytest.raises(sqlite3.IntegrityError):
         conn.execute(
                 """INSERT INTO proposed_actions(

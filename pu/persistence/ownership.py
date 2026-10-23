@@ -165,6 +165,36 @@ def _add_owner_column(conn: sqlite3.Connection, table: str) -> None:
     conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT ''")
 
 
+def reject_empty_owner_user_id(conn: sqlite3.Connection) -> None:
+    """Backfill leftover blank owners, then refuse new blank writes.
+
+    SQLite cannot add a CHECK to an existing column without rebuilding the
+    table. A BEFORE INSERT/UPDATE trigger is the feasible guard. Virtual
+    FTS tables keep the owner copied from their content table.
+    """
+    from pu.identity.directory import ensure_local_principal
+
+    owner = ensure_local_principal(conn).user_id
+    for table in sorted(OWNED_TABLES):
+        _backfill_owner(conn, table, owner)
+    for table in sorted(OWNED_TABLES):
+        if not _exists(conn, table) or _is_virtual(conn, table):
+            continue
+        if "owner_user_id" not in _columns(conn, table):
+            continue
+        for event, suffix in (("INSERT", "ins"), ("UPDATE", "upd")):
+            name = f"{table}_owner_nonempty_{suffix}"
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute(
+                f"""CREATE TRIGGER {name}
+                    BEFORE {event} ON {table}
+                    WHEN NEW.owner_user_id IS NULL OR NEW.owner_user_id = ''
+                    BEGIN
+                        SELECT RAISE(ABORT, 'owner_user_id is required');
+                    END"""
+            )
+
+
 def _backfill_owner(conn: sqlite3.Connection, table: str, owner: str) -> None:
     if not _exists(conn, table) or _is_virtual(conn, table):
         return

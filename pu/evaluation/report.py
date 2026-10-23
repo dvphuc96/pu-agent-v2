@@ -598,10 +598,10 @@ class DeterministicReportEvaluator:
 
 def _admit_judge(contract: AgentRequest | None) -> AgentRequest:
     """Admit the workflow owner. Refuse before the provider when nobody owns the call."""
-    from pu.identity.seam import attached_principal
+    from pu.identity.session import session_principal
 
     if contract is None:
-        attached = attached_principal()
+        attached = session_principal()
         if attached is None:
             raise AgentRequestRejected("request is missing principal or owner")
         contract = AgentRequest(

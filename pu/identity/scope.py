@@ -1,9 +1,9 @@
 """Stamp and resolve ``owner_user_id`` on SQLite connections.
 
 Dev and test stay on SQLite, but inserts through this connection carry the
-current principal. The seam wins when a test has attached one. Otherwise the
-database-local principal is used so the existing single-user suite keeps
-seeing the rows it writes.
+current principal. A session or worker grant wins. A bound request with
+neither stamps nothing. Outside a request the database-local principal keeps
+the single-user suite seeing the rows it writes.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import re
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 
-from pu.identity.seam import attached_principal
 from pu.persistence.ownership import OWNED_TABLES
 
 # Raw sqlite3.Connection objects cannot store arbitrary attributes. Short-lived
@@ -59,19 +58,35 @@ def load_local_owner_cache(conn: sqlite3.Connection) -> None:
 
 
 def current_owner_user_id(conn: sqlite3.Connection) -> str:
+    """Owner stamped onto the next write.
+
+    A worker grant or a live session wins. A bound request with neither
+    raises. Outside a request the database-local owner is used, and an
+    empty id raises instead of writing ``owner_user_id = ''``.
+    """
+    from pu.identity.principal import PrincipalKind
+    from pu.identity.session import request_bound, session_principal
     from pu.identity.worker_job import owner_from_grant
 
     granted = owner_from_grant()
     if granted is not None:
+        if not granted:
+            raise PermissionError("no authenticated principal")
         return granted
-    attached = attached_principal()
-    if attached is not None:
-        return attached.user_id
+    principal = session_principal()
+    if principal is not None:
+        if principal.kind is PrincipalKind.PLATFORM_ADMIN or not principal.user_id:
+            raise PermissionError("no authenticated principal")
+        return principal.user_id
+    if request_bound():
+        raise PermissionError("no authenticated principal")
     cached = _remembered_owner(conn)
-    if cached:
-        return cached
-    load_local_owner_cache(conn)
-    return _remembered_owner(conn)
+    if not cached:
+        load_local_owner_cache(conn)
+        cached = _remembered_owner(conn)
+    if not cached:
+        raise PermissionError("no authenticated principal")
+    return cached
 
 
 def register_owner_function(conn: sqlite3.Connection) -> None:
@@ -95,8 +110,6 @@ def stamp_sql(conn: sqlite3.Connection, sql: str, params):
     if "owner_user_id" in columns:
         return sql, params
     owner = current_owner_user_id(conn)
-    if not owner:
-        return sql, params
     new_cols = match.group("cols").rstrip() + ", owner_user_id"
     rest_at = match.end()
     depth = 1

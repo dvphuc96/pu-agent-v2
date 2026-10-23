@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pu.core.interfaces.tools import ToolContext, ToolResult
-from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam, attached_principal
+from pu.identity.principal import PrincipalKind
 
 _BOUND: ContextVar[Any] = ContextVar("pu_bound_read_harness", default=None)
 _EXECUTING: ContextVar[bool] = ContextVar("pu_harness_execute", default=False)
@@ -77,25 +76,61 @@ def read_harness(app: Any, producer: Callable[..., Any]) -> Any:
 
 
 def job_owner(home: Path | None) -> tuple[str, str]:
-    attached = attached_principal()
-    if attached is not None:
-        return attached.user_id, attached.workspace_id
-    if home is None:
-        return "", ""
+    """Owner and workspace for a worker read.
+
+    A bound request with no grant or session raises. Outside a request the
+    database-local principal is used, and a home that has not opened its
+    database yet gets that principal created so the read runs as a real
+    WORKER. ``home is None`` raises: there is no database to own the job.
+    """
+    from pu.identity.principal import PrincipalKind
+    from pu.identity.session import request_bound, session_principal
+    from pu.identity.worker_job import current_grant
+
+    grant = current_grant()
+    if grant is not None:
+        if not grant.owner_user_id or not grant.workspace_id:
+            raise PermissionError("no authenticated principal")
+        return grant.owner_user_id, grant.workspace_id
+    principal = session_principal()
+    if principal is not None:
+        if principal.kind is PrincipalKind.PLATFORM_ADMIN or not principal.user_id:
+            raise PermissionError("no authenticated principal")
+        return principal.user_id, principal.workspace_id
+    if request_bound() or home is None:
+        raise PermissionError("no authenticated principal")
+    found = _local_job_owner(home)
+    if found is not None:
+        return found
+    from pu.db import connect
+    from pu.identity.directory import ensure_local_principal
+
+    opened = connect(home)
+    try:
+        principal = ensure_local_principal(opened)
+        opened.commit()
+    finally:
+        opened.close()
+    if not principal.user_id or not principal.workspace_id:
+        raise PermissionError("no authenticated principal")
+    return principal.user_id, principal.workspace_id
+
+
+def _local_job_owner(home: Path) -> tuple[str, str] | None:
     database = Path(home) / "state.db"
     if not database.is_file():
-        return "", ""
+        return None
     conn = sqlite3.connect(database)
     try:
         row = conn.execute(
             "SELECT user_id, workspace_id FROM identity_local WHERE singleton = 1"
         ).fetchone()
     except sqlite3.Error:
-        return "", ""
+        return None
     finally:
         conn.close()
-    if not row:
-        return "", ""
+    if not row or not row[0] or not row[1]:
+        return None
     return str(row[0]), str(row[1])
 
 
@@ -109,6 +144,8 @@ def worker_context(
     extra_metadata: dict | None = None,
     tool_name: str = "",
 ) -> ToolContext:
+    if not owner_user_id:
+        raise PermissionError("no authenticated principal")
     scope_set = set(scopes)
     if tool_name in READ_SCOPES:
         scope_set.add(READ_SCOPES[tool_name])
@@ -122,7 +159,7 @@ def worker_context(
     return ToolContext(
         observer=observer,
         actor="worker",
-        principal=owner_user_id or "worker",
+        principal=owner_user_id,
         agent_id="worker",
         scopes=frozenset(scope_set),
         capabilities=frozenset(scope_set),
@@ -138,7 +175,8 @@ class BoundaryHarness:
 
     def execute(self, name: str, arguments: dict, context: ToolContext) -> ToolResult:
         del name
-        if context.metadata.get("principal_kind") != PrincipalKind.WORKER.value:
+        owner = str(context.metadata.get("owner_user_id") or "")
+        if context.metadata.get("principal_kind") != PrincipalKind.WORKER.value or not owner:
             return ToolResult(output="", ok=False, error="worker_principal_required")
         token = _EXECUTING.set(True)
         try:
@@ -150,14 +188,23 @@ class BoundaryHarness:
         return ToolResult(ok=True, output=output)
 
 
-def _attach_worker(owner_user_id: str, workspace_id: str):
+def _open_worker(owner_user_id: str, workspace_id: str, job_id: str):
+    """Grant this read to the job owner. Invalid ids run without a grant."""
     if not owner_user_id or not workspace_id:
         return None
+    import time
+
+    from pu.identity.worker_job import WorkerJob
+
     try:
-        principal = Principal(PrincipalKind.WORKER, owner_user_id, workspace_id)
+        return WorkerJob.open(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            expires_at=time.time() + 120,
+            job_id=job_id,
+        )
     except (TypeError, ValueError):
         return None
-    return InternalPrincipalSeam().attach(principal)
 
 
 def execute_worker_read(
@@ -173,6 +220,8 @@ def execute_worker_read(
     extra_metadata: dict | None = None,
     home: Path | None = None,
 ) -> ToolResult:
+    if not owner_user_id:
+        raise PermissionError("no authenticated principal")
     payload = dict(arguments or {})
     connection_id = str(payload.get("connection_id") or "")
     thread_id = str(payload.get("thread_id") or "")
@@ -212,14 +261,14 @@ def execute_worker_read(
         extra_metadata=extra_metadata,
         tool_name=name,
     )
-    token = _attach_worker(owner_user_id, workspace_id)
+    job = _open_worker(owner_user_id, workspace_id, job_id)
     executing = _EXECUTING.set(True)
     try:
         return harness.execute(name, payload, context)
     finally:
         _EXECUTING.reset(executing)
-        if token is not None:
-            InternalPrincipalSeam().detach(token)
+        if job is not None:
+            job.close()
 
 
 def _invoke_producer(producer: Callable[..., Any], arguments: dict) -> Any:

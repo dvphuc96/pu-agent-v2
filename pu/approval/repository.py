@@ -15,6 +15,16 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
+def _decision_actor(conn, decided_by: str) -> str:
+    """Record a real principal. Legacy labels are not an actor."""
+    from pu.identity.contract import LEGACY_PRINCIPALS
+    from pu.identity.directory import current_principal
+
+    if decided_by and decided_by not in LEGACY_PRINCIPALS:
+        return decided_by
+    return current_principal(conn).user_id
+
+
 def _status(value: str) -> ApprovalStatus:
     try:
         return ApprovalStatus(value)
@@ -187,17 +197,18 @@ class SQLiteApprovalRepository:
         *,
         expected_hash: str,
         note: str = "",
-        decided_by: str = "local-human",
+        decided_by: str = "",
     ) -> ProposedAction | None:
         now = _now()
         with self._connection() as conn:
+            actor = _decision_actor(conn, decided_by)
             cur = conn.execute(
                 """UPDATE proposed_actions
                    SET status='approved', approved_action_hash=action_hash,
                        decision_note=?, decided_by=?, decided_at=?, updated_at=?
                    WHERE id=? AND status='pending' AND action_hash=? AND expires_at>?
                      AND owner_user_id = pu_current_owner()""",
-                (note or None, decided_by, now, now, action_id, expected_hash, now),
+                (note or None, actor, now, now, action_id, expected_hash, now),
             )
             conn.commit()
             changed = cur.rowcount == 1
@@ -208,16 +219,17 @@ class SQLiteApprovalRepository:
         action_id: str,
         *,
         note: str = "",
-        decided_by: str = "local-human",
+        decided_by: str = "",
     ) -> ProposedAction | None:
         now = _now()
         with self._connection() as conn:
+            actor = _decision_actor(conn, decided_by)
             cur = conn.execute(
                 """UPDATE proposed_actions
                    SET status='rejected', decision_note=?, decided_by=?, decided_at=?, updated_at=?
                    WHERE id=? AND status IN ('pending','approved')
                      AND owner_user_id = pu_current_owner()""",
-                (note or None, decided_by, now, now, action_id),
+                (note or None, actor, now, now, action_id),
             )
             conn.commit()
             changed = cur.rowcount == 1

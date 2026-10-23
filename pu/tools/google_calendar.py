@@ -55,14 +55,20 @@ _SETUP_HINT = (
 
 
 def _token_path(home: Path) -> Path:
-    return home / "google-token.json"
+    """Token path for the current owner. An empty owner raises.
+
+    The legacy ``home/google-token.json`` file is readable only by the
+    database-local owner. A cookieless request does not receive that path.
+    """
+    from pu.identity.files import owned_token_path
+
+    return owned_token_path(home, "google-token.json")
 
 
 def _readable_token(home: Path) -> Path | None:
-    """Token file for the current owner, never another user's copy."""
-    from pu.identity.files import private_file
-
-    return private_file(home, "google-token.json")
+    """Existing token file for the current owner, never another user's copy."""
+    path = _token_path(home)
+    return path if path.is_file() else None
 
 
 def _load_credentials(home: Path, scopes: list[str]):
@@ -106,6 +112,7 @@ def connect(home: Path) -> str:
     except ImportError:
         return _INSTALL_HINT
 
+    path = _token_path(home)
     own = home / "credentials.json"
     try:
         if own.exists():
@@ -132,12 +139,11 @@ def connect(home: Path) -> str:
     except Exception as exc:
         return f"Google sign-in failed or was cancelled ({type(exc).__name__}). Nothing was saved."
 
-    path = _token_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(creds.to_json(), encoding="utf-8")
-    from pu.identity.files import claim_private_file
+    from pu.identity.files import note_written
 
-    claim_private_file(home, "google-token.json")
+    note_written(home, path)
     return (
         f"Google Calendar connected (read-only via {client_source}). "
         f"Token cached at {path}."

@@ -21,7 +21,7 @@ from pu.identity.directory import provision_user, workspace_count
 from pu.identity.files import OwnershipDenied
 from pu.identity.legacy_import import LegacyImportRejected, import_legacy_rows
 from pu.identity.principal import Principal
-from pu.identity.seam import InternalPrincipalSeam
+from pu.identity.session import act_as
 from pu.ops.workspace_api import export_workspace_artifact, workspace_action, workspace_list
 from pu.persistence import SQLiteDatabase, SQLiteWorkflowRepository
 from pu.persistence.ownership import OWNED_TABLES
@@ -42,12 +42,9 @@ SKIP_POSTGRES = "PostgreSQL unavailable: set PU_POSTGRES_DSN to run MU-07"
 
 
 @contextmanager
-def _as(seam: InternalPrincipalSeam, principal: Principal):
-    token = seam.attach(principal)
-    try:
+def _as(home, principal: Principal):
+    with act_as(home, principal):
         yield
-    finally:
-        seam.detach(token)
 
 
 def _open(tmp_path):
@@ -57,7 +54,7 @@ def _open(tmp_path):
     user_a = provision_user(conn)
     user_b = provision_user(conn)
     conn.commit()
-    return home, conn, InternalPrincipalSeam(), user_a, user_b
+    return home, conn, home, user_a, user_b
 
 
 def _report_payload(report_id: str, secret: str) -> dict:
@@ -75,10 +72,19 @@ def _report_payload(report_id: str, secret: str) -> dict:
     }
 
 
-def test_backend_issues_one_personal_workspace_and_seam_ignores_body(tmp_path):
-    home, conn, seam, user_a, _user_b = _open(tmp_path)
+def test_backend_issues_one_personal_workspace_and_body_cannot_install_a_principal(tmp_path):
+    import importlib
+
+    from pu.identity.session import (
+        SESSION_COOKIE,
+        AuthStore,
+        RequestDecision,
+        attached_decision,
+        session_principal,
+    )
+
+    home, conn, _scope, user_a, _user_b = _open(tmp_path)
     assert list(inspect.signature(provision_user).parameters) == ["conn"]
-    assert list(inspect.signature(InternalPrincipalSeam.attach).parameters) == ["self", "principal"]
     assert str(uuid.UUID(user_a.user_id)) == user_a.user_id
     assert str(uuid.UUID(user_a.workspace_id)) == user_a.workspace_id
     assert workspace_count(conn, user_a.user_id) == 1
@@ -88,19 +94,36 @@ def test_backend_issues_one_personal_workspace_and_seam_ignores_body(tmp_path):
             (str(uuid.uuid4()), user_a.user_id, "t"),
         )
     conn.rollback()
-    with pytest.raises(TypeError):
-        seam.attach({"owner_user_id": user_a.user_id, "workspace_id": user_a.workspace_id})
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("pu.identity.seam")
     from evals.helpers import ScriptedProvider, make_pu
     from pu.core.container import build_dependencies
 
     app = make_pu(home / "app", ScriptedProvider([]))
     try:
-        assert isinstance(app.principal_seam, InternalPrincipalSeam)
-        assert app.principal_seam is app.dependencies.principal_seam
+        assert not hasattr(app, "principal_seam")
+        assert "principal_seam" not in app.dependencies.__dataclass_fields__
         built = build_dependencies(settings=app.settings, llm_provider=ScriptedProvider([]))
-        assert isinstance(built.principal_seam, InternalPrincipalSeam)
+        assert "principal_seam" not in built.__dataclass_fields__
     finally:
         app.close()
+    store = AuthStore(home)
+    anonymous = store.evaluate(
+        {"Host": "127.0.0.1", "owner_user_id": user_a.user_id},
+        mutate=False,
+    )
+    assert anonymous.principal is None
+    assert anonymous.authenticated is False
+    forged = RequestDecision(rejected=False, principal=user_a, session_id="forged")
+    with attached_decision(forged):
+        assert session_principal() is None
+    issued = store.issue_session(user_a)
+    decision = store.evaluate(
+        {"Cookie": f"{SESSION_COOKIE}={issued.session_id}", "Host": "127.0.0.1"},
+        mutate=False,
+    )
+    assert decision.authenticated is True
+    assert decision.principal.user_id == user_a.user_id
     conn.close()
 
 

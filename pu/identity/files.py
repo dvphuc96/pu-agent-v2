@@ -10,8 +10,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from pu.identity.seam import attached_principal
-
 PRIVATE_RELATIVE_PATHS = (
     "usage.jsonl",
     "eval_runs.jsonl",
@@ -36,31 +34,59 @@ class OwnershipDenied(PermissionError):
 
 
 def database_local_owner(home: Path) -> str:
-    """The single dev/test owner stored in this database, ignoring the seam."""
+    """The single dev/test owner stored in this database, ignoring the session."""
     return _local_owner(Path(home))
 
 
 def owner_for_home(home: Path) -> str:
-    attached = attached_principal()
-    if attached is not None:
-        return attached.user_id
-    database = Path(home) / "state.db"
-    if not database.is_file():
-        return ""
-    conn = sqlite3.connect(database)
-    try:
-        row = conn.execute(
-            "SELECT user_id FROM identity_local WHERE singleton = 1"
-        ).fetchone()
-    except sqlite3.Error:
-        return ""
-    finally:
-        conn.close()
-    return row[0] if row else ""
+    """Owner for a private file.
+
+    A cookieless request raises. It does not fall back to the database-local
+    owner or to a legacy path. Outside a request the local owner is used. A
+    home that has never opened its identity database returns ``""`` so
+    single-user files stay on their legacy paths. That branch is unreachable
+    while a request is bound.
+    """
+    from pu.identity.principal import PrincipalKind
+    from pu.identity.session import request_bound, session_principal
+    from pu.identity.worker_job import owner_from_grant
+
+    granted = owner_from_grant()
+    if granted is not None:
+        if not granted:
+            raise PermissionError("no authenticated principal")
+        return granted
+    principal = session_principal()
+    if principal is not None:
+        if principal.kind is PrincipalKind.PLATFORM_ADMIN or not principal.user_id:
+            raise PermissionError("no authenticated principal")
+        return principal.user_id
+    if request_bound():
+        raise PermissionError("no authenticated principal")
+    return database_local_owner(home)
 
 
 def owner_root(home: Path, owner_user_id: str) -> Path:
     return Path(home) / "owners" / owner_user_id
+
+
+def owned_token_path(home: Path, relative: str) -> Path:
+    """Path this owner may read or write for one OAuth token.
+
+    A bound request with no principal raises before any path is returned.
+    An existing copy under ``owners/<id>/`` wins. The legacy ``home/<relative>``
+    file is returned only for the database-local owner, which is how a
+    single-user token stays readable after the identity database appears.
+    Every other owner gets ``owners/<id>/<relative>`` and does not receive
+    the shared file.
+    """
+    owner = owner_for_home(home)
+    found = private_file(home, relative)
+    if found is not None:
+        return found
+    if owner == database_local_owner(home):
+        return Path(home) / relative
+    return owner_root(home, owner) / relative
 
 
 def write_owned_bytes(home: Path, relative: str, data: bytes) -> Path:
@@ -82,15 +108,14 @@ def write_owned_text(home: Path, relative: str, text: str) -> Path:
 def private_file(home: Path, relative: str) -> Path | None:
     """Path the current owner may read.
 
-    A file claimed by someone else, or a legacy file when this user is not
-    the database-local owner, is not returned. Callers treat ``None`` as
-    "this user has no such file" and must not open the other copy.
+    A bound request with no principal raises before any path is returned.
+    Outside a request, a home with no identity database may still open its
+    legacy file. A file claimed by someone else, or a legacy file when this
+    user is not the database-local owner, is not returned. Callers treat
+    ``None`` as "this user has no such file" and must not open the other copy.
     """
     legacy = Path(home) / relative
-    try:
-        owner = owner_for_home(home)
-    except sqlite3.Error:
-        owner = ""
+    owner = owner_for_home(home)
     if not owner:
         return legacy if legacy.is_file() else None
     owned = owner_root(home, owner) / relative
@@ -147,7 +172,7 @@ def note_written(home: Path, path: Path) -> None:
     try:
         relative = Path(path).resolve().relative_to(Path(home).resolve()).as_posix()
         mirror_existing(Path(home), relative)
-    except (OSError, ValueError, sqlite3.Error, AttributeError):
+    except (OSError, ValueError, sqlite3.Error, AttributeError, PermissionError):
         return
 
 
@@ -155,7 +180,7 @@ def mirror_existing(home: Path, relative: str) -> None:
     """Copy a legacy file into the current owner's root when it is safe to do so."""
     try:
         owner = owner_for_home(home)
-    except sqlite3.Error:
+    except (sqlite3.Error, PermissionError):
         return
     if not owner:
         return

@@ -186,10 +186,10 @@ class SQLiteAgentEventRepository:
 
 def _caller_is_admin() -> bool:
     from pu.identity.principal import PrincipalKind
-    from pu.identity.seam import attached_principal
+    from pu.identity.session import session_principal
 
-    attached = attached_principal()
-    return attached is not None and attached.kind is PrincipalKind.PLATFORM_ADMIN
+    principal = session_principal()
+    return principal is not None and principal.kind is PrincipalKind.PLATFORM_ADMIN
 
 
 def _safe_kind(kind: object) -> bool:

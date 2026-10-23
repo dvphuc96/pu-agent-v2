@@ -1,9 +1,7 @@
 """Backend identity for ADR-MU-001.
 
-Phase 1 issues ``user_id`` values and resolves the caller through
-``InternalPrincipalSeam``. Phase 6 removes ``pu.identity.seam`` and the
-``principal_seam`` field; after that, the principal comes only from an
-authenticated OIDC session.
+``user_id`` values are issued by the backend. The caller is the principal
+on an authenticated OIDC session, or the worker grant for the current job.
 """
 
 from pu.identity.principal import Principal, PrincipalKind

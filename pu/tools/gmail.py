@@ -58,7 +58,14 @@ _SETUP_HINT = (
 # ---- OAuth ----------------------------------------------------------------
 
 def _token_path(home: Path) -> Path:
-    return home / _TOKEN_FILE
+    """Token path for the current owner. An empty owner raises.
+
+    The legacy ``home/gmail-token.json`` file is readable only by the
+    database-local owner. A cookieless request does not receive that path.
+    """
+    from pu.identity.files import owned_token_path
+
+    return owned_token_path(home, _TOKEN_FILE)
 
 
 def _load_credentials(home: Path):
@@ -98,6 +105,7 @@ def connect(home: Path) -> str:
     except ImportError:
         return _INSTALL_HINT
 
+    path = _token_path(home)
     own = home / "credentials.json"
     try:
         if own.exists():
@@ -117,7 +125,6 @@ def connect(home: Path) -> str:
     except Exception as exc:
         return f"Google sign-in failed or was cancelled ({type(exc).__name__}). Nothing was saved."
 
-    path = _token_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(creds.to_json(), encoding="utf-8")
     from pu.identity.files import note_written

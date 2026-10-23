@@ -265,6 +265,16 @@ def _tool_status(output: str) -> str:
     return "ok"
 
 
+def _owner_has_token(home: Path, name: str) -> bool:
+    """True when this principal has that token. A shared home file does not count."""
+    from pu.identity.files import owned_token_path
+
+    try:
+        return owned_token_path(home, name).is_file()
+    except PermissionError:
+        return False
+
+
 def collect() -> dict:
     """Everything the page shows, in one JSON blob."""
     settings = load_settings()
@@ -498,13 +508,13 @@ def collect() -> dict:
                ORDER BY internal_date DESC LIMIT 100"""
         ),
         "gmail_enabled": settings.gmail,
-        "gmail_connected": (home / "gmail-token.json").exists(),
+        "gmail_connected": _owner_has_token(home, "gmail-token.json"),
         "knowledge_sources": [dict(r) for r in conn.execute(
             """SELECT id, title, "group", origin, path, enabled, chars, added_at
                FROM knowledge_sources
                WHERE owner_user_id = pu_current_owner()
                ORDER BY "group", title""")],
-        "drive_connected": (home / "drive-token.json").exists(),
+        "drive_connected": _owner_has_token(home, "drive-token.json"),
         "outbox": outbox,
         "skills": skills,
         "eval_report": eval_report,
@@ -801,7 +811,12 @@ def approval_action(payload: dict) -> dict:
     with agent_lock:
         agent = get_agent()
         service = agent.approval_service
-        actor = "local-dashboard-user"
+        from pu.identity.directory import current_principal
+
+        try:
+            actor = current_principal(agent.conn).user_id
+        except PermissionError:
+            return {"error": "no authenticated principal"}
         if op == "edit":
             arguments = payload.get("arguments")
             if not isinstance(arguments, dict):
@@ -858,12 +873,17 @@ def gmail_sync_action(payload: dict) -> dict:
         execute_worker_read,
         external_harness,
         job_owner,
-        worker_context,
     )
+    from pu.identity.directory import current_principal
     from pu.tools import gmail
 
     settings = load_settings()
     home = settings.ensure_home()
+    conn = connect(home)
+    try:
+        current_principal(conn)
+    finally:
+        conn.close()
     label = (payload.get("label") or "").strip() or settings.gmail_label
     try:
         max_messages = int(payload.get("max_messages") or settings.gmail_max_messages)
@@ -886,17 +906,19 @@ def gmail_sync_action(payload: dict) -> dict:
         return {"message": text}
     conn = connect(home)
     try:
-        context = worker_context(
+        result = execute_worker_read(
+            BoundaryHarness(
+                lambda: gmail.sync(conn, home, label=label, max_messages=max_messages)
+            ),
+            "read_gmail_today",
+            {},
             owner_user_id=owner,
             workspace_id=workspace_id,
             job_id="gmail-sync",
             scopes=("email:read",),
-            tool_name="read_gmail_today",
+            home=home,
         )
-        result = BoundaryHarness(
-            lambda: gmail.sync(conn, home, label=label, max_messages=max_messages)
-        ).execute("read_gmail_today", {}, context)
-        return {"message": result.output}
+        return {"message": result.output if result.ok else (result.error or result.output)}
     finally:
         conn.close()
 
@@ -919,11 +941,13 @@ def knowledge_action(payload: dict) -> dict:
     already works. Upload is NOT multipart: the browser reads the text file
     with FileReader and posts its content as JSON (text-only formats by
     design), so this stdlib server never parses multipart bodies."""
+    from pu.identity.directory import current_principal
     from pu.memory import knowledge as kb
 
     home = load_settings().ensure_home()
     conn = connect(home)
     try:
+        current_principal(conn)
         op = payload.get("op", "")
         if op == "add":
             title = (payload.get("title") or "").strip() or "Untitled source"
@@ -951,8 +975,7 @@ def knowledge_action(payload: dict) -> dict:
         if op == "reindex":
             from pu.identity.files import owner_for_home, owner_root
 
-            owner = owner_for_home(home)
-            folder = owner_root(home, owner) / "knowledge" if owner else home / "knowledge"
+            folder = owner_root(home, owner_for_home(home)) / "knowledge"
             return {"message": kb.reindex_folder(conn, folder)}
         return {"error": f"Unknown knowledge op '{op}'"}
     finally:
@@ -963,10 +986,18 @@ def drive_action(payload: dict) -> dict:
     """POST /api/drive — connect / list / import for the Knowledge dialog.
 
     connect() may open the consent browser: an allowed entry point (like the
-    Gmail card), because the user clicked it on purpose."""
+    Gmail card), because the user clicked it on purpose. The token is the
+    caller's; a request with no principal raises before any token file opens.
+    """
+    from pu.identity.directory import current_principal
     from pu.tools import google_drive
 
     home = load_settings().ensure_home()
+    conn = connect(home)
+    try:
+        current_principal(conn)
+    finally:
+        conn.close()
     op = payload.get("op", "")
     if op == "connect":
         return {"message": google_drive.connect(home)}
@@ -1399,6 +1430,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/auth/"):
                 self._auth_get()
                 return
+            if self._api_principal_user_id() is None:
+                return
             self._get_routes()
 
     def _reject(self, status: int, reason: str) -> None:
@@ -1550,10 +1583,13 @@ class Handler(BaseHTTPRequestHandler):
             self._reject(403, decision.reason)
             return
         with attached_decision(decision):
+            owner = self._api_principal_user_id()
+            if owner is None:
+                return
             if self.path.split("?", 1)[0] == "/api/auth/logout":
                 self._auth_logout()
                 return
-            self._post_routes()
+            self._post_routes(owner)
 
     def _auth_logout(self) -> None:
         from pu.config import load_settings
@@ -1569,7 +1605,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _post_routes(self):
+    def _api_principal_user_id(self) -> str | None:
+        """Resolve the caller for a private ``/api`` route.
+
+        Login, the OIDC callback, and the CSRF read stay public. Every other
+        ``/api`` route requires ``current_principal`` and answers 401 when
+        the request has no session. ``""`` means this path is not private.
+        """
+        path = self.path.split("?", 1)[0]
+        if path in {"/api/auth/login", "/api/auth/callback", "/api/auth/csrf"}:
+            return ""
+        if not path.startswith("/api/"):
+            return ""
+        from pu.identity.directory import current_principal
+
+        home = load_settings().ensure_home()
+        conn = connect(home)
+        try:
+            user_id = current_principal(conn).user_id
+        except PermissionError as exc:
+            reason = str(exc)
+            if reason == "no authenticated principal":
+                self._reject(401, reason)
+            else:
+                self._reject(403, reason)
+            return None
+        finally:
+            conn.close()
+        if not user_id:
+            self._reject(401, "no authenticated principal")
+            return None
+        return user_id
+
+    def _post_routes(self, owner: str):
         from urllib.parse import urlparse
 
         from pu.identity.session import SESSION_COOKIE, cookie_value, host_is_loopback
@@ -1617,7 +1685,12 @@ class Handler(BaseHTTPRequestHandler):
             from pu.ops.chat_runs import stop_chat
 
             payload = json.loads(self.rfile.read(length) or "{}")
-            self._send(json.dumps({"accepted": stop_chat(payload.get("request_id"))}).encode(), "application/json")
+            try:
+                accepted = stop_chat(payload.get("request_id"), owner)
+            except PermissionError:
+                self._reject(401, "no authenticated principal")
+                return
+            self._send(json.dumps({"accepted": accepted}).encode(), "application/json")
             return
         if self.path == "/api/chat/stream":
             payload = json.loads(self.rfile.read(length) or "{}")
@@ -1642,7 +1715,7 @@ class Handler(BaseHTTPRequestHandler):
                 from pu.ops.chat_runs import active_chat, check_cancelled
 
                 request_id = payload.get("request_id") or str(uuid.uuid4())
-                with active_chat(request_id) as cancel_event:
+                with active_chat(request_id, owner) as cancel_event:
                     emit("chat_started", {"request_id": request_id})
 
                     def live_emit(kind, event):
