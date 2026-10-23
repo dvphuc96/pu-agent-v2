@@ -1,8 +1,10 @@
 # Nâng cấp và triển khai đa người dùng
 
-Hướng dẫn này bám mã đã merge qua Phase 6 của lộ trình đa người dùng (`docs/MULTI_USER_ARCHITECTURE_ROADMAP.md`). Mỗi lệnh, tên biến và hiệu ứng migration dưới đây được lấy từ source. Không có lệnh `pu migrate` và không có process nào phục vụ dashboard từ PostgreSQL.
+**Production hiện chạy trên SQLite.** Dashboard (`pu/ops/dashboard.py`), CLI (`create_application` → `build_operational_persistence`), worker (`pu/ops/briefing.py`) và `AuthStore` (`pu/identity/session.py`) đều mở `$PU_HOME/state.db`. Không process phục vụ nào mở PostgreSQL. `PU_POSTGRES_DSN` chỉ được test đọc.
 
-Runtime đang chạy vẫn mở SQLite tại `$PU_HOME/state.db`. PostgreSQL là schema production trong `pu/persistence/postgres_schema.py`: hàm `install` tạo schema `pu_phase1`, role `pu_app` và RLS. Các test đọc `PU_POSTGRES_DSN` để gọi `install`. `pu/persistence/factory.py` vẫn trả adapter SQLite.
+Schema `pu_phase1`, RLS và role `pu_app` trong `pu/persistence/postgres_schema.py` là hợp đồng đã được test. Chúng không phải ranh giới cô lập đang sống. Ranh giới hôm nay là kiểm tra owner trong ứng dụng: `current_principal`, `pu_current_owner()` / `current_owner_user_id` (`pu/identity/scope.py`), trigger SQLite 9006 và 9009, và file dưới `owners/<id>/`. Nối PostgreSQL vào process đang chạy là việc sau này. Mục 4 và mục 5 chỉ dùng cho lúc đó.
+
+Hướng dẫn này bám mã đã merge qua Phase 6 (`docs/MULTI_USER_ARCHITECTURE_ROADMAP.md`). Mỗi lệnh, tên biến và hiệu ứng migration dưới đây được lấy từ source. Không có lệnh `pu migrate`.
 
 ## 1. Điều kiện
 
@@ -158,16 +160,20 @@ Ba giá trị bật của `PU_GMAIL`, `PU_GOOGLE_CALENDAR` và `PU_GRAPH_WORKFLO
 | `PU_DELEGATE_ENV_DENY` | rỗng | Tên biến, cách nhau bởi dấu phẩy, bị gỡ khỏi môi trường subprocess |
 | `PU_RUN_LIVE_EVALS` | không đặt | Đúng `1` thì một số test trong `test_tool_trigger.py` hết skip |
 
-## 4. Role PostgreSQL `pu_app`
+## 4. Hợp đồng PostgreSQL `pu_app` (chưa gắn vào process nào)
 
-`install` trong `pu/persistence/postgres_schema.py` là đường duy nhất tạo schema. Không có file SQL riêng. Hàm từ chối nếu `password` trống (`ValueError: password is required; there is no default database password`). Tên role chỉ được chữ, số và `_`.
+**Production hiện chạy trên SQLite.** `build_operational_persistence` trả `SQLiteDatabase`. Dashboard, CLI, worker và `AuthStore` không gọi `psycopg`. File trong `pu/` mở driver đó để tạo schema chỉ có `pu/persistence/postgres_schema.py`. `pu/agents/isolation.py` nhận ra connection psycopg nếu được đưa sẵn; ứng dụng không tự mở connection đó.
+
+RLS và `pu_app` không che dữ liệu mà dashboard đang phục vụ. Cô lập đang sống là kiểm tra owner ở tầng ứng dụng. Tạo schema `pu_phase1` rồi trỏ ứng dụng vào `pu_app` không bật cô lập, vì không có đường đọc schema đó.
+
+`install` là hợp đồng mà test gọi. Không có file SQL riêng. Hàm từ chối nếu `password` trống (`ValueError: password is required; there is no default database password`). Tên role chỉ được chữ, số và `_`. Phần `pu_app` và Supabase ở mục 5 chỉ dành cho lúc PostgreSQL được nối vào process.
 
 Hành vi khi schema `pu_phase1` đã tồn tại:
 
 - Đếm mọi hàng trong schema. Nếu có hàng và `replace_existing` là `False` (mặc định), ném `RuntimeError` và không `DROP SCHEMA`.
 - Nếu schema tồn tại nhưng rỗng, hoặc `replace_existing=True`, chạy `DROP SCHEMA IF EXISTS pu_phase1 CASCADE` rồi tạo lại.
 
-Test deterministic truyền `replace_existing=True`. Đừng trỏ các test đó vào database đang giữ dữ liệu. Xem mục 11.
+Test deterministic truyền `replace_existing=True`. Một lần chạy suite với `PU_POSTGRES_DSN` xóa schema `pu_phase1` bốn lần. Chỉ trỏ biến đó vào database trống, dùng xong thì bỏ. Chi tiết ở mục 11.
 
 `CREATE ROLE` không chạy trong transaction. `install` bật `autocommit` nếu connection đang tắt, rồi trả lại chế độ cũ.
 
@@ -187,9 +193,9 @@ Role đã tồn tại thì `ALTER ROLE` cùng các cờ đó. Quyền cấp cho 
 
 Mỗi bảng trong `PRIVATE_TABLES` nhận `CHECK (owner_user_id <> '')` tên `<bảng>_owner_nonempty`, `ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY`, và policy `pu_owner_isolation` với `USING` lẫn `WITH CHECK` bằng `owner_user_id = current_setting('pu.owner_user_id', true)`. Bảng `users` không nằm trong `PRIVATE_TABLES`. Nó có policy `pu_user_self`: `id` phải bằng cùng setting đó.
 
-Comment ở đầu module: kết nối superuser bỏ qua RLS kể cả khi `FORCE ROW LEVEL SECURITY` đã bật. DSN production không được là superuser và không được là role có `BYPASSRLS`. `set_owner` chạy `SELECT set_config('pu.owner_user_id', %s, true)`. Không có setting này thì policy không thấy hàng.
+Comment ở đầu module: kết nối superuser bỏ qua RLS kể cả khi `FORCE ROW LEVEL SECURITY` đã bật. Khi PostgreSQL được nối, connection của ứng dụng phải là `pu_app` (`NOSUPERUSER`, `NOBYPASSRLS`). `set_owner` chạy `SELECT set_config('pu.owner_user_id', %s, true)`. Không có setting này thì policy không thấy hàng.
 
-Ví dụ gọi đúng hàm, với một DSN quản trị. Mật khẩu là tham số, không phải biến mà app đọc:
+Đoạn dưới là cách test gọi `install`, không phải bước khởi động dashboard. Mật khẩu là tham số, không phải biến mà app đọc:
 
 ```python
 import os
@@ -203,13 +209,13 @@ admin.close()
 
 Để nguyên `replace_existing=False` trên database đã có dữ liệu. Test kết nối lại bằng `user="pu_app"`, cùng mật khẩu đã truyền, `dbname` lấy từ DSN quản trị, `port` từ DSN hoặc `5432`. Nếu `host` của DSN là socket (`/...`), test đổi host thành `127.0.0.1`.
 
-## 5. Supabase như Postgres được quản lý
+## 5. Supabase, chỉ khi PostgreSQL đã được nối
 
-Repo không chứa test Supabase. Quy tắc lấy từ `install` và comment RLS.
+Mục này không phải bước triển khai hôm nay. Dashboard, CLI, worker và `AuthStore` không mở Postgres. Tạo `pu_phase1` trên Supabase không đổi ranh giới cô lập đang chạy.
 
-Tạo schema bằng một kết nối quản trị đủ quyền `CREATE SCHEMA` và `CREATE ROLE`, rồi để ứng dụng và mọi truy vấn dữ liệu riêng đi bằng `pu_app`. Đừng dùng role `postgres` và đừng dùng `service_role` cho kết nối đó: module yêu cầu `NOSUPERUSER` và `NOBYPASSRLS`, và nói rõ superuser vẫn bỏ qua RLS khi đã `FORCE`. `PU_POSTGRES_DSN` trong test là DSN quản trị, không phải DSN của `pu_app`.
+Khi một process thực sự kết nối PostgreSQL, connection đó dùng role `pu_app` do `install` tạo (`LOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`, `NOCREATEDB`, `NOCREATEROLE`). Kết nối đó không dùng role `postgres` và không dùng `service_role`: comment của module nói superuser vẫn bỏ qua RLS khi đã `FORCE`. Schema của hợp đồng là `pu_phase1`, không phải `public`. Policy chỉ nhận owner từ `set_config('pu.owner_user_id', ...)`.
 
-Schema ứng dụng là `pu_phase1`, không phải `public`. Policy chỉ nhận owner từ `set_config('pu.owner_user_id', ...)`. Dashboard hiện không mở connection Postgres nên bước này chuẩn bị schema và khóa cổng MU-07; nó không chuyển storage của process đang chạy.
+Repo không chứa test Supabase và không kiểm tra cờ role trên một project hosted. `PU_POSTGRES_DSN` trong test là DSN quản trị để `CREATE SCHEMA` / `CREATE ROLE`, không phải DSN của `pu_app` và không phải DSN của ứng dụng.
 
 ## 6. Sao lưu trước khi migrate
 
@@ -227,7 +233,7 @@ SQLite bật `PRAGMA journal_mode=WAL` trong `SQLiteDatabase.connect`. Copy cả
 
 Migration 9005 đổi tên bảng thành `<bảng>__pre_owner`, copy, rồi xóa bản copy khi số hàng khớp. Bản `__pre_owner` không phải bản sao lưu của operator: lần mở sau sẽ xóa nó nếu copy đã đủ hàng. Giữ bản copy thư mục home ở ngoài `PU_HOME`.
 
-Với PostgreSQL, dump database trước khi gọi `install`. `replace_existing=True` xóa schema `pu_phase1`. Repo không bọc `pg_dump`.
+Dump PostgreSQL chỉ khi bạn cố ý gọi `install` trên một database có dữ liệu cần giữ. Suite test với `PU_POSTGRES_DSN` không thuộc trường hợp đó: nó cần database trống vì `replace_existing=True` xóa schema `pu_phase1`. Repo không bọc `pg_dump`. Gọi `install` không chuyển storage của dashboard.
 
 Đặt `PU_TOKEN_KEY` trước lần mở database đầu tiên nếu bảng `oauth_connections` có thể chứa blob `enc1`. Thiếu khóa thì 9007 vẫn ghim digest, nhưng ciphertext không được viết lại (mục 7).
 
@@ -273,7 +279,7 @@ Các version và việc chúng làm:
 - Nếu còn bảng `*__pre_owner` từ lần trước bị đứt, `_resume_interrupted` khôi phục bảng sống từ backup khi bảng sống thiếu hoặc ngắn hơn. Nếu bảng sống dài hơn backup, ném `RuntimeError` và không ghi version 9005.
 - `ensure_local_principal` tạo một user UUID và một workspace nếu `identity_local` chưa có hàng `singleton = 1`.
 - Thêm `owner_user_id` cho bảng riêng trong `OWNED_TABLES`, rồi `UPDATE ... SET owner_user_id = ? WHERE owner_user_id = ''` bằng user đó.
-- Unique `(id, owner_user_id)` trên `workflow_runs`, `research_workspaces`, `knowledge_sources`, `workspace_reports`.
+- Unique `(id, owner_user_id)` trên `workflow_runs`, `research_workspaces`, `knowledge_sources`. Unique `(report_id, owner_user_id)` trên `workspace_reports` (`_unique_owner_key(..., "report_id")`).
 - Dựng lại checkpoint, bảng con workspace, khóa briefing, khóa chính `crm_emails (gmail_id, owner_user_id)`, khóa ngoại `knowledge_chunks`, và FTS có cột `owner_user_id UNINDEXED`.
 - Còn bảng `__pre_owner` thì không ghi version.
 
@@ -428,9 +434,16 @@ python -m pytest -q evals/deterministic
 - `evals/deterministic/test_phase6_multi_user_release.py::test_release_mu07_postgres_role_has_no_bypassrls` — cùng câu của MU-07
 - `evals/deterministic/test_phase6_multi_user_release.py::test_release_postgres_check_rejects_empty_owner` — cùng câu của MU-07
 
-Phase 1 và Phase 4 còn skip nếu `psycopg.connect` lỗi. `test_release_postgres_check_rejects_empty_owner` không bọc lỗi kết nối: DSN sai làm test này lỗi thật.
+Chỉ đặt `PU_POSTGRES_DSN` vào một database trống, tạo riêng để chạy test rồi bỏ. Một lần `pytest evals/deterministic` với biến này gọi `install(..., replace_existing=True)` bốn lần, nên `DROP SCHEMA pu_phase1 CASCADE` chạy bốn lần:
 
-Có Postgres thì dùng một database trống, disposable. Cả ba test gọi `install(..., replace_existing=True)` và `DROP SCHEMA pu_phase1 CASCADE`. Mật khẩu fixture trong test là `pu-phase1-fixture` (Phase 1 và Phase 4) và `pu-phase6-fixture` (Phase 6). `connect_timeout` là 3 giây.
+- `test_mu07_rls_hides_other_owner_and_role_cannot_bypass` (Phase 1)
+- `test_hidden_postgres_row_is_refused_before_provider` (Phase 4)
+- `test_release_mu07_postgres_role_has_no_bypassrls` (Phase 6) gọi lại đúng hàm test Phase 1 ở trên, nên `install` chạy thêm một lần
+- `test_release_postgres_check_rejects_empty_owner` (Phase 6, kiểm tra `CHECK`)
+
+Mật khẩu fixture là `pu-phase1-fixture` cho ba lần đầu (Phase 1, Phase 4, và lần Phase 6 gọi lại Phase 1) và `pu-phase6-fixture` cho test `CHECK`. `connect_timeout` là 3 giây.
+
+Phase 1 và Phase 4 skip khi `psycopg.connect` ném `psycopg.Error`. Lần Phase 6 gọi lại Phase 1 đi cùng đường skip đó. Test `CHECK` của Phase 6 không skip khi DSN sai hoặc máy chủ từ chối kết nối: `psycopg.connect` nằm ngoài `pytest.skip`, nên DSN hỏng làm test đó lỗi thật. Thiếu gói `psycopg` mà vẫn đặt DSN thì test `CHECK` fail lúc import; Phase 1 và Phase 4 skip.
 
 ```bash
 PU_POSTGRES_DSN="postgresql://<admin>:<mật-khẩu>@127.0.0.1:5432/<db-trống>" \
@@ -447,7 +460,7 @@ Không có migration xuống. Xóa một hàng `schema_migrations` không hoàn 
 2. SQLite: thay cả thư mục `PU_HOME` bằng bản copy ở mục 6. Đừng xóa tay bảng `*__pre_owner` khi 9005 đang dở. Mở lại để `_resume_interrupted` xử lý. Nếu nó báo bảng sống dài hơn backup, dừng và phục hồi cả file `state.db` từ bản copy.
 3. Blob đã thành `enc2` chỉ trở lại `enc1` nếu phục hồi `state.db`. Khóa sai không giải được thì hàng ở `migration_pending = 1` và `use_oauth_connection` trả `None`. Đừng xóa `legacy_digest` để "chạy lại": digest là tập đã ghim, và blob `enc1` không khớp digest không được viết lại.
 4. Xóa `owners/<id>/` không trả ownership SQL về trạng thái cũ. File gốc ở home vẫn còn vì mirror không xóa nguồn.
-5. PostgreSQL: phục hồi dump. Gọi lại `install` với `replace_existing=False` khi schema còn hàng sẽ từ chối, không sửa schema. `replace_existing=True` xóa schema.
+5. PostgreSQL chỉ cần phục hồi nếu bạn đã gọi `install` trên database đó. Ứng dụng đang chạy không giữ state ở đó. `install` với `replace_existing=False` từ chối khi schema còn hàng. `replace_existing=True` xóa schema `pu_phase1`.
 6. Thu hồi phiên (`revoked_at`) không rollback dữ liệu. `reset_local_data` trong `pu/ops/reset.py` không phải rollback: nó xóa gần như cả home, giữ một danh sách file cấu hình, rồi `connect` tạo database mới. `pu/__main__.py` không gắn hàm này vào CLI.
 
 ## 13. Những gì đã đối chiếu và chưa có trong mã
@@ -456,8 +469,8 @@ Không có migration xuống. Xóa một hàng `schema_migrations` không hoàn 
 
 Chưa có trong mã, nên hướng dẫn không bịa lệnh cho chúng:
 
-- Process dashboard hoặc CLI mở `PU_POSTGRES_DSN` và phục vụ dữ liệu từ Postgres. Factory vẫn là SQLite.
+- Process dashboard, CLI, worker hoặc `AuthStore` mở `PU_POSTGRES_DSN`. Factory trả SQLite. RLS/`pu_app` là hợp đồng test, chưa phải ranh giới đang sống.
 - Lệnh migrate, backup, rollback, hoặc copy `knowledge/` / token / `calendar.ics` sang `owners/<id>/`.
 - Map một `sub` OIDC sang user `identity_local`, nên đăng nhập trình duyệt không nhận dữ liệu home cũ.
 - Bind khác `127.0.0.1`, cookie không `Secure`, hoặc `POST` chấp nhận `Origin` scheme `https`.
-- Kiểm tra thuộc tính role `service_role` và `postgres` trên một project Supabase. Mục 5 chỉ áp ràng buộc `NOSUPERUSER` / `NOBYPASSRLS` của `install`.
+- Kiểm tra thuộc tính role `service_role` và `postgres` trên một project Supabase. Mục 5 chỉ áp ràng buộc `NOSUPERUSER` / `NOBYPASSRLS` của `install`, và chỉ cho lúc PostgreSQL được nối.
