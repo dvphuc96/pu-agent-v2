@@ -101,9 +101,9 @@ class ResearchWorkflowOrchestrator:
             and request.personal_workspace_id
         ):
             return request
-        from pu.identity.seam import attached_principal
+        from pu.identity.session import session_principal
 
-        attached = attached_principal()
+        attached = session_principal()
         if attached is None:
             return request
         return replace(

@@ -36,7 +36,6 @@ from pu.harness import (
     InMemoryRateLimiter,
     JsonlToolAuditSink,
 )
-from pu.identity.seam import InternalPrincipalSeam
 from pu.ops.agentops import AgentOpsHarness, SLOEvaluator
 from pu.ops.tracing import Tracer
 from pu.persistence import (
@@ -78,7 +77,6 @@ class ApplicationDependencies:
     report_builder: StructuredReportBuilder
     evaluation_harness: EvaluationHarness
     report_repository: FileReportRepository
-    principal_seam: InternalPrincipalSeam
 
 
 def build_dependencies(
@@ -214,7 +212,6 @@ def build_dependencies(
         report_builder=report_builder,
         evaluation_harness=evaluation_harness,
         report_repository=report_repository,
-        principal_seam=InternalPrincipalSeam(),
     )
 
 

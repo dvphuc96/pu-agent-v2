@@ -801,7 +801,12 @@ def approval_action(payload: dict) -> dict:
     with agent_lock:
         agent = get_agent()
         service = agent.approval_service
-        actor = "local-dashboard-user"
+        from pu.identity.directory import current_principal
+
+        try:
+            actor = current_principal(agent.conn).user_id
+        except PermissionError:
+            return {"error": "no authenticated principal"}
         if op == "edit":
             arguments = payload.get("arguments")
             if not isinstance(arguments, dict):
@@ -858,7 +863,6 @@ def gmail_sync_action(payload: dict) -> dict:
         execute_worker_read,
         external_harness,
         job_owner,
-        worker_context,
     )
     from pu.tools import gmail
 
@@ -886,17 +890,19 @@ def gmail_sync_action(payload: dict) -> dict:
         return {"message": text}
     conn = connect(home)
     try:
-        context = worker_context(
+        result = execute_worker_read(
+            BoundaryHarness(
+                lambda: gmail.sync(conn, home, label=label, max_messages=max_messages)
+            ),
+            "read_gmail_today",
+            {},
             owner_user_id=owner,
             workspace_id=workspace_id,
             job_id="gmail-sync",
             scopes=("email:read",),
-            tool_name="read_gmail_today",
+            home=home,
         )
-        result = BoundaryHarness(
-            lambda: gmail.sync(conn, home, label=label, max_messages=max_messages)
-        ).execute("read_gmail_today", {}, context)
-        return {"message": result.output}
+        return {"message": result.output if result.ok else (result.error or result.output)}
     finally:
         conn.close()
 

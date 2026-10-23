@@ -15,6 +15,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,7 +31,6 @@ from pu.identity.oidc import (
     pkce_pair,
 )
 from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam
 
 SESSION_COOKIE = "pu_session"
 OIDC_COOKIE = "pu_oidc"
@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     workspace_id TEXT NOT NULL,
     csrf_token TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    revoked_at TEXT
+    revoked_at TEXT,
+    principal_kind TEXT NOT NULL DEFAULT 'USER'
 );
 CREATE TABLE IF NOT EXISTS oidc_transactions (
     id TEXT PRIMARY KEY,
@@ -150,6 +151,29 @@ class RequestDecision:
     reason: str = ""
     principal: Principal | None = None
     session_id: str = ""
+    authenticated: bool = False
+
+
+_SESSION_PRINCIPAL: ContextVar[Principal | None] = ContextVar(
+    "pu_session_principal", default=None
+)
+_REQUEST_BOUND: ContextVar[bool] = ContextVar("pu_request_bound", default=False)
+
+
+def session_principal() -> Principal | None:
+    """Principal installed from a live session. A missing cookie leaves this empty."""
+    return _SESSION_PRINCIPAL.get()
+
+
+def request_bound() -> bool:
+    """True while an HTTP request is inside ``attached_decision``."""
+    return _REQUEST_BOUND.get()
+
+
+def reset_session_principal() -> None:
+    """Drop a leaked session. Test isolation calls this between cases."""
+    _SESSION_PRINCIPAL.set(None)
+    _REQUEST_BOUND.set(False)
 
 
 class AuthStore:
@@ -172,6 +196,11 @@ class AuthStore:
             if "nonce" not in columns:
                 conn.execute(
                     "ALTER TABLE oidc_transactions ADD COLUMN nonce TEXT NOT NULL DEFAULT ''"
+                )
+            session_columns = {row[1] for row in conn.execute("PRAGMA table_info(auth_sessions)")}
+            if "principal_kind" not in session_columns:
+                conn.execute(
+                    "ALTER TABLE auth_sessions ADD COLUMN principal_kind TEXT NOT NULL DEFAULT 'USER'"
                 )
             migrate_legacy_oauth_tokens(conn)
             conn.commit()
@@ -244,9 +273,16 @@ class AuthStore:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO auth_sessions(
-                       id, owner_user_id, workspace_id, csrf_token, created_at
-                   ) VALUES(?,?,?,?,?)""",
-                (session_id, principal.user_id, principal.workspace_id, csrf_token, _now()),
+                       id, owner_user_id, workspace_id, csrf_token, created_at, principal_kind
+                   ) VALUES(?,?,?,?,?,?)""",
+                (
+                    session_id,
+                    principal.user_id,
+                    principal.workspace_id,
+                    csrf_token,
+                    _now(),
+                    principal.kind.value,
+                ),
             )
             conn.commit()
         return SessionIssued(
@@ -294,11 +330,17 @@ class AuthStore:
             presented = header_value(headers, CSRF_HEADER)
             if not presented or not _equal(presented, session["csrf_token"]):
                 return RequestDecision(rejected=True, reason="csrf", session_id=session_id)
-        principal = Principal(
-            PrincipalKind.USER, session["owner_user_id"], session["workspace_id"]
-        )
+        kind_name = session["principal_kind"] or PrincipalKind.USER.value
+        try:
+            kind = PrincipalKind(kind_name or PrincipalKind.USER.value)
+        except ValueError:
+            return RequestDecision(rejected=True, reason="session_revoked", session_id=session_id)
+        principal = Principal(kind, session["owner_user_id"], session["workspace_id"])
         return RequestDecision(
-            rejected=False, principal=principal, session_id=session_id
+            rejected=False,
+            principal=principal,
+            session_id=session_id,
+            authenticated=True,
         )
 
     def save_oauth_token(self, *, owner_user_id: str, provider: str, token: dict) -> str:
@@ -520,12 +562,31 @@ def owner_may_use(home: Path, connection_id: str, owner_user_id: str) -> bool:
 
 @contextmanager
 def attached_decision(decision: RequestDecision) -> Iterator[RequestDecision]:
-    if decision.principal is None:
-        yield decision
-        return
-    seam = InternalPrincipalSeam()
-    token = seam.attach(decision.principal)
+    """Bind this request. Only ``evaluate`` may install a principal.
+
+    A decision built by hand, and a request with no session cookie, leave the
+    principal empty. Callers then fail closed instead of using the
+    database-local owner.
+    """
+    principal = decision.principal if decision.authenticated and not decision.rejected else None
+    bound = _REQUEST_BOUND.set(True)
+    token = _SESSION_PRINCIPAL.set(principal)
     try:
         yield decision
     finally:
-        seam.detach(token)
+        _SESSION_PRINCIPAL.reset(token)
+        _REQUEST_BOUND.reset(bound)
+
+
+@contextmanager
+def act_as(home: Path, principal: Principal) -> Iterator[SessionIssued]:
+    """Install the principal from a real session row. Tests use this, not a seam."""
+    issued = AuthStore(home).issue_session(principal)
+    decision = AuthStore(home).evaluate(
+        {"Cookie": f"{SESSION_COOKIE}={issued.session_id}", "Host": "127.0.0.1"},
+        mutate=False,
+    )
+    if not decision.authenticated or decision.principal is None:
+        raise PermissionError("session did not authenticate")
+    with attached_decision(decision):
+        yield issued

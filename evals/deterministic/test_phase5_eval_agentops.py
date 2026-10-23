@@ -23,7 +23,7 @@ from pu.harness.audit import CompositeToolAuditSink, JsonlToolAuditSink
 from pu.identity.directory import provision_user
 from pu.identity.files import database_local_owner, owner_root
 from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam
+from pu.identity.session import act_as
 from pu.identity.worker_job import WorkerJob
 from pu.loop.agent import run_loop
 from pu.ops.agentops import SLOEvaluator, prometheus_text
@@ -92,12 +92,12 @@ class _OneShot:
 
 
 @contextmanager
-def _attached(seam, principal):
-    token = seam.attach(principal)
-    try:
+def _attached(home, principal):
+    if principal is None:
         yield
-    finally:
-        seam.detach(token)
+        return
+    with act_as(home, principal):
+        yield
 
 
 def _open(tmp_path):
@@ -108,7 +108,7 @@ def _open(tmp_path):
     user_b = provision_user(conn)
     conn.commit()
     conn.close()
-    return home, InternalPrincipalSeam(), user_a, user_b
+    return home, home, user_a, user_b
 
 
 def _settings(home, **overrides):
@@ -455,7 +455,7 @@ def test_ops04_production_audit_sink_hides_the_other_owners_tool_args(tmp_path):
             {"note": LOCAL_NOTE, "echo": "L" * 11},
             _audit_context(local_id),
         )
-        with _attached(app.principal_seam, other):
+        with _attached(home, other):
             foreign = app.tool_harness.execute(
                 "phase5_audit_probe",
                 {"note": OTHER_NOTE, "echo": "O" * 23},
@@ -477,8 +477,8 @@ def test_ops04_production_audit_sink_hides_the_other_owners_tool_args(tmp_path):
         assert local_id in shared_text
         assert OTHER_NOTE in other_text and LOCAL_NOTE not in other_text
         assert other.user_id in other_text
-        local_view = _visible_text(home, app.principal_seam, None)
-        other_view = _visible_text(home, app.principal_seam, other)
+        local_view = _visible_text(home, home, None)
+        other_view = _visible_text(home, home, other)
         assert LOCAL_NOTE in local_view and LOCAL_SUMMARY in local_view
         assert OTHER_NOTE not in local_view and OTHER_SUMMARY not in local_view
         assert UNSTAMPED_NOTE not in local_view and UNSTAMPED_SUMMARY not in local_view

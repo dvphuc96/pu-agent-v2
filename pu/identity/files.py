@@ -10,8 +10,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from pu.identity.seam import attached_principal
-
 PRIVATE_RELATIVE_PATHS = (
     "usage.jsonl",
     "eval_runs.jsonl",
@@ -36,27 +34,30 @@ class OwnershipDenied(PermissionError):
 
 
 def database_local_owner(home: Path) -> str:
-    """The single dev/test owner stored in this database, ignoring the seam."""
+    """The single dev/test owner stored in this database, ignoring the session."""
     return _local_owner(Path(home))
 
 
 def owner_for_home(home: Path) -> str:
-    attached = attached_principal()
-    if attached is not None:
-        return attached.user_id
-    database = Path(home) / "state.db"
-    if not database.is_file():
-        return ""
-    conn = sqlite3.connect(database)
+    """Owner for a private file. A cookieless request does not use the local owner."""
+    from pu.identity.principal import PrincipalKind
+    from pu.identity.session import request_bound, session_principal
+    from pu.identity.worker_job import owner_from_grant
+
     try:
-        row = conn.execute(
-            "SELECT user_id FROM identity_local WHERE singleton = 1"
-        ).fetchone()
-    except sqlite3.Error:
+        granted = owner_from_grant()
+    except PermissionError:
         return ""
-    finally:
-        conn.close()
-    return row[0] if row else ""
+    if granted:
+        return granted
+    principal = session_principal()
+    if principal is not None:
+        if principal.kind is PrincipalKind.PLATFORM_ADMIN:
+            return ""
+        return principal.user_id
+    if request_bound():
+        return ""
+    return database_local_owner(home)
 
 
 def owner_root(home: Path, owner_user_id: str) -> Path:

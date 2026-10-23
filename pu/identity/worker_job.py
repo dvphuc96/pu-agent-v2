@@ -13,7 +13,6 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
 from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam
 
 _GRANT: ContextVar[JobGrant | None] = ContextVar("pu_worker_job", default=None)
 
@@ -69,12 +68,11 @@ def reset_worker_grant() -> None:
 
 
 class WorkerJob:
-    """One owner scope for one job. ``close`` restores the caller's principal."""
+    """One owner scope for one job. ``close`` restores the caller's grant."""
 
-    def __init__(self, grant: JobGrant, grant_token: Token, seam_token: Token):
+    def __init__(self, grant: JobGrant, grant_token: Token):
         self.grant = grant
         self._grant_token = grant_token
-        self._seam_token = seam_token
 
     @classmethod
     def open(
@@ -87,7 +85,7 @@ class WorkerJob:
         job_id: str = "",
         watch_db_lease: bool = False,
     ) -> WorkerJob:
-        principal = Principal(PrincipalKind.WORKER, owner_user_id, workspace_id)
+        Principal(PrincipalKind.WORKER, owner_user_id, workspace_id)
         grant = JobGrant(
             owner_user_id=owner_user_id,
             workspace_id=workspace_id,
@@ -97,12 +95,7 @@ class WorkerJob:
             watch_db_lease=watch_db_lease,
         )
         grant_token = _GRANT.set(grant)
-        try:
-            seam_token = InternalPrincipalSeam().attach(principal)
-        except Exception:
-            _GRANT.reset(grant_token)
-            raise
-        return cls(grant, grant_token, seam_token)
+        return cls(grant, grant_token)
 
     def assert_live(self) -> None:
         if not self.grant.allows_read():
@@ -117,11 +110,8 @@ class WorkerJob:
         self.grant.expires_at = 0
 
     def close(self) -> None:
-        """End the job and restore the principal that was current before ``open``."""
+        """End the job and restore the grant that was current before ``open``."""
         self.grant.closed = True
-        if self._seam_token is not None:
-            InternalPrincipalSeam().detach(self._seam_token)
-            self._seam_token = None
         if self._grant_token is not None:
             _GRANT.reset(self._grant_token)
             self._grant_token = None

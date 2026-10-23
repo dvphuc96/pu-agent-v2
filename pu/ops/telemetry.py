@@ -1,7 +1,7 @@
 """Who a telemetry read or write belongs to.
 
 JSONL traces and the usage ledger are files, so they cannot rely on SQL row
-ownership. The attached principal, or the worker job grant, decides the file.
+ownership. The authenticated session, or the worker job grant, decides the file.
 A platform admin does not receive another owner's trace content. A client
 value named ``owner_user_id`` is never consulted.
 """
@@ -31,7 +31,7 @@ def telemetry_scope(home: Path) -> TelemetryScope:
     """Resolve the caller. An expired worker grant is denied, not reassigned."""
     from pu.identity.files import database_local_owner
     from pu.identity.principal import PrincipalKind
-    from pu.identity.seam import attached_principal
+    from pu.identity.session import request_bound, session_principal
     from pu.identity.worker_job import owner_from_grant
 
     try:
@@ -44,10 +44,12 @@ def telemetry_scope(home: Path) -> TelemetryScope:
         return TelemetryScope("", local_owner, admin=False, denied=True)
     if granted:
         return TelemetryScope(granted, local_owner, admin=False, denied=False)
-    attached = attached_principal()
-    if attached is not None:
-        admin = attached.kind is PrincipalKind.PLATFORM_ADMIN
-        return TelemetryScope(attached.user_id, local_owner, admin=admin, denied=False)
+    principal = session_principal()
+    if principal is not None:
+        admin = principal.kind is PrincipalKind.PLATFORM_ADMIN
+        return TelemetryScope(principal.user_id, local_owner, admin=admin, denied=False)
+    if request_bound():
+        return TelemetryScope("", local_owner, admin=False, denied=True)
     return TelemetryScope(local_owner, local_owner, admin=False, denied=False)
 
 

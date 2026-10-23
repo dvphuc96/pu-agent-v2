@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pu.core.interfaces.tools import ToolContext, ToolResult
-from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam, attached_principal
+from pu.identity.principal import PrincipalKind
 
 _BOUND: ContextVar[Any] = ContextVar("pu_bound_read_harness", default=None)
 _EXECUTING: ContextVar[bool] = ContextVar("pu_harness_execute", default=False)
@@ -77,10 +76,22 @@ def read_harness(app: Any, producer: Callable[..., Any]) -> Any:
 
 
 def job_owner(home: Path | None) -> tuple[str, str]:
-    attached = attached_principal()
-    if attached is not None:
-        return attached.user_id, attached.workspace_id
-    if home is None:
+    from pu.identity.principal import PrincipalKind
+    from pu.identity.session import request_bound, session_principal
+    from pu.identity.worker_job import current_grant
+
+    try:
+        grant = current_grant()
+    except PermissionError:
+        return "", ""
+    if grant is not None:
+        return grant.owner_user_id, grant.workspace_id
+    principal = session_principal()
+    if principal is not None:
+        if principal.kind is PrincipalKind.PLATFORM_ADMIN:
+            return "", ""
+        return principal.user_id, principal.workspace_id
+    if request_bound() or home is None:
         return "", ""
     database = Path(home) / "state.db"
     if not database.is_file():
@@ -150,14 +161,23 @@ class BoundaryHarness:
         return ToolResult(ok=True, output=output)
 
 
-def _attach_worker(owner_user_id: str, workspace_id: str):
+def _open_worker(owner_user_id: str, workspace_id: str, job_id: str):
+    """Grant this read to the job owner. Invalid ids run without a grant."""
     if not owner_user_id or not workspace_id:
         return None
+    import time
+
+    from pu.identity.worker_job import WorkerJob
+
     try:
-        principal = Principal(PrincipalKind.WORKER, owner_user_id, workspace_id)
+        return WorkerJob.open(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            expires_at=time.time() + 120,
+            job_id=job_id,
+        )
     except (TypeError, ValueError):
         return None
-    return InternalPrincipalSeam().attach(principal)
 
 
 def execute_worker_read(
@@ -212,14 +232,14 @@ def execute_worker_read(
         extra_metadata=extra_metadata,
         tool_name=name,
     )
-    token = _attach_worker(owner_user_id, workspace_id)
+    job = _open_worker(owner_user_id, workspace_id, job_id)
     executing = _EXECUTING.set(True)
     try:
         return harness.execute(name, payload, context)
     finally:
         _EXECUTING.reset(executing)
-        if token is not None:
-            InternalPrincipalSeam().detach(token)
+        if job is not None:
+            job.close()
 
 
 def _invoke_producer(producer: Callable[..., Any], arguments: dict) -> Any:

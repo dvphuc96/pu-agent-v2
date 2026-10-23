@@ -6,7 +6,6 @@ import sqlite3
 from datetime import UTC, datetime
 
 from pu.identity.principal import Principal, PrincipalKind, issue_user_id, issue_workspace_id
-from pu.identity.seam import attached_principal
 
 _IDENTITY_DDL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -66,9 +65,8 @@ def provision_user(conn: sqlite3.Connection) -> Principal:
 def ensure_local_principal(conn: sqlite3.Connection) -> Principal:
     """Return the single dev/test principal stored for this database.
 
-    Existing single-user callers never attach a seam. Their rows still need
-    an owner, so each database keeps one backend-issued local principal.
-    Phase 6 removes that fallback together with the seam.
+    CLI and the single-user suite stamp rows with this owner when no HTTP
+    request is in progress. A bound request never receives it.
     """
     ensure_identity_tables(conn)
     row = _raw(
@@ -90,25 +88,25 @@ def ensure_local_principal(conn: sqlite3.Connection) -> Principal:
 
 
 def current_principal(conn: sqlite3.Connection) -> Principal:
-    """Attached seam principal, otherwise the database-local principal.
+    """Worker grant, else the authenticated session.
 
-    A worker job that has ended or whose lease has expired raises instead of
-    falling back to another owner.
+    A bound request with no session raises. It does not become the
+    database-local owner. Outside a request, CLI and the single-user suite
+    still use that one database owner so their rows stay visible.
     """
+    from pu.identity.session import request_bound, session_principal
     from pu.identity.worker_job import current_grant
 
     grant = current_grant()
     if grant is not None:
         return Principal(PrincipalKind.WORKER, grant.owner_user_id, grant.workspace_id)
-    attached = attached_principal()
-    if attached is not None:
-        if attached.kind is PrincipalKind.PLATFORM_ADMIN:
+    principal = session_principal()
+    if principal is not None:
+        if principal.kind is PrincipalKind.PLATFORM_ADMIN:
             raise PermissionError("platform admin does not receive a private owner scope")
-        return attached
-    cached_user = getattr(conn, "_pu_local_owner", "")
-    cached_workspace = getattr(conn, "_pu_local_workspace", "")
-    if cached_user and cached_workspace:
-        return Principal(PrincipalKind.USER, cached_user, cached_workspace)
+        return principal
+    if request_bound():
+        raise PermissionError("no authenticated principal")
     return ensure_local_principal(conn)
 
 

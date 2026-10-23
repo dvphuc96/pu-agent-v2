@@ -101,7 +101,7 @@ class HumanApprovalService:
             raise ValueError("approval changed concurrently; reload and try again")
         return updated
 
-    def approve(self, action_id: str, *, note: str = "", decided_by: str = "local-human") -> ProposedAction:
+    def approve(self, action_id: str, *, note: str = "", decided_by: str = "") -> ProposedAction:
         action = self.get(action_id)
         if action is None:
             raise KeyError("approval not found")
@@ -116,7 +116,7 @@ class HumanApprovalService:
             raise ValueError("approval changed or expired; reload and review again")
         return approved
 
-    def reject(self, action_id: str, *, note: str = "", decided_by: str = "local-human") -> ProposedAction:
+    def reject(self, action_id: str, *, note: str = "", decided_by: str = "") -> ProposedAction:
         action = self.get(action_id)
         if action is None:
             raise KeyError("approval not found")

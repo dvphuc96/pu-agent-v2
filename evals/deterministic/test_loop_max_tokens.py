@@ -10,14 +10,29 @@ again, say so out loud. Silence is never a final reply."""
 
 from __future__ import annotations
 
+import uuid
+
 from evals.helpers import ScriptedProvider, response, text_block
 from pu.harness import (
     DefaultSecurityHarness,
     DefaultToolHarness,
     InMemoryToolAuditSink,
 )
+from pu.identity.contract import AgentRequest, admit, tool_context_from_request
+from pu.identity.principal import Principal, PrincipalKind
 from pu.loop.agent import run_loop
 from pu.tools.registry import ToolRegistry
+
+
+def _context():
+    user_id = str(uuid.uuid4())
+    workspace_id = str(uuid.uuid4())
+    request = admit(AgentRequest(
+        principal=Principal(PrincipalKind.USER, user_id, workspace_id),
+        owner_user_id=user_id,
+        workspace_id=workspace_id,
+    ))
+    return tool_context_from_request(request)
 
 
 class Recorder(ScriptedProvider):
@@ -45,6 +60,7 @@ def _run(provider):
         tool_harness=DefaultToolHarness(
             registry, DefaultSecurityHarness(), InMemoryToolAuditSink()
         ),
+        tool_context=_context(),
     )
 
 

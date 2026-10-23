@@ -63,6 +63,49 @@ def _assistant_message(response: LLMResponse) -> dict[str, Any]:
     return {"role": "assistant", "content": blocks}
 
 
+def _require_admitted_context(tool_context: ToolContext | None) -> ToolContext:
+    """Admit before the provider. A missing principal never reaches the model."""
+    from pu.identity.contract import (
+        AgentRequest,
+        AgentRequestRejected,
+        admit,
+        admit_call,
+        is_backend_user_id,
+        tool_context_from_request,
+    )
+    from pu.identity.principal import Principal, PrincipalKind
+    from pu.identity.session import session_principal
+    from pu.identity.worker_job import current_grant
+
+    if tool_context is not None and is_backend_user_id(tool_context.principal):
+        admit_call(contract=None, context=tool_context)
+        return tool_context
+    try:
+        grant = current_grant()
+    except PermissionError as exc:
+        raise AgentRequestRejected("request is missing principal or owner") from exc
+    principal = None
+    if grant is not None:
+        principal = Principal(PrincipalKind.WORKER, grant.owner_user_id, grant.workspace_id)
+    else:
+        principal = session_principal()
+    if principal is None or principal.kind is PrincipalKind.PLATFORM_ADMIN:
+        raise AgentRequestRejected("request is missing principal or owner")
+    request = admit(
+        AgentRequest(
+            principal=principal,
+            owner_user_id=principal.user_id,
+            workspace_id=principal.workspace_id,
+        )
+    )
+    return tool_context_from_request(
+        request,
+        observer=None if tool_context is None else tool_context.observer,
+        actor="agent" if tool_context is None else tool_context.actor,
+        agent_id=None if tool_context is None else tool_context.agent_id,
+    )
+
+
 def run_loop(
     provider: LLMProvider,
     model: str,
@@ -80,7 +123,7 @@ def run_loop(
     notify = observer or (lambda kind, ev: None)
     result = LoopResult(reply="")
     definitions = _tool_definitions(tools)
-    base_context = tool_context or ToolContext()
+    base_context = _require_admitted_context(tool_context)
     if base_context.observer is not notify:
         base_context = replace(base_context, observer=notify)
 

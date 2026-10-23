@@ -30,12 +30,13 @@ from pu.identity.directory import provision_user
 from pu.identity.files import OwnershipDenied, read_owned_bytes, write_owned_text
 from pu.identity.oidc import AuthError, OidcProvider, sign_hs256
 from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam, attached_principal
 from pu.identity.session import (
     SESSION_COOKIE,
     AuthStore,
+    act_as,
     evaluate_on_home,
     format_set_cookie,
+    session_principal,
 )
 from pu.identity.threads import spawn_inheriting
 from pu.ops.agentops import AgentOpsHarness
@@ -52,12 +53,9 @@ CLIENT_SECRET = "test-client-secret"
 
 
 @contextmanager
-def _as(seam: InternalPrincipalSeam, principal: Principal):
-    token = seam.attach(principal)
-    try:
+def _as(home, principal: Principal):
+    with act_as(home, principal):
         yield
-    finally:
-        seam.detach(token)
 
 
 def _open(tmp_path):
@@ -68,7 +66,7 @@ def _open(tmp_path):
     user_b = provision_user(conn)
     conn.commit()
     conn.close()
-    return home, InternalPrincipalSeam(), user_a, user_b
+    return home, home, user_a, user_b
 
 
 def _settings(home):
@@ -347,7 +345,7 @@ def test_mu05_concurrent_worker_threads_do_not_mix_rows(tmp_path):
     def job(owner_id: str, mark: str, website: str) -> None:
         try:
             barrier.wait(timeout=5)
-            assert attached_principal().user_id == owner_id
+            assert session_principal().user_id == owner_id
             repo = WorkspaceRepository(home)
             workspace = repo.create(mark, website)
             repo.add_source(workspace["id"], title=mark, content=mark, source_type="document")
@@ -412,7 +410,7 @@ def test_background_thread_inherits_principal_context(tmp_path):
     seen: dict[str, str] = {}
 
     def sample() -> None:
-        current = attached_principal()
+        current = session_principal()
         seen["id"] = current.user_id if current else ""
 
     with _as(seam, user_a):

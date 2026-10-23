@@ -231,7 +231,6 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
             external_harness,
             job_owner,
             parse_json_output,
-            worker_context,
         )
 
         app = app_factory() if app_factory else None
@@ -244,30 +243,19 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
         if harness is None:
             from pu.tools.web_source import fetch_source
 
-            context = worker_context(
-                owner_user_id=owner,
-                workspace_id=workspace_owner,
-                job_id=str(workspace_id),
-                scopes=("web:read",),
-                tool_name="read_web_page",
-                extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
-            )
-            result = BoundaryHarness(lambda: fetch_source(url)).execute(
-                "read_web_page", {"url": url}, context
-            )
-        else:
-            result = execute_worker_read(
-                harness,
-                "read_web_page",
-                {"url": url},
-                owner_user_id=owner,
-                workspace_id=workspace_owner,
-                job_id=str(workspace_id),
-                scopes=("web:read",),
-                observer=observer,
-                extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
-                home=home,
-            )
+            harness = BoundaryHarness(lambda: fetch_source(url))
+        result = execute_worker_read(
+            harness,
+            "read_web_page",
+            {"url": url},
+            owner_user_id=owner,
+            workspace_id=workspace_owner,
+            job_id=str(workspace_id),
+            scopes=("web:read",),
+            observer=observer,
+            extra_metadata={"workspace_id": workspace_id, "untrusted_input": True},
+            home=home,
+        )
         page = parse_json_output(result)
         if not isinstance(page, dict):
             raise ValueError("Nguồn web không khả dụng qua tool harness.")
@@ -416,11 +404,15 @@ def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
                              AND json_extract(arguments_json,'$.report_id')=?""",
                         (workspace_id, original["payload"]["report_id"]),
                     ).fetchall()
+                from pu.identity.directory import current_principal
+
+                with repo.database.connection() as actor_conn:
+                    actor = current_principal(actor_conn).user_id
                 for action in pending:
                     app.approval_service.reject(
                         action["id"],
                         note="Báo cáo đã có phiên bản chỉnh sửa; cần phê duyệt phiên bản mới.",
-                        decided_by="local-dashboard-user",
+                        decided_by=actor,
                     )
                 return repo.detail(workspace_id, report.report_id)
             tool_name = payload.get("tool")

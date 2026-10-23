@@ -94,33 +94,27 @@ def todays_events(home: Path) -> str:
         execute_worker_read,
         job_owner,
         read_calendar_ics,
-        worker_context,
     )
 
     owner, workspace_id = job_owner(home)
     harness = bound_harness()
-    if harness is not None:
-        today = datetime.now().strftime("%Y-%m-%d")
-        result = execute_worker_read(
-            harness,
-            "list_events",
-            {"start": today, "end": today},
-            owner_user_id=owner,
-            workspace_id=workspace_id,
-            job_id="triage",
-            scopes=("calendar:read",),
-            home=home,
-        )
-        return result.output if result.ok else (result.error or result.output)
-    context = worker_context(
+    today = datetime.now().strftime("%Y-%m-%d")
+    if harness is None:
+        harness = BoundaryHarness(lambda: read_calendar_ics(home))
+        arguments: dict = {}
+    else:
+        arguments = {"start": today, "end": today}
+    result = execute_worker_read(
+        harness,
+        "list_events",
+        arguments,
         owner_user_id=owner,
         workspace_id=workspace_id,
         job_id="triage",
         scopes=("calendar:read",),
-        tool_name="list_events",
+        home=home,
     )
-    result = BoundaryHarness(lambda: read_calendar_ics(home)).execute("list_events", {}, context)
-    return result.output
+    return result.output if result.ok else (result.error or result.output)
 
 
 def build_triage_graph(*, classify_fn: Callable[[str], tuple[str, str]],

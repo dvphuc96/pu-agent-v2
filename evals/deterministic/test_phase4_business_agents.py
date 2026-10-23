@@ -32,8 +32,7 @@ from pu.identity.contract import AgentRequestRejected
 from pu.identity.directory import provision_user
 from pu.identity.files import owner_root
 from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam
-from pu.identity.session import AuthStore
+from pu.identity.session import AuthStore, act_as
 from pu.memory import knowledge
 from pu.memory.semantic.store import SqliteFactStore
 from pu.ops.briefing import BriefingService, job_fingerprint
@@ -72,12 +71,9 @@ ALPHA_CONTACT = "alpha@fixture-a.example"
 
 
 @contextmanager
-def _as(seam: InternalPrincipalSeam, principal: Principal):
-    token = seam.attach(principal)
-    try:
+def _as(home, principal: Principal):
+    with act_as(home, principal):
         yield
-    finally:
-        seam.detach(token)
 
 
 def _open(tmp_path):
@@ -88,7 +84,7 @@ def _open(tmp_path):
     user_b = provision_user(conn)
     conn.commit()
     conn.close()
-    return home, InternalPrincipalSeam(), user_a, user_b
+    return home, home, user_a, user_b
 
 
 def _payload(report_id: str, secret: str) -> dict:
@@ -617,7 +613,7 @@ def test_research_workflow_admits_the_judge_and_refuses_without_principal(
 ):
     """The production research path admits the workflow owner before the judge.
 
-    ``attached_principal()`` stays unset. The same judge refuses, with zero
+    The session principal stays unset. The same judge refuses, with zero
     provider calls, when that contract is missing.
     """
     from evals.deterministic.test_phase8_report_evaluation import (
@@ -627,7 +623,7 @@ def test_research_workflow_admits_the_judge_and_refuses_without_principal(
     from pu.core.container import create_application
     from pu.evaluation.report import admit as real_admit
     from pu.identity.directory import current_principal
-    from pu.identity.seam import attached_principal
+    from pu.identity.session import session_principal
 
     provider = JudgeProvider()
     order: list[tuple[str, str]] = []
@@ -640,7 +636,7 @@ def test_research_workflow_admits_the_judge_and_refuses_without_principal(
     provider.complete = wrapped
 
     def spy(request):
-        assert attached_principal() is None
+        assert session_principal() is None
         order.append(("admit", request.owner_user_id))
         return real_admit(request)
 

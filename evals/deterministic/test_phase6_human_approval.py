@@ -139,11 +139,11 @@ def test_edit_changes_hash_revision_and_requires_reapproval(tmp_path):
 def test_approve_executes_exact_payload_once_and_records_human_actor(tmp_path):
     _, _, service, registry, harness, executor, _, calls = setup_approval(tmp_path)
     proposed = harness.execute("propose_write_x", {"text":"once"}, agent_context(registry))
-    approved = service.approve(
-        proposed.metadata["approval_id"], note="looks right", decided_by="local-dashboard-user"
-    )
+    approved = service.approve(proposed.metadata["approval_id"], note="looks right")
     assert approved.approved_action_hash == approved.action_hash
-    assert approved.decided_by == "local-dashboard-user"
+    from pu.identity.contract import is_backend_user_id
+
+    assert is_backend_user_id(approved.decided_by)
     final, result = executor.execute(approved.id)
     assert result.ok and result.output == "wrote:once"
     assert final.status is ApprovalStatus.EXECUTED

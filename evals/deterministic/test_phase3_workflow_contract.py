@@ -28,7 +28,7 @@ from pu.harness import DefaultSecurityHarness, DefaultToolHarness, InMemoryToolA
 from pu.identity.contract import AgentRequest, AgentRequestRejected, invoke_tool
 from pu.identity.directory import provision_user
 from pu.identity.principal import Principal, PrincipalKind
-from pu.identity.seam import InternalPrincipalSeam
+from pu.identity.session import act_as
 from pu.identity.worker_job import WorkerJob, owner_from_grant
 from pu.ops.briefing import BriefingService
 from pu.orchestration.research import WorkflowExecutionError
@@ -41,12 +41,9 @@ EVENT_SECRET = "fixture-event-secret"
 
 
 @contextmanager
-def _as(seam: InternalPrincipalSeam, principal: Principal):
-    token = seam.attach(principal)
-    try:
+def _as(home, principal: Principal):
+    with act_as(home, principal):
         yield
-    finally:
-        seam.detach(token)
 
 
 def _open(tmp_path):
@@ -56,7 +53,7 @@ def _open(tmp_path):
     user_a = provision_user(conn)
     user_b = provision_user(conn)
     conn.commit()
-    return home, conn, InternalPrincipalSeam(), user_a, user_b
+    return home, conn, home, user_a, user_b
 
 
 def _counts(home: Path, stage: str, workflow_id: str) -> tuple[int, int]:
