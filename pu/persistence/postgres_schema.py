@@ -319,6 +319,10 @@ def install(
             if statement:
                 conn.execute(statement)
         for table in PRIVATE_TABLES:
+            conn.execute(
+                f"ALTER TABLE {table} ADD CONSTRAINT {table}_owner_nonempty "
+                "CHECK (owner_user_id <> '')"
+            )
             conn.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
             conn.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
             conn.execute(

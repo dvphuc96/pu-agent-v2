@@ -7,16 +7,40 @@ from types import SimpleNamespace
 
 import pytest
 
+from pu.config import Settings
 from pu.core.cancellation import RunCancelled
+from pu.db import connect
+from pu.identity.directory import provision_user
+from pu.identity.session import SESSION_COOKIE, AuthStore
 from pu.ops import dashboard
 from pu.ops.chat_runs import active_chat, chat_lock, check_cancelled, stop_chat
 
 
-def post(path, payload):
+def _session(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    conn = connect(home)
+    user = provision_user(conn)
+    conn.commit()
+    conn.close()
+    settings = Settings(home=home)
+    settings.ensure_home()
+    monkeypatch.setattr("pu.config.load_settings", lambda: settings)
+    monkeypatch.setattr("pu.ops.dashboard.load_settings", lambda: settings)
+    issued = AuthStore(home).issue_session(user)
+    return user, issued
+
+
+def post(path, payload, issued):
     handler = object.__new__(dashboard.Handler)
     body = json.dumps(payload).encode()
     handler.path = path
-    handler.headers = {"Host": "127.0.0.1:8765", "Content-Length": str(len(body))}
+    handler.headers = {
+        "Host": "127.0.0.1:8765",
+        "Content-Length": str(len(body)),
+        "Cookie": f"{SESSION_COOKIE}={issued.session_id}",
+        "X-CSRF-Token": issued.csrf_token,
+    }
     handler.rfile, handler.wfile = io.BytesIO(body), io.BytesIO()
     handler.send_response = lambda status: None
     handler.send_header = lambda *args: None
@@ -25,16 +49,19 @@ def post(path, payload):
     return handler.wfile.getvalue().decode()
 
 
-def test_stop_is_scoped_and_cleans_up_after_completion():
-    with active_chat('run-a') as first, active_chat('run-b') as second:
-        assert json.loads(post('/api/chat/stop', {'request_id': 'run-a'}))['accepted']
+def test_stop_is_scoped_and_cleans_up_after_completion(tmp_path, monkeypatch):
+    user, issued = _session(tmp_path, monkeypatch)
+    with active_chat('run-a', user.user_id) as first, active_chat('run-b', user.user_id) as second:
+        assert json.loads(post('/api/chat/stop', {'request_id': 'run-a'}, issued))['accepted']
         assert first.is_set() and not second.is_set()
         with pytest.raises(RunCancelled):
             check_cancelled(first)
-        with pytest.raises(ValueError), active_chat('run-a'):
+        with pytest.raises(ValueError), active_chat('run-a', user.user_id):
             pass
-    assert not stop_chat('run-a')
-    assert not stop_chat({'invalid': 'input'})
+    assert not stop_chat('run-a', user.user_id)
+    assert not stop_chat({'invalid': 'input'}, user.user_id)
+    with pytest.raises(PermissionError, match="no authenticated principal"):
+        stop_chat('run-b', '')
 
 
 def test_cancelled_waiter_never_runs_when_another_chat_owns_the_lock():
@@ -50,23 +77,24 @@ def test_cancelled_waiter_never_runs_when_another_chat_owns_the_lock():
         lock.release()
 
 
-def test_stream_acknowledges_before_work_and_cancel_is_terminal(monkeypatch):
+def test_stream_acknowledges_before_work_and_cancel_is_terminal(tmp_path, monkeypatch):
+    user, issued = _session(tmp_path, monkeypatch)
     stages = []
 
     def work(message, emit, *, cancel_event):
         stages.append('started')
         emit('text', {'delta': 'Partial reply'})
-        assert stop_chat('test-stream')
+        assert stop_chat('test-stream', user.user_id)
         emit('text', {'delta': 'Must not appear'})
         stages.append('must-not-run')
 
     monkeypatch.setattr(dashboard, 'chat_stream', work)
-    data = post('/api/chat/stream', {'message': 'hello', 'request_id': 'test-stream'})
+    data = post('/api/chat/stream', {'message': 'hello', 'request_id': 'test-stream'}, issued)
     events = [json.loads(line[6:]) for line in data.splitlines() if line.startswith('data: ')]
     assert events[0] == {'kind': 'chat_started', 'request_id': 'test-stream'}
     assert events[-1]['kind'] == 'done' and events[-1]['cancelled']
     assert 'Must not appear' not in data and stages == ['started']
-    assert not stop_chat('test-stream')
+    assert not stop_chat('test-stream', user.user_id)
 
 
 def test_cancelled_agent_releases_lock_and_records_interrupted_turn(monkeypatch):

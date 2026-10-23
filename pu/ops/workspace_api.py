@@ -181,8 +181,17 @@ def ask_sources(
 
 
 def workspace_action(home: Path, payload: dict, *, app_factory=None) -> dict:
+    from pu.db import connect
+    from pu.identity.directory import current_principal
     from pu.identity.requests import coerce_workspace_id, discard_client_owner
 
+    # MU-12 remaps a foreign workspace_id onto this principal's personal
+    # workspace. A request with no principal never reaches that remap.
+    conn = connect(home)
+    try:
+        current_principal(conn)
+    finally:
+        conn.close()
     payload = discard_client_owner(payload)
     repo = WorkspaceRepository(home)
     op = payload.get("op", "")

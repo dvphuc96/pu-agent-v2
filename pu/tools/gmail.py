@@ -58,7 +58,20 @@ _SETUP_HINT = (
 # ---- OAuth ----------------------------------------------------------------
 
 def _token_path(home: Path) -> Path:
-    return home / _TOKEN_FILE
+    """Token path for the current owner. An empty owner raises.
+
+    The legacy ``home/gmail-token.json`` file is readable only by the
+    database-local owner. A cookieless request does not receive that path.
+    """
+    from pu.identity.files import database_local_owner, owner_for_home, owner_root, private_file
+
+    owner = owner_for_home(home)
+    found = private_file(home, _TOKEN_FILE)
+    if found is not None:
+        return found
+    if owner == database_local_owner(home):
+        return home / _TOKEN_FILE
+    return owner_root(home, owner) / _TOKEN_FILE
 
 
 def _load_credentials(home: Path):

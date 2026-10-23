@@ -20,7 +20,13 @@ APPROVAL_STATUSES = frozenset(
 # Labels the single-user code used before a backend UUID existed. A model or
 # tool call may not present one of these as its principal.
 LEGACY_PRINCIPALS = frozenset(
-    {"local-user", "graph-local-user", "local-dashboard-user", "local-human"}
+    {
+        "local-user",
+        "graph-local-user",
+        "local-dashboard-user",
+        "local-human",
+        "automatic-briefing",
+    }
 )
 
 

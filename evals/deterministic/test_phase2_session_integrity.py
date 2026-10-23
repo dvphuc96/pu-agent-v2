@@ -231,6 +231,7 @@ def test_mu11_oidc_pkce_sets_lax_cookie_and_checks_state(tmp_path, monkeypatch):
 def test_mu11_csrf_rejects_state_change_and_legacy_loopback_still_runs(tmp_path, monkeypatch):
     home, _seam, user_a, _user_b = _open(tmp_path)
     monkeypatch.setattr("pu.config.load_settings", lambda: _settings(home))
+    monkeypatch.setattr("pu.ops.dashboard.load_settings", lambda: _settings(home))
     issued = AuthStore(home).issue_session(user_a)
     assert "HttpOnly" in issued.set_cookie
     assert "Secure" in issued.set_cookie
@@ -248,8 +249,8 @@ def test_mu11_csrf_rejects_state_change_and_legacy_loopback_still_runs(tmp_path,
     assert allowed.statuses == [200]
     assert "accepted" in json.loads(allowed.body)
     legacy = _Handler("POST", "/api/chat/stop", {"Content-Length": "2"}, b"{}")
-    assert legacy.statuses == [200]
-    assert "accepted" in json.loads(legacy.body)
+    assert legacy.statuses == [401]
+    assert json.loads(legacy.body)["error"] == "no authenticated principal"
     assert evaluate_on_home({"Host": "127.0.0.1:8765"}, mutate=True).rejected is False
     assert evaluate_on_home({"Host": "localhost"}, mutate=True).rejected is False
     rebound = evaluate_on_home({"Host": "rebind.example"}, mutate=True)

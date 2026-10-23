@@ -215,6 +215,11 @@ ALTER TABLE briefing_jobs ADD COLUMN next_attempt TEXT NOT NULL DEFAULT '';
         "briefing_fingerprint_per_owner",
         "",
     ),
+    Migration(
+        9009,
+        "reject_empty_owner_user_id",
+        "",
+    ),
 )
 
 
@@ -255,6 +260,10 @@ class SQLiteMigrationRunner:
                 from pu.persistence.ownership import scope_briefing_fingerprint
 
                 scope_briefing_fingerprint(self.conn)
+            elif migration.version == 9009:
+                from pu.persistence.ownership import reject_empty_owner_user_id
+
+                reject_empty_owner_user_id(self.conn)
             elif migration.sql:
                 self.conn.executescript(migration.sql)
             self.conn.execute(

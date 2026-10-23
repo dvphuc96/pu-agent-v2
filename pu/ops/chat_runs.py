@@ -7,18 +7,20 @@ from contextlib import contextmanager
 from pu.core.cancellation import RunCancelled
 
 _lock = threading.Lock()
-_runs: dict[str, threading.Event] = {}
+_runs: dict[str, tuple[threading.Event, str]] = {}
 
 
 @contextmanager
-def active_chat(request_id):
+def active_chat(request_id, owner_user_id: str):
+    if not owner_user_id:
+        raise PermissionError("no authenticated principal")
     if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,80}", request_id):
         raise ValueError("Invalid chat request ID")
     event = threading.Event()
     with _lock:
         if request_id in _runs:
             raise ValueError("Chat request ID is already active")
-        _runs[request_id] = event
+        _runs[request_id] = (event, owner_user_id)
     try:
         yield event
     finally:
@@ -26,12 +28,23 @@ def active_chat(request_id):
             _runs.pop(request_id, None)
 
 
-def stop_chat(request_id):
+def stop_chat(request_id, owner_user_id: str):
+    """Stop a run only when ``owner_user_id`` started it.
+
+    A missing owner raises. A run owned by someone else raises. An unknown
+    id returns False so a finished run is not reported as another user's.
+    """
+    if not owner_user_id:
+        raise PermissionError("no authenticated principal")
     with _lock:
-        event = _runs.get(request_id) if isinstance(request_id, str) else None
-        if event is not None:
-            event.set()
-        return event is not None
+        record = _runs.get(request_id) if isinstance(request_id, str) else None
+        if record is None:
+            return False
+        event, owner = record
+        if owner != owner_user_id:
+            raise PermissionError("chat run is not owned by this session")
+        event.set()
+        return True
 
 
 def check_cancelled(event):

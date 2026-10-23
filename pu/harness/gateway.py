@@ -76,37 +76,61 @@ def read_harness(app: Any, producer: Callable[..., Any]) -> Any:
 
 
 def job_owner(home: Path | None) -> tuple[str, str]:
+    """Owner and workspace for a worker read.
+
+    A bound request with no grant or session raises. Outside a request the
+    database-local principal is used, and a home that has not opened its
+    database yet gets that principal created so the read runs as a real
+    WORKER. ``home is None`` raises: there is no database to own the job.
+    """
     from pu.identity.principal import PrincipalKind
     from pu.identity.session import request_bound, session_principal
     from pu.identity.worker_job import current_grant
 
-    try:
-        grant = current_grant()
-    except PermissionError:
-        return "", ""
+    grant = current_grant()
     if grant is not None:
+        if not grant.owner_user_id or not grant.workspace_id:
+            raise PermissionError("no authenticated principal")
         return grant.owner_user_id, grant.workspace_id
     principal = session_principal()
     if principal is not None:
-        if principal.kind is PrincipalKind.PLATFORM_ADMIN:
-            return "", ""
+        if principal.kind is PrincipalKind.PLATFORM_ADMIN or not principal.user_id:
+            raise PermissionError("no authenticated principal")
         return principal.user_id, principal.workspace_id
     if request_bound() or home is None:
-        return "", ""
+        raise PermissionError("no authenticated principal")
+    found = _local_job_owner(home)
+    if found is not None:
+        return found
+    from pu.db import connect
+    from pu.identity.directory import ensure_local_principal
+
+    opened = connect(home)
+    try:
+        principal = ensure_local_principal(opened)
+        opened.commit()
+    finally:
+        opened.close()
+    if not principal.user_id or not principal.workspace_id:
+        raise PermissionError("no authenticated principal")
+    return principal.user_id, principal.workspace_id
+
+
+def _local_job_owner(home: Path) -> tuple[str, str] | None:
     database = Path(home) / "state.db"
     if not database.is_file():
-        return "", ""
+        return None
     conn = sqlite3.connect(database)
     try:
         row = conn.execute(
             "SELECT user_id, workspace_id FROM identity_local WHERE singleton = 1"
         ).fetchone()
     except sqlite3.Error:
-        return "", ""
+        return None
     finally:
         conn.close()
-    if not row:
-        return "", ""
+    if not row or not row[0] or not row[1]:
+        return None
     return str(row[0]), str(row[1])
 
 
@@ -120,6 +144,8 @@ def worker_context(
     extra_metadata: dict | None = None,
     tool_name: str = "",
 ) -> ToolContext:
+    if not owner_user_id:
+        raise PermissionError("no authenticated principal")
     scope_set = set(scopes)
     if tool_name in READ_SCOPES:
         scope_set.add(READ_SCOPES[tool_name])
@@ -133,7 +159,7 @@ def worker_context(
     return ToolContext(
         observer=observer,
         actor="worker",
-        principal=owner_user_id or "worker",
+        principal=owner_user_id,
         agent_id="worker",
         scopes=frozenset(scope_set),
         capabilities=frozenset(scope_set),
@@ -149,7 +175,8 @@ class BoundaryHarness:
 
     def execute(self, name: str, arguments: dict, context: ToolContext) -> ToolResult:
         del name
-        if context.metadata.get("principal_kind") != PrincipalKind.WORKER.value:
+        owner = str(context.metadata.get("owner_user_id") or "")
+        if context.metadata.get("principal_kind") != PrincipalKind.WORKER.value or not owner:
             return ToolResult(output="", ok=False, error="worker_principal_required")
         token = _EXECUTING.set(True)
         try:
@@ -193,6 +220,8 @@ def execute_worker_read(
     extra_metadata: dict | None = None,
     home: Path | None = None,
 ) -> ToolResult:
+    if not owner_user_id:
+        raise PermissionError("no authenticated principal")
     payload = dict(arguments or {})
     connection_id = str(payload.get("connection_id") or "")
     thread_id = str(payload.get("thread_id") or "")

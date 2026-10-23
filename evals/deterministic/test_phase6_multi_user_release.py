@@ -543,7 +543,7 @@ def test_release_cookieless_request_fails_closed(tmp_path, monkeypatch):
         {"Content-Length": str(len(body)), "Content-Type": "application/json"},
         body,
     )
-    assert denied.statuses == [200]
+    assert denied.statuses == [401]
     assert json.loads(denied.body)["error"] == "no authenticated principal"
     assert user_a.user_id not in denied.body.decode()
     assert BETA not in denied.body.decode()
@@ -676,3 +676,168 @@ def test_release_no_xfail_and_token_key_is_not_committed():
                 if len(value) >= 16 and not value.startswith("$") and "os.environ" not in line:
                     leaked.append(f"{path}:{value[:4]}…")
     assert leaked == []
+
+
+def test_release_cookieless_probes_do_not_touch_legacy_private_data(tmp_path, monkeypatch):
+    """Loopback without a cookie is 401 before any private read or write.
+
+    MU-12 still remaps a foreign workspace_id for an authenticated caller.
+    These probes never reach that remap: there is no principal to remap onto.
+    """
+    from pu.graph.workflows.triage import todays_events
+    from pu.harness.gateway import job_owner, worker_context
+    from pu.identity.files import private_file
+    from pu.ops.chat_runs import active_chat
+    from pu.tools.gmail import _token_path
+
+    home, user_a, user_b = _open(tmp_path)
+    _bind_home(monkeypatch, home)
+    token = "phase6-gmail-token-canary"
+    (home / "gmail-token.json").write_text(token, encoding="utf-8")
+    knowledge = home / "knowledge"
+    knowledge.mkdir()
+    (knowledge / "note.txt").write_text(BETA, encoding="utf-8")
+    today = datetime.now().strftime("%Y%m%d")
+    (home / "calendar.ics").write_text(
+        f"BEGIN:VEVENT\nSUMMARY:phase6-legacy-calendar\nDTSTART:{today}T090000\nEND:VEVENT\n",
+        encoding="utf-8",
+    )
+    reads: list[str] = []
+
+    def spy_sync(*_args, **_kwargs):
+        reads.append((home / "gmail-token.json").read_text(encoding="utf-8"))
+        return "synced"
+
+    monkeypatch.setattr("pu.tools.gmail.sync", spy_sync)
+
+    def post(path: str, payload: dict, issued=None):
+        body = json.dumps(payload).encode()
+        headers = {"Content-Length": str(len(body)), "Content-Type": "application/json"}
+        if issued is not None:
+            headers["Cookie"] = f"{SESSION_COOKIE}={issued.session_id}"
+            headers["X-CSRF-Token"] = issued.csrf_token
+        return _Handler("POST", path, headers, body)
+
+    sync = post("/api/gmail/sync", {})
+    assert sync.statuses == [401]
+    assert json.loads(sync.body)["error"] == "no authenticated principal"
+    assert reads == []
+    assert token not in sync.body.decode()
+
+    reindex = post("/api/knowledge", {"op": "reindex"})
+    assert reindex.statuses == [401]
+    search = post("/api/knowledge", {"op": "search", "query": BETA})
+    assert search.statuses == [401]
+    assert BETA not in reindex.body.decode() + search.body.decode()
+
+    created = post("/api/workspace", {"op": "create", "company": BETA})
+    assert created.statuses == [401]
+    listed = _Handler("GET", "/api/workspaces", {})
+    assert listed.statuses == [401]
+    assert BETA not in created.body.decode() + listed.body.decode()
+
+    anonymous = AuthStore(home).evaluate({"Host": "127.0.0.1"}, mutate=False)
+    with attached_decision(anonymous):
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            job_owner(home)
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            worker_context(owner_user_id="")
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            private_file(home, "gmail-token.json")
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            _token_path(home)
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            todays_events(home)
+        with pytest.raises(PermissionError, match="no authenticated principal"):
+            current_owner = connect(home)
+            try:
+                from pu.identity.scope import current_owner_user_id
+
+                current_owner_user_id(current_owner)
+            finally:
+                current_owner.close()
+
+    conn = connect(home)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM knowledge_sources WHERE owner_user_id = ''"
+    ).fetchone()[0]
+    count += conn.execute(
+        "SELECT COUNT(*) FROM knowledge_chunks WHERE owner_user_id = '' OR content LIKE ?",
+        (f"%{BETA}%",),
+    ).fetchone()[0]
+    workspaces = conn.execute(
+        "SELECT COUNT(*) FROM research_workspaces WHERE owner_user_id = '' OR company = ?",
+        (BETA,),
+    ).fetchone()[0]
+    with pytest.raises(sqlite3.IntegrityError, match="owner_user_id is required"):
+        conn.execute(
+            "INSERT INTO facts(subject, content, owner_user_id) VALUES('s', ?, '')",
+            (BETA,),
+        )
+    conn.close()
+    assert count == 0
+    assert workspaces == 0
+    assert reads == []
+
+    with active_chat("run-a", user_a.user_id) as event:
+        cookieless = post("/api/chat/stop", {"request_id": "run-a"})
+        assert cookieless.statuses == [401]
+        issued_b = AuthStore(home).issue_session(user_b)
+        cross = post("/api/chat/stop", {"request_id": "run-a"}, issued_b)
+        assert cross.statuses == [403]
+        assert json.loads(cross.body)["error"] == "chat run is not owned by this session"
+        assert event.is_set() is False
+        issued_a = AuthStore(home).issue_session(user_a)
+        owned = post("/api/chat/stop", {"request_id": "run-a"}, issued_a)
+        assert owned.statuses == [200]
+        assert json.loads(owned.body)["accepted"] is True
+        assert event.is_set() is True
+
+
+def test_release_automatic_briefing_records_the_worker_owner(tmp_path):
+    from pu.identity.worker_job import WorkerJob
+
+    home, _user_a, user_b = _open(tmp_path)
+    repo = SQLiteApprovalRepository(SQLiteDatabase.from_home(home))
+    service = HumanApprovalService(repo)
+    job = WorkerJob.open(
+        owner_user_id=user_b.user_id,
+        workspace_id=user_b.workspace_id,
+        expires_at=time.time() + 60,
+    )
+    try:
+        repo.create(_action("act-auto", user_b.user_id, pending=True, secret="alpha"))
+        rejected = service.reject("act-auto", decided_by="automatic-briefing")
+    finally:
+        job.close()
+    assert rejected.decided_by == user_b.user_id
+    assert is_backend_user_id(rejected.decided_by)
+
+
+def test_release_postgres_check_rejects_empty_owner():
+    dsn = os.environ.get("PU_POSTGRES_DSN", "").strip()
+    if not dsn:
+        pytest.skip(SKIP_POSTGRES)
+    import psycopg
+
+    from pu.persistence.postgres_schema import PRIVATE_TABLES, install
+
+    admin = psycopg.connect(dsn, connect_timeout=3)
+    try:
+        install(admin, password="pu-phase6-fixture", replace_existing=True)
+        names = {
+            row[0]
+            for row in admin.execute(
+                "SELECT conname FROM pg_constraint WHERE conname LIKE %s",
+                ("%\\_owner_nonempty",),
+            )
+        }
+        assert names == {f"{table}_owner_nonempty" for table in PRIVATE_TABLES}
+        with pytest.raises(psycopg.errors.CheckViolation):
+            admin.execute(
+                "INSERT INTO facts(owner_user_id, subject, content) VALUES (%s, %s, %s)",
+                ("", "fixture", BETA),
+            )
+        admin.rollback()
+    finally:
+        admin.close()

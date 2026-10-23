@@ -632,10 +632,14 @@ class BriefingService:
                         (wid, payload["report_id"]),
                     ).fetchall()
                 for row in obsolete:
+                    from pu.identity.directory import current_principal
+
+                    with self.repo.database.connection() as actor_conn:
+                        actor = current_principal(actor_conn).user_id
                     app.approval_service.reject(
                         row[0],
                         note="Đã có báo cáo mới; vui lòng đọc và duyệt phiên bản mới.",
-                        decided_by="automatic-briefing",
+                        decided_by=actor,
                     )
                 self.prepare_approvals(wid, payload, app)
             self.update(jid, status="completed", stage="completed")
