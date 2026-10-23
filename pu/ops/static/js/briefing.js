@@ -18,6 +18,7 @@ async function briefRefresh(){
   finally{BRIEF.loading=false;}
 }
 function briefPaint(){
+  if (typeof puUiClosed === "function" && puUiClosed()) return;
   const [view,id]=(location.hash||'#today').slice(1).split('/');
   if(!['today','review','reports'].includes(view)||view==='reports'&&id)return;
   if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#brief-settings'))return;

@@ -136,9 +136,12 @@ function playNext(){
   setTimeout(playNext, 620);   // stagger so stages light up in sequence
 }
 async function pollEvents(){
+  if (typeof puUiClosed === "function" && puUiClosed()) return;
   try{
-    const r = await (await fetch("/api/events" + (evCursor==null?"":"?cursor="+evCursor))).json();
-    if (evCursor != null && r.events.length){
+    const res = await fetch("/api/events" + (evCursor==null?"":"?cursor="+evCursor));
+    if (!res.ok || (typeof puUiClosed === "function" && puUiClosed())) return;
+    const r = await res.json();
+    if (evCursor != null && r.events && r.events.length){
       evQueue.push(...r.events);
       if (!playing) playNext();
     }

@@ -502,6 +502,32 @@
   .conncard:hover{box-shadow:0 5px 18px rgba(0,0,0,.25)}
   .connstatus.needs-setup{color:#d9a441}
 }
+.pagehead-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.pagehead-row h1{flex:1;min-width:0}
+#session-bar{display:flex;align-items:center;gap:8px;margin-left:auto}
+#session-user{font:12px/1.3 var(--mono);color:var(--ink2);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#logout-error{color:var(--bad);font-size:12px}
+#logout-btn,#login-google{cursor:pointer;border-radius:8px;font-size:13px}
+#logout-btn{background:transparent;border:1px solid var(--line2);color:var(--ink);padding:6px 10px}
+#login-google{background:var(--accent);color:#fff;border:0;padding:10px 16px;font-weight:600}
+#login-google:focus-visible,#logout-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#login-screen{display:none}
+body.logged-out{display:block;overflow:auto}
+body.logged-out nav,
+body.logged-out #nav-resizer,
+body.logged-out main,
+body.logged-out #dock-resizer,
+body.logged-out #dock,
+body.logged-out #nav-reopen,
+body.logged-out #dock-reopen{display:none !important}
+body.logged-out #login-screen{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
+.login-card{width:min(440px,100%);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:28px 24px}
+.login-card h1{font-size:22px;margin-bottom:8px}
+.login-card p{color:var(--ink2);margin:0 0 16px}
+#login-config{color:var(--ink);margin-top:16px}
+#login-config ul{margin:8px 0 0 18px}
+#login-config code,#login-error code{font-family:var(--mono);font-size:12px}
+#login-error{color:var(--bad)}
 @media (max-width:720px){
   .conngrid{grid-template-columns:1fr}
   .connmodal-back{padding:10px}
